@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?><!--
+   Minimal hardening: the shared preferences file contains the
+   Wi-Fi Direct passphrase, so it is excluded from cloud backup / device migration.
+   This file applies to devices running Android 11 (API 30) and below.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="linkhelm_prefs.xml"/>
+</full-backup-content>

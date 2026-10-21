@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <!-- v1.3.3 audit: REQUEST_IGNORE_BATTERY_OPTIMIZATIONS kept for the foreground
+         sharing service; boot-restore was removed entirely (dead feature). -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.LinkHelm">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- v1.5.33: anti-battery-saver watchdog — alarm ticks survive process
+             death and resurrect the sharing service if an OEM killed it. -->
+        <receiver
+            android:name=".HostWatchdogReceiver"
+            android:exported="false" />
+
+        <!-- NEW: tun2socks VPN Service -->
+        <service
+            android:name=".MyVpnServiceTun2Socks"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="specialUse"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:process=":vpn">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="VPN proxy using tun2socks" />
+        </service>
+
+        <!-- v1.3.3 audit: removed the disabled "optional backup" MyVpnServiceOptimized
+             (dead code whose DnsCache pre-warmed hardcoded third-party domains via DNS
+             on startup) and the disabled BootReceiver (auto-restart never worked). -->
+
+        <!-- Fix (v1.2, P0-A): removed android:process=":proxy". HostService used to run
+             in a separate process, so its static endpoint state was never visible to
+             MainActivity and the UI was stuck on "pending" even while the proxy was up.
+             All sessions still run on their own worker threads; the SOCKS5 core is
+             unchanged. -->
+        <service
+            android:name=".HostService"
+            android:enabled="true"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Proxy server and Wi-Fi Direct host" />
+        </service>
+    </application>
+
+</manifest>
