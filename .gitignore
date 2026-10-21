@@ -37,3 +37,7 @@ host_client_connection_summary.txt
 
 # Stale project structure reference (manually maintained, always out of date)
 structure.txt
+
+# Local PyInstaller output dirs (sandbox-safe rebuild workaround)
+laptop_proxy/dist_new/
+laptop_proxy/build_new/
