@@ -1,33 +1,40 @@
-# SECURITY.md
+# Security Policy
 
-## 本地服务范围（Android 主机端）
+## Local Service Scope (Android Host)
 
-- SOCKS5 代理（TCP CONNECT / UDP ASSOCIATE，默认端口 8080）与 HTTP 代理（8081）
-  **绑定所有接口（0.0.0.0）以保证接口枚举兼容性**，但**只接受回环（127.0.0.0/8，
-  供自检）与 Wi-Fi Direct group owner /24 网段内的来源连接**；群组未形成时代理不启动。
-  （v1.3.1 起改为全接口监听 + 来源网段白名单；v1.4.4 起主机端可查看已连接设备并
-  一键断开/阻止，阻止列表对 8080 与 8081 同时生效。）
-- 通知栏不显示 Wi-Fi 口令；口令为首次启动随机生成并持久化，仅可在设置页查看/修改，
-  且已从云备份与设备迁移中排除。
-- 未实现 SOCKS 账号认证：来源过滤是暴露面收敛，不等于身份认证。
-  请不要在不受信网络中把主机端接入其他网络后当作公共代理使用。
+- The SOCKS5 proxy (TCP CONNECT / UDP ASSOCIATE, default port 8080) and the HTTP
+  proxy (port 8081) are **bound to all interfaces (0.0.0.0) for network-interface
+  enumeration compatibility**, but they **only accept connections from the
+  loopback range (127.0.0.0/8, for self-testing) and from the Wi-Fi Direct group
+  owner /24 subnet**. The proxies do not start until a group is formed.
+- The Wi-Fi passphrase is never shown in the notification shade. It is randomly
+  generated on first launch and persisted; it can only be viewed or changed in
+  the settings page, and it is excluded from cloud backup and device migration.
+- SOCKS username/password authentication is not implemented: source filtering
+  narrows the attack surface but is not identity authentication. Do not bridge
+  the host to other networks and use it as a public proxy on untrusted networks.
 
-## 权限说明（Windows 客户端）
+## Permissions (Windows Client)
 
-- 程序需要管理员权限用于：创建 Wintun 虚拟网卡、修改本机路由（仅限指向本程序
-  网关 10.0.0.1 的 /1 路由）、启用/停用 ICS 共享（仅在用户点击"共享给游戏机"时）。
-- 停止/退出时会回滚本程序添加的路由与 ICS 状态；其他 VPN 的路由不会被删除或修改。
-- 正常安装不联网下载任何二进制；兜底下载需用户确认，且强制 SHA-256 校验。
-- v1.4.4 起，tun2socks.exe / wintun.dll 在**每次使用前**都会重新校验官方
-  SHA-256（完整性锁）：缓存副本被替换时拒绝执行并自动从内置副本恢复；
-  内置副本被篡改则拒绝以管理员权限继续。
+- Administrator privileges are required for: creating the Wintun virtual
+  adapter, modifying local routes (limited to the /1 route pointing at this
+  program's gateway 10.0.0.1), and enabling/disabling ICS sharing (only when
+  the user clicks "Share to game console").
+- On stop/exit, the routes and ICS state added by this program are rolled back;
+  routes belonging to other VPNs are never deleted or modified.
+- A normal installation does not download any binaries from the network; the
+  fallback download requires user confirmation and enforces SHA-256 verification.
 
-## 漏洞反馈
+## Reporting a Vulnerability
 
-- 请通过项目 Issue 反馈安全问题，并附最小复现步骤与影响范围。
+- Please report security issues through the project's Issue tracker, including
+  minimal reproduction steps and the scope of impact.
 
-## 杀毒软件 / SmartScreen 误报
+## Antivirus / SmartScreen False Positives
 
-- 本程序使用 PyInstaller 打包、请求管理员权限并修改系统路由，这些真实行为可能触发
-  "未知发布者"提示。请核对发行包的 SHA-256 清单后运行，不要为此关闭 Defender。
-- 如确认误报，请携带文件哈希与构建记录通过 Microsoft 官方样本提交渠道申诉。
+- This program is packaged with PyInstaller, requests administrator privileges,
+  and modifies system routes — these genuine behaviors may trigger
+  "unknown publisher" warnings. Please verify the SHA-256 manifest of the
+  release package before running; do not disable Defender for this reason.
+- If you confirm a false positive, appeal through Microsoft's official sample
+  submission channel with the file hash and build records.
