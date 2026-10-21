@@ -29,7 +29,7 @@ Windows PC  -- LinkHelm Desktop -->  virtual adapter (10.0.0.1)
 
 Please read this section carefully. It defines what this software **is** and, just as importantly, what it **is not**.
 
-1. **Personal learning and development only.** LinkHelm is released for personal study, research, and development use. **Commercial use is strictly prohibited.** (c) 2026 LinkHelm Developers.
+1. **Built for personal learning and development.** LinkHelm is released for personal study, research, and development use. The code is licensed under the **MIT License** (see [LICENSE](LICENSE)) — the same terms as the upstream project — which also permits commercial use; if you intend to use it commercially, the author asks that you make contact first via **jak21117@gmail.com**. (c) 2026 LinkHelm Developers.
 
 2. **It is not a general-purpose VPN or a network "unlock" tool.** LinkHelm does **not** tunnel arbitrary traffic through remote servers, does **not** hide your IP from the internet at large, and does **not** route around the policy of networks you do not control. The only thing it does is carry traffic **from your own Windows PC, through your own Android phone, out of the connection that phone already has.** Its "cross-proxy" capability is deliberately **locked to your own tethered phone** and cannot be pointed at an arbitrary upstream.
 
@@ -146,7 +146,7 @@ Pinned dependency sources and their SHA-256 values are documented in the source 
 
 ## License
 
-For personal learning and development use only. Commercial use is strictly prohibited. Provided "as is", without warranty. See the disclaimer above.
+Licensed under the MIT License (see [LICENSE](LICENSE)) — the same terms as the upstream project. The project targets personal learning and development; the MIT License permits commercial use, but the author asks for prior contact (**jak21117@gmail.com**). Provided "as is", without warranty. See the disclaimer above.
 
 ---
 

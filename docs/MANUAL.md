@@ -60,4 +60,4 @@ This is the short version. Full details are in the [README](../README.md).
 
 ---
 
-> Reminder / 提示: personal learning & development use only; no commercial use; the upstream is locked to your own tethered phone. 仅供个人学习开发使用，严禁商业用途；上游仅限你本人共享的手机。
+> Reminder / 提示: built for personal learning & development use; licensed under MIT — for commercial use the author asks for prior contact (jak21117@gmail.com); the upstream is locked to your own tethered phone. 面向个人学习开发使用；按 MIT 许可证授权，如需商用请先联系作者 (jak21117@gmail.com)；上游仅限你本人共享的手机。

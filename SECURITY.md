@@ -10,9 +10,15 @@
 - The Wi-Fi passphrase is never shown in the notification shade. It is randomly
   generated on first launch and persisted; it can only be viewed or changed in
   the settings page, and it is excluded from cloud backup and device migration.
-- SOCKS username/password authentication is not implemented: source filtering
-  narrows the attack surface but is not identity authentication. Do not bridge
-  the host to other networks and use it as a public proxy on untrusted networks.
+- SOCKS5 enforces username/password authentication (RFC 1929): clients that do
+  not offer credentials are rejected, and there is no no-auth fallback. The
+  initial credentials are fixed values shipped with the app, so anyone who
+  reads this repository knows them — change them in Settings on both ends
+  before relying on this protection.
+- Source filtering additionally restricts connections to the loopback range
+  and the Wi-Fi Direct /24 subnet; it is an extra layer, not a substitute for
+  the credential check. Do not bridge the host to other networks and use it
+  as a public proxy on untrusted networks.
 
 ## Permissions (Windows Client)
 
