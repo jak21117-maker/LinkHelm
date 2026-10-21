@@ -133,33 +133,19 @@ class ProxyServer internal constructor(
         // Wi-Fi Direct /24 so devices on other networks cannot use the open proxy.
         val allowedClientRanges: List<String> = emptyList(),
         val coreThreads: Int = 16,
-        // v1.5.45 (beta1.0.1): thread ceilings are no longer the resource story.
-        // A blocking-IO server spends one worker per connection, so "480/800
-        // threads" meant "480/800 live sessions" — exactly the active-connection
-        // explosion reported with compatibility mode. The real ceilings now
-        // live in the session caps below (maxTcpSessions / maxUdpAssociations,
-        // per-device quotas, admit queue); maxThreads only sizes the worker
-        // pool above those caps (sessions + reserve for accept/UDP-cleanup).
-        // STANDARD 160 = 96 sessions + 64 reserve; TURBO 288 = 192 + 96;
-        // COMPAT 112 = 48 + 64. Live profile swap: applySessionProfile().
-        val maxThreads: Int = 160,
-        // v1.5.45 (beta1.0.1, plan 4.1): STANDARD per-device TCP session ceiling
-        // is 32 (was 200). One busy device can no longer grab the whole pool.
-        // multiDeviceQuotaPerClient is now flat at the same value — the tier
-        // system that raised the per-IP ceiling for many-device hosts is gone:
-        // spreading the pool across devices happens through the GLOBAL session
-        // cap, not through per-IP generosity.
-        val maxConnectionsPerClient: Int = 32,
-        // v1.5.45 (beta1.0.1): NEW global session caps — the actual admission
-        // ceilings (threads are sized above them, never below).
-        val maxTcpSessions: Int = 96,
-        val maxTcpSessionsPerClient: Int = 32,
-        val maxUdpAssociations: Int = 24,
-        val maxUdpAssociationsPerClient: Int = 8,
-        // v1.5.45 (beta1.0.1): accept backlog = admit queue limit. A full queue
-        // refuses new connections fast (SOCKS5 \x05\xff) instead of letting the
-        // kernel backlog balloon — Karing/Streisand bursts fail cleanly.
-        val maxAdmitQueue: Int = 96,
+        // v1.5.46 (beta1.0.2): restored to the beta1.0.0 values that are
+        // proven with a single PC tunneling all its traffic. See the
+        // SessionProfile note above for the beta1.0.1 post-mortem.
+        val maxThreads: Int = 480,
+        val maxConnectionsPerClient: Int = 200,
+        // v1.5.45: global session caps — admission ceilings sized below the
+        // thread pool (threads stay the reserve for accept/UDP-cleanup).
+        val maxTcpSessions: Int = 384,
+        val maxTcpSessionsPerClient: Int = 200,
+        val maxUdpAssociations: Int = 48,
+        val maxUdpAssociationsPerClient: Int = 24,
+        // v1.5.45: accept backlog = admit queue limit.
+        val maxAdmitQueue: Int = 256,
         val workerKeepAliveMs: Long = 60_000L,
         val connectTimeoutMs: Int = 15_000,
         val handshakeTimeoutMs: Int = 15_000,
@@ -195,10 +181,9 @@ class ProxyServer internal constructor(
         // v1.5.0: NEW-connection per-IP ceiling while the pool is congested
         // (≥95% busy enters, <80% busy exits). Normal usage never touches
         // this; only admitted when the pool is nearly saturated.
-        // v1.5.45 (beta1.0.1): extreme-congestion overlay value (was 100) —
-        // must stay BELOW the smallest global cap (compat 48) or it would
-        // tighten nothing. 24 also matches the standard per-device budget.
-        val congestionQuotaPerClient: Int = 24,
+        // v1.5.46 (beta1.0.2): restored to 100 (beta1.0.0). With the generous
+        // caps above, the overlay must stay meaningful at ≥95% saturation.
+        val congestionQuotaPerClient: Int = 100,
         // v1.5.2 (LinkHelm dual-lane): optional SECOND listening socket for
         // the Windows lane router's standby lane. 0 = disabled (legacy single
         // port). Both accept loops feed the SAME executor and the SAME
@@ -280,11 +265,9 @@ class ProxyServer internal constructor(
     private val activeUdpGlobal = AtomicInteger(0)
     private val activeUdpByClient = ConcurrentHashMap<String, AtomicInteger>()
 
-    // v1.5.45 (beta1.0.1): the ≥3-device tier is gone. Per-device ceilings are
-    // now FLAT (32 standard / 16 compat / 64 turbo); spreading capacity across
-    // devices is the global session cap's job, not per-IP generosity. Field
-    // kept so existing call sites compile; it now mirrors the standard cap.
-    internal val multiDeviceQuotaPerClient: Int = 32
+    // v1.5.46 (beta1.0.2): the ≥3-device tier is RESTORED (150/IP after the
+    // 30s debounce) — beta1.0.1's flat per-device cap broke single-PC use.
+    internal val multiDeviceQuotaPerClient: Int = 150
 
     // v1.4.9: monotonic timestamp of the most recent ≥3-device observation —
     // the 150/IP tier is held for config.quotaDebounceMs after this, so the
@@ -312,15 +295,19 @@ class ProxyServer internal constructor(
         // below (sessions + reserve). Was 480/800 — with one worker per
         // connection that was a 480/800 live-session allowance, the direct
         // cause of the "active connections exploded" report.
-        const val NORMAL_MAX_THREADS = 160
-        const val TURBO_MAX_THREADS = 288
-        const val COMPAT_MAX_THREADS = 112
+        const val NORMAL_MAX_THREADS = 480
+        const val TURBO_MAX_THREADS = 800
+        const val COMPAT_MAX_THREADS = 480
 
-        // v1.5.45 (beta1.0.1, plan section 4.1): the three resource profiles.
-        // Compatibility mode is now the CONSERVATIVE one (fewest sessions) —
-        // its job is to keep third-party clients stable on weak phones, not to
-        // out-run the standard mode. Numbers are the plan's starting points,
-        // to be tuned by measurement, never raised "just in case".
+        // v1.5.46 (beta1.0.2): beta1.0.1's aggressive caps (48/16 per device)
+        // REJECTED the PC's legitimate traffic — the PC tunnels ALL of its
+        // internet through one source IP, and dozens of concurrent TCP flows
+        // are normal (tun2socks log: "connection was forcibly closed by the
+        // remote host"). The caps are restored to generous beta1.0.0-level
+        // values; the compatibility profile stays bounded (192/64) to keep
+        // third-party clients from exploding sessions, and the genuinely safe
+        // beta1.0.1 improvement (UDP idle reclamation + UDP budget) remains.
+        // Numbers are starting points — tune by measurement, not by fear.
         internal enum class SessionProfile(
             val maxThreads: Int,
             val maxTcpSessions: Int,
@@ -331,9 +318,9 @@ class ProxyServer internal constructor(
             val udpIdleTimeoutMs: Long,
             val udpCleanupIntervalMs: Long
         ) {
-            STANDARD(160, 96, 32, 24, 8, 96, 120_000L, 60_000L),
-            TURBO(288, 192, 64, 48, 16, 128, 180_000L, 90_000L),
-            COMPAT(112, 48, 16, 12, 4, 48, 90_000L, 45_000L)
+            STANDARD(480, 384, 200, 48, 24, 256, 120_000L, 60_000L),
+            TURBO(800, 640, 300, 64, 32, 256, 180_000L, 90_000L),
+            COMPAT(480, 192, 64, 32, 12, 256, 90_000L, 60_000L)
         }
 
         // v1.5.43: SOCKS5 credentials (RFC 1929) defaults. System-initial and fixed,
@@ -830,11 +817,20 @@ class ProxyServer internal constructor(
      *    device's connection count blips around the boundary.
      */
     internal fun perClientQuotaFor(deviceCountIncludingNew: Int): Int {
-        // v1.5.45 (beta1.0.1): FLAT per-device ceiling. The old ≥3-device tier
-        // (150/IP) existed to spread a 480-worker pool; the global session cap
-        // does that job now, so the tier only served to raise a single
-        // device's allowance — removed on purpose.
-        val base = config.maxTcpSessionsPerClient
+        // v1.5.46 (beta1.0.2): tier logic RESTORED from beta1.0.0 — a single
+        // PC legitimately holds 200 sessions; with ≥3 device IPs the ceiling
+        // drops to 150 so the pool is spread instead of grabbed.
+        val base = if (deviceCountIncludingNew >= 3) {
+            lastMultiDeviceQuotaAt.set(elapsedRealtimeMs())
+            multiDeviceQuotaPerClient
+        } else {
+            val held = lastMultiDeviceQuotaAt.get()
+            if (held != 0L && elapsedRealtimeMs() - held < config.quotaDebounceMs) {
+                multiDeviceQuotaPerClient
+            } else {
+                config.maxTcpSessionsPerClient
+            }
+        }
         // v1.5.0: extreme-congestion overlay — tightens NEW-connection
         // admission only; existing sessions and the exit path are untouched.
         return if (congestionActive.get()) minOf(base, config.congestionQuotaPerClient) else base

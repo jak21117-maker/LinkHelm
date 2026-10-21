@@ -1958,10 +1958,21 @@ class TunManager:
                     self._lane_a_fail_strikes = 0
                     continue
                 self._lane_a_fail_strikes += 1
-                if self._lane_a_fail_strikes < 3:
+                # v1.5.46 (beta1.0.2): 3 strikes under load were too twitchy —
+                # a busy phone (heavy pages, file transfer) can stall three
+                # 3s probes in a row and trigger a needless tunnel rebuild
+                # ("frequent disconnect/reconnect" reports). Now 5 strikes,
+                # and before any switch a 6s confirm probe must ALSO fail.
+                if self._lane_a_fail_strikes < 5:
                     self.log(
-                        f"Primary :8080 probe timed out ({self._lane_a_fail_strikes}/3); observing..."
+                        f"Primary :8080 probe timed out ({self._lane_a_fail_strikes}/5); observing..."
                     )
+                    continue
+                if self._probe_socks_port(self.phone_port, timeout=6.0):
+                    self.log(
+                        "Primary :8080 confirm probe (6s) passed; the earlier timeouts were transient, no lane switch."
+                    )
+                    self._lane_a_fail_strikes = 0
                     continue
                 if not self._probe_socks_port(SECONDARY_LANE_PORT, timeout=3.0):
                     self.log(
@@ -2255,7 +2266,7 @@ class App:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("LinkHelm Desktop beta1.0.1 | Windows")
+        self.root.title("LinkHelm Desktop beta1.0.2 | Windows")
         self.root.geometry(f"460x{min(770, max(620, root.winfo_screenheight() - 90))}")
         self.root.minsize(420, 590)
         self.root.configure(fg_color=self.BG)
@@ -3197,7 +3208,7 @@ class App:
         lang_var = ctk.StringVar(value=("中文" if LANG == "zh" else "English"))
         ctk.CTkSegmentedButton(
             lang_card, values=["English", "中文"], variable=lang_var,
-            command=lambda _v: _on_language_change(), progress_color=self.ACCENT
+            command=lambda _v: _on_language_change()
         ).pack(anchor="w", padx=14, pady=(0, 12))
 
         def _on_language_change():

@@ -152,7 +152,11 @@ class HostService : Service() {
             return instance.applyAuth(user, pass)
         }
 
-        private const val WATCHDOG_INTERVAL_MS = 15 * 60 * 1000L
+        // v1.5.46 (beta1.0.2): 15min -> 5min. START_STICKY + the 1s
+        // task-removed alarm handle most kills; this alarm is the last-resort
+        // resurrection when an OEM silently kills the process, and 15 minutes
+        // of dead air was too long ("connects but the phone side died").
+        private const val WATCHDOG_INTERVAL_MS = 5 * 60 * 1000L
         private const val WATCHDOG_REQUEST_CODE = 1001
         /**
          * v1.5.33: (re)arm the AlarmManager watchdog tick. The alarm is
