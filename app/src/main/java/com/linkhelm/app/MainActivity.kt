@@ -9,7 +9,9 @@ import android.os.Bundle
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.BorderStroke
@@ -21,6 +23,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -30,6 +33,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -320,17 +325,28 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
 
                     DebugLogSection()
 
-                    // Footer: short copyright / disclaimer + optional sponsor.
+                    // Footer: copyright / license notice + repository link.
                     // The developer log has been removed per policy.
                     Spacer(modifier = Modifier.height(20.dp))
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(
                             L10n.tr(
-                                "LinkHelm is for personal learning and development use only. Commercial use is strictly prohibited.",
-                                L10n.tr("LinkHelm is for personal learning and development use only. Commercial use is strictly prohibited.", "LinkHelm 仅供个人学习开发使用，严禁商业使用。")
+                                "Built for personal learning and development. Licensed under the MIT License (see LICENSE); for commercial use the author asks for prior contact (jak21117@gmail.com).",
+                                "面向个人学习与开发。按 MIT 许可证授权（见 LICENSE）；如需商用，请先联系作者 (jak21117@gmail.com)。"
                             ),
                             fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        val uriHandler = LocalUriHandler.current
+                        Text(
+                            text = "github.com/jak21117-maker/LinkHelm",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.clickable {
+                                uriHandler.openUri("https://github.com/jak21117-maker/LinkHelm")
+                            }
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
@@ -586,6 +602,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
         var socksPass by remember {
             mutableStateOf(prefs.getString("socks_pass", ProxyServer.DEFAULT_SOCKS_PASS) ?: ProxyServer.DEFAULT_SOCKS_PASS)
         }
+        var socksPassVisible by remember { mutableStateOf(false) }
         Spacer(modifier = Modifier.height(16.dp))
         Card(
             modifier = Modifier.fillMaxWidth().padding(16.dp),
@@ -622,8 +639,16 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                     label = { Text(L10n.tr("Password (8-13 alphanumeric)", "密码（8-13 位字母数字）")) },
                     modifier = Modifier.fillMaxWidth(),
                     leadingIcon = { Icon(Icons.Default.Lock, null) },
+                    trailingIcon = {
+                        IconButton(onClick = { socksPassVisible = !socksPassVisible }) {
+                            Icon(
+                                imageVector = if (socksPassVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = if (socksPassVisible) L10n.tr("Hide password", "隐藏密码") else L10n.tr("Show password", "显示密码")
+                            )
+                        }
+                    },
                     shape = RoundedCornerShape(12.dp),
-                    visualTransformation = PasswordVisualTransformation(),
+                    visualTransformation = if (socksPassVisible) VisualTransformation.None else PasswordVisualTransformation(),
                     singleLine = true
                 )
 
@@ -906,8 +931,9 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                                         if (realDeviceCount > 3)
                                             L10n.tr("${realDeviceCount} device(s) online; enabling this improves multi-device stability (uses more battery)", "当前 ${realDeviceCount} 台设备在线，建议开启以提升多设备稳定性（更耗电）")
                                         else
-                                            // v1.4.82: 480/800, with the dynamic quota explained
-                                            L10n.tr("Worker thread limit 480 -> 800; with 3+ devices the per-device connection cap drops to 150 (uses more battery)", "工作线程上限 480 → 800；3 台及以上设备时单机连接上限自动降为 150（更耗电）"),
+                                            // v1.5.45 (beta1.0.1): the old "480 -> 800 threads" copy is
+                                            // gone — threads now follow BOUNDED session caps.
+                                            L10n.tr("Session caps 96 -> 192 (64 per device); active connections stay capped, never unbounded (uses more battery)", "会话上限 96 → 192（单设备 64）；活动连接数有上限，不会无限增长（更耗电）"),
                                         fontSize = 11.sp,
                                         color = if (realDeviceCount > 3) Color(0xFFE65100)
                                         else MaterialTheme.colorScheme.onSurfaceVariant
@@ -918,7 +944,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                                         android.app.AlertDialog.Builder(ctxForTurbo)
                                             .setTitle(L10n.tr("Enable turbo mode?", "开启强力模式？"))
                                             .setMessage(
-                                                L10n.tr("Raises the worker thread limit to 800 to improve stability when multiple devices share the connection, ", "工作线程上限提升到 800，可改善多设备同时使用的稳定性，") +
+                                                L10n.tr("Raises the session caps (96 -> 192 TCP sessions, 64 per device) to improve stability when multiple devices share the connection, ", "将会话上限提升（TCP 会话 96 → 192，单设备 64）以改善多设备同时使用的稳定性，") +
                                                     L10n.tr("but increases power draw and heat.\n\nTakes effect immediately; no sharing restart needed.", "但会增加耗电与发热。\n\n改动立即生效，无需重启共享。")
                                             )
                                             .setPositiveButton(L10n.tr("Enable", "开启")) { _, _ ->
@@ -966,7 +992,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                                     )
                                     Text(
                                         if (compatOn)
-                                            L10n.tr("On: concurrent multi-source-port UDP sessions are returned precisely per target (immediate, slight overhead)", "已开启：UDP 多源端口并发会话按目标精确回发（立即生效，略增开销）")
+                                            L10n.tr("On: concurrent multi-source-port UDP sessions are returned precisely per target, with conservative session caps (48 TCP / 12 UDP) to keep third-party clients stable", "已开启：UDP 多源端口并发会话按目标精确回发，并采用保守会话上限（TCP 48 / UDP 12）保证第三方客户端稳定")
                                         else
                                             L10n.tr("Enable when clients such as Karing/Streisand have working TCP but UDP fails or drops packets; takes effect immediately", "Karing/Streisand 等客户端 TCP 正常但 UDP 不通/丢包时开启；立即生效"),
                                         fontSize = 11.sp,
@@ -993,6 +1019,11 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                 }
             }
         }
+
+        // v1.5.45 (beta1.0.1): file-transfer trial entry — single file <= 1 GB
+        // over the Wi-Fi Direct link only (never the SOCKS5 internet exit).
+        Spacer(modifier = Modifier.height(20.dp))
+        FileTransferCard()
 
         // v1.4.1: iPhone proxy-free entry moved to the bottom of the share page; tap to expand/collapse the guide
         Spacer(modifier = Modifier.height(20.dp))
@@ -1313,14 +1344,23 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
 
                 Spacer(modifier = Modifier.height(8.dp))
 
+                var clientPassVisible by remember { mutableStateOf(false) }
                 OutlinedTextField(
                     value = clientPass.value,
                     onValueChange = { clientPass.value = it },
                     label = { Text(L10n.tr("SOCKS5 password (8-13 alphanumeric)", "SOCKS5 密码（8-13 位字母数字）")) },
                     modifier = Modifier.fillMaxWidth(),
                     leadingIcon = { Icon(Icons.Default.Lock, null) },
+                    trailingIcon = {
+                        IconButton(onClick = { clientPassVisible = !clientPassVisible }) {
+                            Icon(
+                                imageVector = if (clientPassVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = if (clientPassVisible) L10n.tr("Hide password", "隐藏密码") else L10n.tr("Show password", "显示密码")
+                            )
+                        }
+                    },
                     shape = RoundedCornerShape(12.dp),
-                    visualTransformation = PasswordVisualTransformation(),
+                    visualTransformation = if (clientPassVisible) VisualTransformation.None else PasswordVisualTransformation(),
                     singleLine = true,
                     enabled = !isClientRunning.value && !isHostRunning.value
                 )
@@ -1848,6 +1888,147 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
             hostRunning?.let { putBoolean("host_was_running", it) }
             vpnRunning?.let { putBoolean("vpn_was_running", it) }
             apply()
+        }
+    }
+}
+
+/**
+ * v1.5.45 (beta1.0.1): file-transfer trial card — single file <= 1 GB over the
+ * Wi-Fi Direct link only (never the phone's internet exit), independent of the
+ * sharing service. See FileTransfer.kt for the wire protocol.
+ */
+@Composable
+fun FileTransferCard() {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("linkhelm_prefs", Context.MODE_PRIVATE) }
+    var targetIp by remember { mutableStateOf("192.168.49.2") }
+    var dirSet by remember {
+        mutableStateOf(prefs.getString(FileTransferProtocol.PREFS_KEY_DIR, null) != null)
+    }
+    val state = FileTransferBus.state
+
+    val dirLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            }
+            prefs.edit().putString(FileTransferProtocol.PREFS_KEY_DIR, uri.toString()).apply()
+            dirSet = true
+            HostService.restartFileTransferLive()
+        }
+    }
+    val fileLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            val user = prefs.getString("socks_user", ProxyServer.DEFAULT_SOCKS_USER)
+                ?: ProxyServer.DEFAULT_SOCKS_USER
+            val pass = prefs.getString("socks_pass", ProxyServer.DEFAULT_SOCKS_PASS)
+                ?: ProxyServer.DEFAULT_SOCKS_PASS
+            FileTransferClient.send(targetIp.trim(), user, pass, context.contentResolver, uri)
+        }
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(16.dp),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f))
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                L10n.tr("File Transfer (trial)", "文件传输（试用版）"),
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                L10n.tr(
+                    "Single file up to 1 GB, over the Wi-Fi Direct link only — never the phone's internet exit. Independent of sharing; SHA-256 verified.",
+                    "单文件最大 1 GB，仅走 Wi-Fi Direct 本地通道，不经手机外网出口；与网络共享互不影响，传输后校验 SHA-256。"
+                ),
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+
+            OutlinedButton(
+                onClick = { dirLauncher.launch(null) },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Icon(Icons.Default.Folder, null)
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (dirSet) L10n.tr("Save directory: set (tap to change)", "接收保存目录：已设置（点击更改）")
+                    else L10n.tr("Set the save directory", "设置接收保存目录")
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            OutlinedTextField(
+                value = targetIp,
+                onValueChange = { targetIp = it },
+                label = { Text(L10n.tr("PC address (default 192.168.49.2)", "电脑地址（默认 192.168.49.2）")) },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                shape = RoundedCornerShape(12.dp)
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Button(
+                onClick = { fileLauncher.launch(arrayOf("*/*")) },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Icon(Icons.Default.Send, null)
+                Spacer(Modifier.width(8.dp))
+                Text(L10n.tr("Send a file to the PC", "发送文件到电脑"))
+            }
+
+            if (state.active) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    L10n.tr(
+                        "${if (state.direction == "send") "Sending" else "Receiving"}: ${state.fileName} (${state.status})",
+                        "${if (state.direction == "send") "正在发送" else "正在接收"}：${state.fileName}（${state.status}）"
+                    ),
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                LinearProgressIndicator(
+                    progress = {
+                        if (state.totalBytes > 0) {
+                            (state.doneBytes.toFloat() / state.totalBytes).coerceIn(0f, 1f)
+                        } else 0f
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    "${state.doneBytes / 1024 / 1024} MB / ${state.totalBytes / 1024 / 1024} MB",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                TextButton(onClick = { FileTransferClient.cancel() }) {
+                    Text(L10n.tr("Cancel transfer", "取消传输"))
+                }
+            } else if (state.error != null) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    L10n.tr("Last transfer: ${state.error}", "上次传输：${state.error}"),
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
         }
     }
 }

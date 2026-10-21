@@ -1,5 +1,7 @@
 import customtkinter as ctk
 from tkinter import messagebox
+from tkinter import filedialog
+import file_transfer
 import queue
 import random
 import re
@@ -18,6 +20,7 @@ import zipfile
 import io
 import hashlib
 import platform
+import webbrowser
 from console_bridge import BridgeError, IcsManager
 # import symbols
 
@@ -2252,7 +2255,7 @@ class App:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("LinkHelm Desktop beta1.0.0 | Windows")
+        self.root.title("LinkHelm Desktop beta1.0.1 | Windows")
         self.root.geometry(f"460x{min(770, max(620, root.winfo_screenheight() - 90))}")
         self.root.minsize(420, 590)
         self.root.configure(fg_color=self.BG)
@@ -2552,6 +2555,26 @@ class App:
         )
         self.udp_button.pack(fill="x", pady=(0, 12))
 
+        # v1.5.45 (beta1.0.1): file-transfer trial entry — single file <= 1 GB
+        # over the Wi-Fi Direct link only (port 8765), independent of the
+        # tunnel; files never touch the phone's internet exit.
+        ft_card = ctk.CTkFrame(
+            self.content, fg_color=self.CARD, corner_radius=13,
+            border_width=1, border_color=self.BORDER
+        )
+        ft_card.pack(fill="x", pady=(12, 0))
+        ft_header = ctk.CTkFrame(ft_card, fg_color="transparent")
+        ft_header.pack(fill="x", padx=16, pady=9)
+        ctk.CTkLabel(
+            ft_header, text=tr("File Transfer (trial)", "文件传输（试用版）"),
+            font=("Segoe UI", 11, "bold"), text_color=self.TEXT
+        ).pack(side="left")
+        ctk.CTkButton(
+            ft_header, text=tr("Open", "打开"), width=95, height=24,
+            fg_color="transparent", hover_color=self.STATUS_BG,
+            text_color=self.ACCENT, command=self._open_file_transfer_dialog
+        ).pack(side="right")
+
         activity_card = ctk.CTkFrame(
             self.content, fg_color=self.CARD, corner_radius=13,
             border_width=1, border_color=self.BORDER
@@ -2583,12 +2606,27 @@ class App:
             text_color=self.MUTED, command=self._clear_log
         ).pack(anchor="e", padx=16, pady=(6, 12))
 
-        # Footer: short copyright / disclaimer only (developer log removed per policy).
+        # Footer: license notice + repository link (consistent with the MIT LICENSE).
         footer = ctk.CTkFrame(self.content, fg_color="transparent")
         footer.pack(fill="x", pady=(14, 0))
         ctk.CTkLabel(
             footer,
-            text=tr("LinkHelm is for personal learning and development use only. Commercial use is strictly prohibited. © 2026 LinkHelm Developers", "LinkHelm 仅供个人学习开发使用，严禁商业使用。© 2026 LinkHelm Developers"),
+            text=tr("Built for personal learning and development. Licensed under the MIT License (see LICENSE); for commercial use the author asks for prior contact (jak21117@gmail.com).", "面向个人学习与开发。按 MIT 许可证授权（见 LICENSE）；如需商用，请先联系作者 (jak21117@gmail.com)。"),
+            font=("Segoe UI", 10), text_color=self.MUTED, wraplength=560, justify="center"
+        ).pack()
+        ctk.CTkLabel(
+            footer,
+            text="github.com/jak21117-maker/LinkHelm",
+            font=("Segoe UI", 10), text_color="#2E9BFF", cursor="hand2"
+        ).pack()
+        link_label = footer.winfo_children()[-1]
+        link_label.bind(
+            "<Button-1>",
+            lambda _e: webbrowser.open("https://github.com/jak21117-maker/LinkHelm"),
+        )
+        ctk.CTkLabel(
+            footer,
+            text="© 2026 LinkHelm Developers",
             font=("Segoe UI", 10), text_color=self.MUTED
         ).pack()
 
@@ -2810,6 +2848,119 @@ class App:
     def _refresh_ethernet(self):
         self.refresh_ethernet_button.configure(state="disabled")
         threading.Thread(target=self._do_refresh_ethernet, daemon=True).start()
+
+    # ---- v1.5.45 (beta1.0.1): file-transfer trial -------------------------
+    def _open_file_transfer_dialog(self):
+        phone_ip = self.phone_ip.get().strip() or "192.168.49.1"
+        user = self.phone_user.get().strip() or DEFAULT_PHONE_USER
+        password = self.phone_pass.get().strip() or DEFAULT_PHONE_PASS
+        local_ip = file_transfer.local_ip_toward(phone_ip)
+
+        win = ctk.CTkToplevel(self.root)
+        win.title(tr("File Transfer (trial)", "文件传输（试用版）"))
+        win.geometry("470x380")
+        win.transient(self.root)
+        win.grab_set()
+
+        ctk.CTkLabel(
+            win, font=("Segoe UI", 12, "bold"), text_color=self.TEXT,
+            text=tr("Single file up to 1 GB, over the Wi-Fi Direct link only.\n"
+                    "Never touches the phone's internet exit; SHA-256 verified.",
+                    "单文件最大 1 GB，仅走 Wi-Fi Direct 本地通道。\n不经手机外网出口；传输后校验 SHA-256。")
+        ).pack(padx=16, pady=(14, 4))
+        ctk.CTkLabel(
+            win, font=("Segoe UI", 10), text_color=self.MUTED,
+            text=tr(f"This PC (for the phone to send to): {local_ip}:{file_transfer.FT_PORT}",
+                    f"本机地址（供手机发送到）：{local_ip}:{file_transfer.FT_PORT}")
+        ).pack(padx=16, pady=(0, 8))
+
+        status = ctk.CTkLabel(win, font=("Segoe UI", 10), text_color=self.MUTED,
+                              text=tr("Idle", "空闲"))
+        status.pack(padx=16, pady=(4, 2))
+        bar = ctk.CTkProgressBar(win, width=430)
+        bar.set(0)
+        bar.pack(padx=16, pady=(0, 10))
+
+        cancel_event = threading.Event()
+        self._ft_server = None
+
+        def _set_status(text, ok=None):
+            color = self.MUTED
+            if ok is True:
+                color = "#4ADE80"
+            elif ok is False:
+                color = "#F87171"
+            self.root.after(0, lambda: status.configure(text=text, text_color=color))
+
+        def _progress(done, total):
+            frac = (done / total) if total else 0.0
+            self.root.after(0, lambda: bar.set(frac))
+            self.root.after(0, lambda: status.configure(
+                text=f"{done // 1024 // 1024} MB / {total // 1024 // 1024} MB",
+                text_color=self.MUTED))
+
+        def _do_send():
+            path = filedialog.askopenfilename(
+                parent=win, title=tr("Pick a file to send (<= 1 GB)", "选择要发送的文件（≤ 1 GB）"))
+            if not path:
+                return
+            cancel_event.clear()
+
+            def worker():
+                try:
+                    file_transfer.send_file(
+                        phone_ip, user, password, path,
+                        progress_cb=_progress, cancel_event=cancel_event, log_fn=self.log)
+                    _set_status(tr("Sent and verified.", "已发送并校验。"), ok=True)
+                    self.root.after(0, lambda: bar.set(1.0))
+                except Exception as exc:
+                    _set_status(str(exc), ok=False)
+
+            threading.Thread(target=worker, daemon=True).start()
+            _set_status(tr("Sending...", "正在发送…"))
+
+        def _do_receive():
+            path = filedialog.asksaveasfilename(
+                parent=win, title=tr("Save the incoming file as", "接收文件保存为"),
+                initialfile="received.bin")
+            if not path:
+                return
+            self._ft_server = file_transfer.ReceiverServer(
+                local_ip, user, password, path, log_fn=self.log)
+            self._ft_server.start()
+            bar.set(0)
+            _set_status(tr("Waiting for the phone to send (stops after one file)...",
+                           "等待手机发送（接收一个文件后自动停止）…"))
+
+        def _cancel():
+            cancel_event.set()
+            if self._ft_server:
+                self._ft_server.stop()
+                self._ft_server = None
+            _set_status(tr("Cancelled.", "已取消。"), ok=False)
+
+        def _close():
+            cancel_event.set()
+            if self._ft_server:
+                self._ft_server.stop()
+                self._ft_server = None
+            win.destroy()
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(6, 14))
+        ctk.CTkButton(
+            btn_row, text=tr("Send a file to the phone", "发送文件到手机"),
+            fg_color=self.ACCENT, hover_color=self.STATUS_BG, text_color="#FFFFFF",
+            command=_do_send).pack(side="left", expand=True, fill="x", padx=(0, 4))
+        ctk.CTkButton(
+            btn_row, text=tr("Receive from the phone", "从手机接收文件"),
+            fg_color=self.STATUS_BG, hover_color=self.CARD, text_color=self.ACCENT,
+            command=_do_receive).pack(side="left", expand=True, fill="x", padx=4)
+        ctk.CTkButton(
+            btn_row, text=tr("Cancel", "取消"), width=60,
+            fg_color="transparent", hover_color=self.CARD, text_color=self.MUTED,
+            command=_cancel).pack(side="left", padx=(4, 0))
+        win.protocol("WM_DELETE_WINDOW", _close)
 
     def _do_refresh_ethernet(self):
         try:

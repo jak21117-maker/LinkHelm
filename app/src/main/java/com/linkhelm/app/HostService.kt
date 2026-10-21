@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.net.Uri
 import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pGroup
@@ -87,6 +88,9 @@ class HostService : Service() {
 
     private var proxyServer: ProxyServer? = null
     private var pendingServer: ProxyServer? = null
+    // v1.5.45 (beta1.0.1): file-transfer receiver (trial) — lives and dies with
+    // the sharing session, reuses the SOCKS5 credentials.
+    private var fileTransferServer: FileTransferServer? = null
     // v1.4.0: independent HTTP proxy module for iPhone / no-VPN clients (port 8081).
     // Failure here is non-fatal — the SOCKS5 path stays fully independent.
     @Volatile
@@ -118,6 +122,16 @@ class HostService : Service() {
         /** v1.5.0: apply the turbo toggle to the running pool, if sharing. */
         fun applyTurboModeLive(enabled: Boolean) {
             liveInstance?.applyTurbo(enabled)
+        }
+
+        /**
+         * v1.5.45 (beta1.0.1): (re)start the file-transfer receiver with the
+         * current save directory + SOCKS5 credentials, so picking a directory
+         * in the UI takes effect without restarting sharing. No-op (besides
+         * stopping) when no directory is set.
+         */
+        fun restartFileTransferLive() {
+            liveInstance?.restartFileTransfer()
         }
 
         /**
@@ -288,6 +302,7 @@ class HostService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        FileTransferApp.context = applicationContext
         p2pManager = getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
         p2pChannel = p2pManager.initialize(applicationContext, mainLooper, null)
         registerP2pRecoveryReceiver()
@@ -298,6 +313,19 @@ class HostService : Service() {
     /** v1.5.0: live turbo resize on the running proxy (no share restart). */
     private fun applyTurbo(enabled: Boolean) {
         proxyServer?.applyTurboMode(enabled)
+    }
+
+    /** v1.5.45 (beta1.0.1): rebuild the file-transfer receiver from current prefs. */
+    private fun restartFileTransfer() {
+        val prefs = getSharedPreferences("linkhelm_prefs", MODE_PRIVATE)
+        val dir = prefs.getString(FileTransferProtocol.PREFS_KEY_DIR, null)
+        fileTransferServer?.stop()
+        fileTransferServer = null
+        if (dir == null) return
+        val user = prefs.getString("socks_user", ProxyServer.DEFAULT_SOCKS_USER) ?: ProxyServer.DEFAULT_SOCKS_USER
+        val pass = prefs.getString("socks_pass", ProxyServer.DEFAULT_SOCKS_PASS) ?: ProxyServer.DEFAULT_SOCKS_PASS
+        fileTransferServer = FileTransferServer(user, pass, contentResolver, Uri.parse(dir)).also { it.start() }
+        Log.i("HostService", "File-transfer receiver (re)started on :${FileTransferProtocol.PORT}")
     }
 
     /** v1.5.41: live SOCKS5 compatibility-mode toggle on the running proxy (no share restart). */
@@ -610,7 +638,10 @@ class HostService : Service() {
             ?: ProxyServer.DEFAULT_SOCKS_PASS
         val config: ProxyServer.Config = ProxyServer.Config(
             bindAddress = "0.0.0.0",
-            maxThreads = if (turboMode) ProxyServer.TURBO_MAX_THREADS else ProxyServer.NORMAL_MAX_THREADS,
+            // v1.5.45 (beta1.0.1): the thread ceiling is no longer set here.
+            // Resource profiles (threads + session caps + per-device quotas +
+            // UDP idle) are applied via applyTurboMode/applyCompatMode below;
+            // the Config defaults are the STANDARD profile.
             // v1.3.2: loopback MUST be allowed — the bind-time SOCKS self-test
             // connects from 127.0.0.1 and was rejected by the P2P-only allow-list
             // (field symptom: SOCKS_HANDSHAKE_FAILED + "pending assignment"). Loopback is only
@@ -633,6 +664,9 @@ class HostService : Service() {
         )
         val server: ProxyServer = ProxyServer(config, AndroidProxyLogger)
         pendingServer = server
+        // v1.5.45 (beta1.0.1): restore the persisted Turbo toggle as a full
+        // resource profile (bounded session caps), not just a thread number.
+        if (turboMode) server.applyTurboMode(true)
         server.start()
         Log.i("HostService", "Proxy binding 0.0.0.0:${config.port}, display=$displayIp on iface ${ifaceName ?: "?"} (epoch=$epoch)")
         thread(name = "HostService-ProxyWatch", isDaemon = true) {
@@ -674,6 +708,18 @@ class HostService : Service() {
             val socksCompat = getSharedPreferences("linkhelm_prefs", MODE_PRIVATE)
                 .getBoolean("socks_compat_mode", false)
             if (socksCompat) server.applyCompatMode(true)
+            // v1.5.45 (beta1.0.1): file-transfer receiver (trial). Only starts
+            // when the user has picked a save directory; port 8765, same
+            // credentials as SOCKS5, Wi-Fi Direct sources only.
+            fileTransferServer?.stop()
+            val ftDir = getSharedPreferences("linkhelm_prefs", MODE_PRIVATE)
+                .getString(FileTransferProtocol.PREFS_KEY_DIR, null)
+            fileTransferServer = if (ftDir != null) {
+                FileTransferServer(socksUser, socksPass, contentResolver, Uri.parse(ftDir))
+                    .also { it.start() }
+            } else {
+                null
+            }
             // v1.4.0: independent HTTP proxy module (iPhone proxy-free / no-VPN clients).
             // Non-fatal: its failure never downgrades the SOCKS5 session.
             val httpPort = startHttpProxyLocked(epoch, displayIp, server)
@@ -1019,6 +1065,9 @@ class HostService : Service() {
         stateEpoch.incrementAndGet()
         stateHandler.removeCallbacksAndMessages(null)
         stopProxyLocked()
+        // v1.5.45 (beta1.0.1): the file-transfer receiver dies with sharing.
+        fileTransferServer?.stop()
+        fileTransferServer = null
         resetEndpoint()
         unregisterP2pRecoveryReceiver()
         // v1.5.34: stop the watchdog alarm on a clean shutdown.

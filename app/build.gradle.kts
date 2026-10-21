@@ -12,8 +12,8 @@ android {
         applicationId = "com.linkhelm.app"
         minSdk = 24
         targetSdk = 35
-        versionCode = 34
-        versionName = "beta1.0.0"
+        versionCode = 35
+        versionName = "beta1.0.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
