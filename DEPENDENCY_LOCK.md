@@ -71,8 +71,10 @@ Windows 用户态协议栈由独立**原生 C/C++ 引擎**承接：保留 tun2so
 - 构建：在 MSYS2 MinGW64 中执行 `ci/build-lwip.sh`（或 PowerShell 入口
   `ci/build-lwip.ps1`）。脚本会克隆固定提交、pin 死 lwIP 子树、编译 amd64、把
   `hev-socks5-tunnel.exe` 落到 `laptop_proxy/engine/`，并打印其 SHA-256 供此处回填。
-- **默认仍为 legacy**：`LwipEngine` 仅在环境变量 `LINKHELM_ENGINE=lwip` 且
-  `laptop_proxy/engine/hev-socks5-tunnel.exe` 存在时启用；二进制缺失时优雅报错，
-  不破坏现有 tun2socks 链路（任务书 104-G）。
-- 旧 tun2socks v2.7.0 + 20s CONNECT 补丁**保留**在安装包中，用户可在断开后切回。
+- **默认内核已切换为 lwIP（原生 C/C++）**：`EngineManager` 默认 `mode="lwip"`，只要
+  `laptop_proxy/engine/hev-socks5-tunnel.exe` 存在即启用；二进制缺失时**自动回退**到
+  备份 tun2socks（单例互斥持有 Wintun，两内核绝不同时在线，避免抢包"打架"）（任务书 104-G）。
+- 排障时可设环境变量 `LINKHELM_ENGINE=legacy` 强制走备份 tun2socks。
+- 旧 tun2socks v2.7.0 + 20s CONNECT 补丁作为**备份二进制保留**在安装包中；lwIP 不可用时
+  无缝回退，编译出 `hev-socks5-tunnel.exe` 后下次启动自动切回 lwIP，无需改动任何设置。
 - 在能够直连 GitHub 的环境实际编译后，务必回填上表提交号与 exe 的 SHA-256。

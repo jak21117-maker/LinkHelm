@@ -4,7 +4,8 @@ Windows 用户态的 IP/TCP/UDP 协议栈由独立原生引擎承接，Python �
 （生成配置、拉起/停止进程、互斥持有 Wintun、隔离每用户配置、停机清理）。
 协议栈本身绝不写进 Python —— 这正是任务书要求的"lwIP 用 C++ 重新编译"：
 
-  - LegacyEngine : 现有 tun2socks (Go) 二进制，行为完全不变（默认）。
+  - LegacyEngine : 现有 tun2socks (Go) 二进制，仅作备份（lwIP 未编译/缺失时
+                    自动回退，行为不变）；默认内核已是 lwIP，不再以它为主。
   - LwipEngine   : 原生 C/C++ 的 lwIP 引擎 (hev-socks5-tunnel)，由 MSYS2
                    编译出 hev-socks5-tunnel.exe（见 build-lwip.ps1）。本模块
                    只负责写配置、拉起该原生进程、回收资源。
