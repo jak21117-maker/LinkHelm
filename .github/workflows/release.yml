@@ -103,6 +103,8 @@ jobs:
         run: |
           FILES=("LinkHelm-Host-Android-${TAG}.apk" "LinkHelm.Desktop-${TAG}-win64.zip")
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # If a stale draft survived a tag force-move, publish it too.
+            gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY" || true
             gh release upload "$TAG" "${FILES[@]}" --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$TAG" "${FILES[@]}" \
