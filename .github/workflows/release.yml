@@ -26,8 +26,9 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - uses: android-actions/setup-android@v3
-
+      # The ubuntu runner ships a preinstalled Android SDK (ANDROID_HOME);
+      # only license acceptance is needed — AGP auto-installs any missing
+      # platform/build-tools components.
       - name: Accept SDK licenses
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 

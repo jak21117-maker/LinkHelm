@@ -23,7 +23,6 @@ laptop_proxy/__pycache__/
 laptop_proxy/tests/__pycache__/
 laptop_proxy/.pytest_cache/
 laptop_proxy/*.txt
-laptop_proxy/*.spec
 laptop_proxy/file_version_info.txt
 
 # Log files
