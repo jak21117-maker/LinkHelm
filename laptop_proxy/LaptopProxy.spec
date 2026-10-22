@@ -1,8 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from PyInstaller.utils.hooks import collect_data_files
 
 datas = []
 datas += collect_data_files('customtkinter')
+
+# beta1.0.4: native C/C++ lwIP engine, compiled into laptop_proxy/engine/ by
+# ci/build-lwip.ps1 (MSYS2) or ci/build-lwip-wsl.sh (WSL cross-compile).
+# Optional on purpose: absent until the engine is built, then packed
+# automatically so this very spec produces the lwIP-default package.
+# engine.py resolves LWIP_EXE next to itself (BIN_DIR/engine/...), hence
+# the 'engine' target dir (= _MEIPASS/engine in the frozen onedir layout).
+_lwip_binaries = [
+    ('engine/' + name, 'engine')
+    for name in ('hev-socks5-tunnel.exe', 'wintun.dll')
+    if os.path.isfile('engine/' + name)
+]
 
 block_cipher = None
 
@@ -14,6 +27,7 @@ a = Analysis(
     binaries=[
         ('bundled_bin/tun2socks.exe', 'bin'),
         ('bundled_bin/wintun.dll', 'bin'),
+        *_lwip_binaries,
     ],
     datas=datas,
     # v1.4.93: pystray picks its Windows backend dynamically (pystray._win32)

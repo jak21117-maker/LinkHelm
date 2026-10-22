@@ -6,15 +6,14 @@ Windows 用户态的 IP/TCP/UDP 协议栈由独立原生引擎承接，Python �
 
   - LegacyEngine : 现有 tun2socks (Go) 二进制，仅作备份（lwIP 未编译/缺失时
                     自动回退，行为不变）；默认内核已是 lwIP，不再以它为主。
-  - LwipEngine   : 原生 C/C++ 的 lwIP 引擎 (hev-socks5-tunnel)，由 MSYS2
-                   编译出 hev-socks5-tunnel.exe（见 build-lwip.ps1）。本模块
-                   只负责写配置、拉起该原生进程、回收资源。
+  - LwipEngine   : 原生 C/C++ 的 lwIP 引擎 (hev-socks5-tunnel)，由 MSYS2 或
+                   WSL 交叉编译出 hev-socks5-tunnel.exe（见 ci/build-lwip*）。
+                   本模块只负责写配置、拉起该原生进程、回收资源。
 
 EngineManager 同时刻只允许一个引擎持有 Wintun 会话，禁止新旧双内核抢包。
 """
 from __future__ import annotations
 
-import json
 import os
 import threading
 import urllib.parse
@@ -83,27 +82,41 @@ class LwipEngine(NetworkEngine):
     def build_launch(self, proxy_url: str, mtu: int = 1420):
         os.makedirs(ENGINE_CONFIG_DIR, exist_ok=True)
         host, port, user, pw = _parse_proxy_url(proxy_url)
-        # 凭据只进每用户配置文件，不进日志、不进命令行参数。
-        config = {
-            "log-level": "info",
-            "log-file": os.path.join(ENGINE_CONFIG_DIR, "lwip.log"),
-            "pid-file": os.path.join(ENGINE_CONFIG_DIR, "lwip.pid"),
-            "socks5": {
-                "server": host,
-                "port": port,
-                "username": user,
-                "password": pw,
-                "mtu": mtu,
-            },
-            "wintun": {
-                "name": ADAPTER_NAME,
-                "mtu": mtu,
-            },
-        }
-        cfg_path = os.path.join(ENGINE_CONFIG_DIR, "config.json")
-        with open(cfg_path, "w", encoding="utf-8") as fh:
-            json.dump(config, fh, indent=2)
-        return LWIP_EXE, ["--config", cfg_path], ENGINE_CONFIG_DIR
+
+        def q(s) -> str:
+            # YAML 单引号字面量：内部 ' 翻倍；反斜杠保持原样（Windows 路径安全）。
+            return "'" + str(s).replace("'", "''") + "'"
+
+        # 凭据只进每用户配置文件（YAML 是 Hev 的原生配置格式），不进日志、
+        # 不进命令行参数。键名/结构严格按 Hev 的 conf schema：
+        # tunnel.* 开 Wintun 适配器，socks5.* 指上游，misc.* 日志与 pid。
+        lines = [
+            "tunnel:",
+            f"  name: {ADAPTER_NAME}",
+            f"  mtu: {int(mtu)}",
+            "  ipv4: 198.18.0.1",
+            "  ipv6: 'fc00::1'",
+            "  icmp: 'off'",
+            "socks5:",
+            f"  address: {q(host)}",
+            f"  port: {int(port)}",
+            "  udp: 'udp'",
+        ]
+        if user:
+            lines.append(f"  username: {q(user)}")
+        if pw:
+            lines.append(f"  password: {q(pw)}")
+        lines += [
+            "misc:",
+            f"  log-file: {q(os.path.join(ENGINE_CONFIG_DIR, 'lwip.log'))}",
+            "  log-level: info",
+            f"  pid-file: {q(os.path.join(ENGINE_CONFIG_DIR, 'lwip.pid'))}",
+        ]
+        cfg_path = os.path.join(ENGINE_CONFIG_DIR, "main.yml")
+        with open(cfg_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(lines) + "\n")
+        # Hev 用位置参数接收配置路径（hev-socks5-tunnel <config.yml>）。
+        return LWIP_EXE, [cfg_path], ENGINE_CONFIG_DIR
 
     def configured(self) -> bool:
         return os.path.isfile(LWIP_EXE)
