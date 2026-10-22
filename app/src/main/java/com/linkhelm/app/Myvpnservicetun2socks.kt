@@ -98,7 +98,9 @@ class MyVpnServiceTun2Socks : VpnService() {
         startForegroundNotification()
 
         thread(name = "ProxyTest") {
-            if (DebugUtils.testProxyConnection(proxyIp, proxyPort)) {
+            // beta1.0.4: single unified handshake (was a separate TCP pre-check
+            // that opened its own connection on top of the per-tick keepalive).
+            if (UpstreamNetworkManager.singleHandshake(proxyIp, proxyPort, proxyUser, proxyPass)) {
                 startVpnWithTun2Socks()
             } else {
                 updateNotification("Error: Cannot reach proxy at $proxyIp:$proxyPort")
@@ -207,25 +209,21 @@ class MyVpnServiceTun2Socks : VpnService() {
                 var failures = 0
                 var degraded = false
                 while (isRunning) {
-                    try {
-                        java.net.Socket().use { probe ->
-                            probe.connect(java.net.InetSocketAddress(proxyIp, proxyPort), 2000)
-                            probe.getOutputStream().write(byteArrayOf(5, 1, 0))
-                            probe.getOutputStream().flush()
-                            val resp = ByteArray(2)
-                            val n = probe.getInputStream().read(resp)
-                            if (n == 2 && resp[0] == 5.toByte()) {
-                                if (degraded) {
-                                    degraded = false
-                                    DebugUtils.log("✓ Link warm again after $failures misses")
-                                    updateNotification(L10n.tr("LinkHelm connected $proxyIp:$proxyPort", "✓ LinkHelm 已连接 $proxyIp:$proxyPort"))
-                                }
-                                failures = 0
-                            } else {
-                                failures++
-                            }
+                    // beta1.0.4: ONE negotiated handshake per tick (replaces the
+                    // inline greeting that opened a parallel connection and fought
+                    // the host's UDP probe for the radio). Auth-aware so a wrong
+                    // credential is not mistaken for a live link.
+                    val alive = UpstreamNetworkManager.singleHandshake(
+                        proxyIp, proxyPort, proxyUser, proxyPass, timeoutMs = 2000
+                    )
+                    if (alive) {
+                        if (degraded) {
+                            degraded = false
+                            DebugUtils.log("✓ Link warm again after $failures misses")
+                            updateNotification(L10n.tr("LinkHelm connected $proxyIp:$proxyPort", "✓ LinkHelm 已连接 $proxyIp:$proxyPort"))
                         }
-                    } catch (e: Exception) {
+                        failures = 0
+                    } else {
                         failures++
                     }
                     if (failures >= LINK_KEEPALIVE_FAST_STRIKES && !degraded) {

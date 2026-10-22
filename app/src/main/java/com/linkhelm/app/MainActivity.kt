@@ -1908,7 +1908,10 @@ fun FileTransferCard() {
     var paired by remember { mutableStateOf(FileTransferPairs.pairedSet()) }
     var pairMsg by remember { mutableStateOf<String?>(null) }
     var pairing by remember { mutableStateOf(false) }
-    val isTargetPaired = paired.contains(targetIp.trim())
+    // beta1.0.4: normalize the typed address (drop an optional :port) so the
+    // paired-set lookup matches what pair() actually stored.
+    val peerHost = FileTransferProtocol.parsePeerAddress(targetIp.trim()).first
+    val isTargetPaired = paired.contains(peerHost)
 
     val dirLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
@@ -2026,7 +2029,7 @@ fun FileTransferCard() {
                         ?: ProxyServer.DEFAULT_SOCKS_PASS
                     thread(name = "FT-Pair", isDaemon = true) {
                         val err = FileTransferClient.pair(ip, user, pass)
-                        pairMsg = err ?: "已与 $ip 完成配对"
+                        pairMsg = err ?: "已与 $peerHost 完成配对"
                         pairing = false
                         localIp = FileTransferPairs.localLanIp()
                         paired = FileTransferPairs.pairedSet()

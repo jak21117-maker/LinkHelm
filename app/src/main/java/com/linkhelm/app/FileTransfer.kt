@@ -41,6 +41,24 @@ internal object FileTransferProtocol {
     const val CHUNK = 128 * 1024
     const val PREFS_KEY_DIR = "ft_dir_uri"
     const val PREFS_KEY_PAIRED = "ft_paired_ips"
+
+    /**
+     * beta1.0.4: accept either "192.168.49.2" or "192.168.49.2:8765". The peer's
+     * displayed address may already include the port; never append the default a
+     * second time (that produced "192.168.49.2:8765:8765" and a failed connect).
+     */
+    internal fun parsePeerAddress(raw: String): Pair<String, Int> {
+        val s = raw.trim()
+        val lastColon = s.lastIndexOf(':')
+        if (lastColon > 0) {
+            val host = s.substring(0, lastColon)
+            val port = s.substring(lastColon + 1).toIntOrNull()
+            if (port != null && port in 1..65535 && host.isNotEmpty() && !host.contains(':')) {
+                return host to port
+            }
+        }
+        return s to PORT
+    }
 }
 
 /**
@@ -395,16 +413,17 @@ internal object FileTransferClient {
      * reason. Runs on the calling thread (short request, 5s timeouts).
      */
     fun pair(targetIp: String, user: String, pass: String): String? {
+        val (host, port) = FileTransferProtocol.parsePeerAddress(targetIp)
         return runCatching {
             Socket().use { client ->
-                client.connect(InetSocketAddress(targetIp, FileTransferProtocol.PORT), 5_000)
+                client.connect(InetSocketAddress(host, port), 5_000)
                 client.soTimeout = 5_000
                 val output = BufferedOutputStream(client.getOutputStream())
                 val input = BufferedInputStream(client.getInputStream())
                 writeLine(output, "PAIR $user $pass")
                 when (readLine(input)) {
                     "PAIRED" -> {
-                        FileTransferPairs.addPaired(targetIp)
+                        FileTransferPairs.addPaired(host)
                         null
                     }
                     "ERR busy" -> "对端正忙，请稍后再试"
@@ -414,15 +433,16 @@ internal object FileTransferClient {
         }.getOrElse {
             when {
                 it.message?.contains("timeout", true) == true -> "连接超时：请确认对方 IP 正确且与主机在同一 Wi-Fi Direct 网络"
-                else -> "无法连接 ${targetIp}:${FileTransferProtocol.PORT}（${it.message ?: "未知错误"}）"
+                else -> "无法连接 ${host}:${port}（${it.message ?: "未知错误"}）"
             }
         }
     }
 
     fun unpair(targetIp: String, user: String, pass: String) {
+        val (host, port) = FileTransferProtocol.parsePeerAddress(targetIp)
         runCatching {
             Socket().use { client ->
-                client.connect(InetSocketAddress(targetIp, FileTransferProtocol.PORT), 5_000)
+                client.connect(InetSocketAddress(host, port), 5_000)
                 client.soTimeout = 5_000
                 val output = BufferedOutputStream(client.getOutputStream())
                 val input = BufferedInputStream(client.getInputStream())
@@ -430,7 +450,7 @@ internal object FileTransferClient {
                 readLine(input)
             }
         }
-        FileTransferPairs.removePaired(targetIp)
+        FileTransferPairs.removePaired(host)
     }
 
     fun send(targetIp: String, user: String, pass: String, resolver: ContentResolver, fileUri: Uri) {
@@ -460,8 +480,9 @@ internal object FileTransferClient {
             try {
                 val sha = resolver.openInputStream(fileUri)?.use { sha256Hex(it) }
                     ?: throw IOException("Cannot open the picked file")
+                val (host, port) = FileTransferProtocol.parsePeerAddress(targetIp)
                 val client = Socket().apply {
-                    connect(InetSocketAddress(targetIp, FileTransferProtocol.PORT), 8_000)
+                    connect(InetSocketAddress(host, port), 8_000)
                     soTimeout = 60_000
                 }
                 socket = client

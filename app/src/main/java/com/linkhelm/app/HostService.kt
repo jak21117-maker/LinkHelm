@@ -769,27 +769,19 @@ class HostService : Service() {
                     publishUdpStatus(L10n.tr("Auto probe disabled", "自动检测已关闭"))
                     return@thread
                 }
-                publishUdpStatus(L10n.tr("Probing... (DNS queries sent via the UDP relay in candidate-pool order)", "检测中…（经 UDP 中继按候选池顺序发送 DNS 查询）"))
-                val attempts = mutableListOf<String>()
-                var success: String? = null
-                for (dns in UDP_SELF_TEST_DNS_POOL) {
-                    if (epoch != stateEpoch.get() || !isServiceRunning) return@thread
-                    val error = UdpProbe.socks5UdpDnsProbe(
-                        "127.0.0.1", config.port, dnsHost = dns,
-                        socksUser = config.socksUser, socksPass = config.socksPass
-                    )
-                    if (error == null) {
-                        success = dns
-                        break
-                    }
-                    attempts.add("$dns: $error")
-                    Log.i("HostService", "UDP self-test try failed ($dns): $error; trying next candidate")
-                }
+                publishUdpStatus(L10n.tr("Probing... (single deep probe via the UDP relay, first success wins)", "检测中…（经 UDP 中继单点深度探测，任一候选成功即过）"))
+                // beta1.0.4: collapse the old multi-probe into ONE deep probe that
+                // short-circuits on the first working candidate (was: every chain
+                // had to pass). Same relay path, far fewer live connections.
+                val success = UpstreamNetworkManager.deepProbe(
+                    "127.0.0.1", config.port,
+                    user = config.socksUser, pass = config.socksPass
+                )
                 if (epoch != stateEpoch.get() || !isServiceRunning) return@thread
                 val status = if (success != null) {
                     L10n.tr("OK (via UDP relay to $success:53, connectivity diagnostics only)", "✓ 正常（经 UDP 中继到 $success:53，仅用于连通性诊断）")
                 } else {
-                    L10n.tr("Failed: ", "✗ 失败：") + attempts.joinToString("; ")
+                    L10n.tr("Failed: all candidates unreachable", "✗ 失败：所有候选均不可达")
                 }
                 publishUdpStatus(status)
                 Log.i("HostService", "UDP self-test: $status")

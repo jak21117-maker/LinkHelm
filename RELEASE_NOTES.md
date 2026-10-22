@@ -1,3 +1,29 @@
+## LinkHelm beta1.0.4
+
+底层与架构迁移（研发测试构建，非性能承诺版）。
+
+### Windows 端：换用原生 C/C++ 引擎（lwIP）
+- 数据面主体改为 **C/C++ 原生引擎**（基于 HevSocks5Tunnel，内含 lwIP + Wintun），
+  Python 仅做 GUI 与编排（拉起进程、生成配置、管理 Wintun 互斥、清理），
+  **不再用纯 Python 处理隧道**，从根上解决旧版纯 Python 核心不稳的问题。
+- 新增 `EngineManager`：同一时刻只允许一个引擎持有 Wintun，禁止新旧双内核抢包；
+  默认引擎 = **lwIP**，tun2socks v2.7.0 仅作为**备份二进制**保留在包内，
+  原生 lwIP 二进制缺失时自动回退（两者永不同时在线，不会打架）。
+- 通过 `ci/build-lwip.ps1`（MSYS2/MinGW）按固定提交编译 `hev-socks5-tunnel.exe`，
+  产物落到 `laptop_proxy/engine/`，依赖提交号与 SHA-256 记入 `DEPENDENCY_LOCK.md`。
+- 环境变量 `LINKHELM_ENGINE=legacy` 可强制走备份（仅排障）。
+
+### 安卓端：出站探测收敛
+- 新增 `UpstreamNetworkManager`：把原先分散的 **TCP 预检 + 每 10s SOCKS5 问候保活 +
+  UDP/DNS 中继自测** 三路各自开连接、互相抢链路的"三握手"收敛为**单次统一握手**，
+  深度探测改为**任一候选成功即过**（不再要求三链全过），显著降低活动连接与会话数，
+  缓解并发高负载下手机会话数触及上限、数台设备挤爆的问题。
+- 修复配对地址 `IP:端口` 被双重拼接为 `IP:端口:端口` 导致连接失败的 bug（现自动归一化）。
+
+### 说明
+- 本版为底层迁移验证构建；以相同 Android Host、同网络、同负载做新旧内核对照，
+  达标后再设为默认。原 tun2socks 备份不删除，必要时可回退。
+
 ## LinkHelm beta1.0.3
 
 Three iterations of capacity engineering since beta1.0.0, capped by a  

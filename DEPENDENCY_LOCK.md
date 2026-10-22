@@ -52,3 +52,27 @@ a mismatched hash is never installed.
 pyinstaller==6.10.0 · customtkinter==5.2.2 · darkdetect==0.8.0 · pytest>=8.0,<9 · pytest-mock>=3.12,<4
 
 (After building, record the actually resolved versions from `pip freeze` in the release notes.)
+
+---
+
+## Windows lwIP 引擎（beta1.0.4 新增，任务书 104-B）
+
+Windows 用户态协议栈由独立**原生 C/C++ 引擎**承接：保留 tun2socks 作为 legacy
+回退，新增基于 **HevSocks5Tunnel（lwIP + Wintun）** 的对照内核。`engine.py` 的
+`LwipEngine` 只负责生成配置、拉起 `hev-socks5-tunnel.exe`、互斥持有 Wintun、隔离
+每用户配置、停机清理——**TCP/UDP/DNS 协议栈全在 C 里，不写进 Python**。
+
+| Component | 版本/提交 | 源码 | SHA-256 (exe) | 许可证 |
+|---|---|---|---|---|
+| HevSocks5Tunnel | `TODO_PIN_HEV_COMMIT` | https://github.com/heiher/hev-socks5-tunnel | 待编译后回填 | MIT |
+| lwIP（Hev 子树 third/lwip） | `TODO_PIN_LWIP_COMMIT` | 随 Hev 子模块 | — | BSD-3-Clause |
+| Wintun | 0.14.1 | 见上表（与 legacy 共用） | `e5da8447…`(dll) | 见 wintun.net |
+
+- 构建：在 MSYS2 MinGW64 中执行 `ci/build-lwip.sh`（或 PowerShell 入口
+  `ci/build-lwip.ps1`）。脚本会克隆固定提交、pin 死 lwIP 子树、编译 amd64、把
+  `hev-socks5-tunnel.exe` 落到 `laptop_proxy/engine/`，并打印其 SHA-256 供此处回填。
+- **默认仍为 legacy**：`LwipEngine` 仅在环境变量 `LINKHELM_ENGINE=lwip` 且
+  `laptop_proxy/engine/hev-socks5-tunnel.exe` 存在时启用；二进制缺失时优雅报错，
+  不破坏现有 tun2socks 链路（任务书 104-G）。
+- 旧 tun2socks v2.7.0 + 20s CONNECT 补丁**保留**在安装包中，用户可在断开后切回。
+- 在能够直连 GitHub 的环境实际编译后，务必回填上表提交号与 exe 的 SHA-256。

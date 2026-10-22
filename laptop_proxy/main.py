@@ -1429,11 +1429,21 @@ class TunManager:
         self.log("Starting the LinkHelm adapter...")
         # v1.5.47: dual-lane router removed — tun2socks dials the phone directly
         # (lightweight 8082 failover lives in the health monitor).
-        cmd = tun2socks_cmd(t2s_exe, self._tun2socks_proxy_url())
+        # beta1.0.4: route the launch through EngineManager. Default mode is
+        # "legacy" (identical tun2socks command); "lwip" swaps in the native
+        # C/C++ lwIP engine (hev-socks5-tunnel.exe) once it is built & present.
+        from engine import ENGINE_MANAGER
+        ENGINE_MANAGER.set_legacy_binary(t2s_exe)
+        (exe, args, cwd), engine_name, engine_note = ENGINE_MANAGER.build_launch(
+            self._tun2socks_proxy_url()
+        )
+        self.log(f"Engine selected: {engine_name}")
+        if engine_note:
+            self.log(f"[engine] {engine_note}")
 
         # Hide window on Windows, capture output
         cflags = 0x08000000 if IS_WINDOWS else 0
-        self.process = subprocess.Popen(cmd, cwd=BIN_DIR, creationflags=cflags,
+        self.process = subprocess.Popen([exe, *args], cwd=cwd, creationflags=cflags,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self._read_tun2socks_output()
 
@@ -1722,6 +1732,13 @@ class TunManager:
         # cannot connect"). Here we sweep unconditionally and confirm death, so the
         # SOCKS5 tunnel is fully cut when the disconnect button returns.
         _kill_tun2socks_all(log_fn=self.log)
+        # beta1.0.4: release engine-owned resources (e.g. lwIP pid file) so the
+        # next session starts clean. Legacy engine teardown is a no-op.
+        try:
+            from engine import ENGINE_MANAGER
+            ENGINE_MANAGER.teardown()
+        except Exception:
+            pass
         self.log("Connection stopped.")
 
     def _read_tun2socks_output(self):
@@ -2310,7 +2327,7 @@ class App:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("LinkHelm Desktop beta1.0.3 | Windows")
+        self.root.title("LinkHelm Desktop beta1.0.4 | Windows")
         self.root.geometry(f"460x{min(770, max(620, root.winfo_screenheight() - 90))}")
         self.root.minsize(420, 590)
         self.root.configure(fg_color=self.BG)
