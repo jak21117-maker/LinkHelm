@@ -62,19 +62,29 @@ Windows 用户态协议栈由独立**原生 C/C++ 引擎**承接：保留 tun2so
 `LwipEngine` 只负责生成配置、拉起 `hev-socks5-tunnel.exe`、互斥持有 Wintun、隔离
 每用户配置、停机清理——**TCP/UDP/DNS 协议栈全在 C 里，不写进 Python**。
 
-| Component | 版本/提交 | 源码 | SHA-256 (exe) | 许可证 |
+| Component | 版本/提交 | 源码 | SHA-256 | 许可证 |
 |---|---|---|---|---|
-| HevSocks5Tunnel | `TODO_PIN_HEV_COMMIT` | https://github.com/heiher/hev-socks5-tunnel | 待编译后回填 | MIT |
-| lwIP（Hev 子树 third/lwip） | `TODO_PIN_LWIP_COMMIT` | 随 Hev 子模块 | — | BSD-3-Clause |
-| Wintun | 0.14.1 | 见上表（与 legacy 共用） | `e5da8447…`(dll) | 见 wintun.net |
+| HevSocks5Tunnel (win64 exe) | 2.19.1 | 官方 Windows 构建 `releases/download/2.19.1/hev-socks5-tunnel-win64.zip` | `242557dc4ada5a45bcc02d98a558e86dd29025efdf7960b8e302bfc2ad1901c5` (exe, 316416 B) | MIT |
+| msys-2.0.dll（官方 exe 的运行时依赖） | 随官方 zip | 同上 | `1410599ee2efcede0869abec8910398d688755952e59cf7983b15cac6de78201` (3368065 B) | GPL（MSYS2 运行时） |
+| lwIP（Hev 子模块 third-part/lwip） | `e6d5fc6cdc7c2ab379ffffd13dfdc99fb826a86c` | 随 Hev 子模块（编译进 exe） | — | BSD-3-Clause |
+| HevSocks5Core（子模块 src/core） | `9f1cf0bfca0c003dd0cf0fbdcf6912a2b46a8d05` | 随 Hev 子模块（编译进 exe） | — | MIT |
+| Wintun | 0.14.1 | 官方 zip 内置（与 legacy 共用同一文件） | `e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce` (427552 B) | 见 wintun.net |
 
-- 构建：在 MSYS2 MinGW64 中执行 `ci/build-lwip.sh`（或 PowerShell 入口
-  `ci/build-lwip.ps1`）。脚本会克隆固定提交、pin 死 lwIP 子树、编译 amd64、把
-  `hev-socks5-tunnel.exe` 落到 `laptop_proxy/engine/`，并打印其 SHA-256 供此处回填。
+- **采用官方 Windows 二进制（推荐路径，已采用）**：直接取 Hev 发布页的
+  `hev-socks5-tunnel-win64.zip`，解出 `hev-socks5-tunnel.exe` / `wintun.dll` /
+  `msys-2.0.dll` 三个文件放入 `laptop_proxy/engine/`。这是维护者自己的原生
+  Windows 构建，规避了两类自编译问题：① MinGW 交叉编译缺 POSIX 兼容头
+  （`netinet/in.h` 需完整 `mingw-w64-x86-64-dev` 包）；② Hev rbtree 的
+  `unsigned long __parent_color` 在 Windows LLP64 下为 32 位，指针截断告警
+  （`-Wpointer-to-int-cast`），自编译需 `-Wno-error` 且存在理论风险。
+- **`msys-2.0.dll` 必须与 exe 同目录**（官方 exe 链接了 MSYS2 运行时）；
+  `LaptopProxy.spec` 已把它列入 engine 打包清单。
+- 自编译备选：`ci/build-lwip-wsl.sh`（WSL 交叉编译）或 `ci/build-lwip.ps1`
+  （MSYS2）。注意 WSL 路线需安装完整 `mingw-w64` 元包（不能只装 gcc，否则缺
+  `netinet/in.h`）。产物同样落 `laptop_proxy/engine/`，SHA-256 回填上表。
 - **默认内核已切换为 lwIP（原生 C/C++）**：`EngineManager` 默认 `mode="lwip"`，只要
   `laptop_proxy/engine/hev-socks5-tunnel.exe` 存在即启用；二进制缺失时**自动回退**到
   备份 tun2socks（单例互斥持有 Wintun，两内核绝不同时在线，避免抢包"打架"）（任务书 104-G）。
 - 排障时可设环境变量 `LINKHELM_ENGINE=legacy` 强制走备份 tun2socks。
 - 旧 tun2socks v2.7.0 + 20s CONNECT 补丁作为**备份二进制保留**在安装包中；lwIP 不可用时
-  无缝回退，编译出 `hev-socks5-tunnel.exe` 后下次启动自动切回 lwIP，无需改动任何设置。
-- 在能够直连 GitHub 的环境实际编译后，务必回填上表提交号与 exe 的 SHA-256。
+  无缝回退，放入 `hev-socks5-tunnel.exe` 后下次启动自动切回 lwIP，无需改动任何设置。

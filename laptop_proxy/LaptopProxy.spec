@@ -5,15 +5,18 @@ from PyInstaller.utils.hooks import collect_data_files
 datas = []
 datas += collect_data_files('customtkinter')
 
-# beta1.0.4: native C/C++ lwIP engine, compiled into laptop_proxy/engine/ by
-# ci/build-lwip.ps1 (MSYS2) or ci/build-lwip-wsl.sh (WSL cross-compile).
-# Optional on purpose: absent until the engine is built, then packed
-# automatically so this very spec produces the lwIP-default package.
+# beta1.0.4: native C/C++ lwIP engine. We ship the MAINTAINER'S official
+# Windows build (releases/download/2.19.1/hev-socks5-tunnel-win64.zip):
+# hev-socks5-tunnel.exe + wintun.dll + msys-2.0.dll (the MSYS2 runtime the
+# official exe is linked against — must ride along or the exe won't start).
+# Optional on purpose: absent until dropped into laptop_proxy/engine/, then
+# packed automatically so this very spec produces the lwIP-default package.
 # engine.py resolves LWIP_EXE next to itself (BIN_DIR/engine/...), hence
-# the 'engine' target dir (= _MEIPASS/engine in the frozen onedir layout).
+# the 'engine' target dir (= _MEIPASS/engine in the frozen onedir layout),
+# and msys-2.0.dll / wintun.dll sit beside it so the .exe can load.
 _lwip_binaries = [
     ('engine/' + name, 'engine')
-    for name in ('hev-socks5-tunnel.exe', 'wintun.dll')
+    for name in ('hev-socks5-tunnel.exe', 'wintun.dll', 'msys-2.0.dll')
     if os.path.isfile('engine/' + name)
 ]
 
