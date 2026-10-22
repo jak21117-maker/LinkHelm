@@ -43,3 +43,4 @@ structure.txt
 # Local PyInstaller output dirs (sandbox-safe rebuild workaround)
 laptop_proxy/dist*/
 laptop_proxy/build*/
+laptop_proxy/ft_paired.json
