@@ -1,0 +1,112 @@
+name: Build and Release
+
+# Push a `beta*` tag -> both binaries are built on GitHub runners and
+# published as a pre-release. Binaries never travel from a local machine:
+# only the (small) source push crosses the wire, the heavy artifacts are
+# built and uploaded from GitHub's own network.
+
+on:
+  push:
+    tags:
+      - 'beta*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Accept SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build release APK
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Sign APK (project debug keystore, same as every LinkHelm build)
+        run: |
+          BT="$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          "$ANDROID_HOME/build-tools/$BT/apksigner" sign \
+            --ks ci/debug.keystore --ks-pass pass:android --key-pass pass:android \
+            --out "LinkHelm-Host-Android-${GITHUB_REF_NAME}.apk" \
+            app/build/outputs/apk/release/app-release-unsigned.apk
+          "$ANDROID_HOME/build-tools/$BT/apksigner" verify \
+            "LinkHelm-Host-Android-${GITHUB_REF_NAME}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: LinkHelm-Host-Android-*.apk
+          if-no-files-found: error
+
+  windows:
+    name: Build Windows EXE
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install build dependencies
+        working-directory: laptop_proxy
+        run: pip install pyinstaller==6.22.3 customtkinter==5.2.2 darkdetect==0.8.0 pillow==12.3.0 pystray==0.19.5
+
+      - name: Build EXE
+        working-directory: laptop_proxy
+        shell: bash
+        run: pyinstaller LaptopProxy.spec --noconfirm
+
+      - name: Package win64 zip
+        shell: pwsh
+        run: Compress-Archive -Path laptop_proxy/dist/LinkHelm_Desktop/* -DestinationPath "LinkHelm.Desktop-${{ github.ref_name }}-win64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-zip
+          path: LinkHelm.Desktop-*-win64.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-zip
+
+      - name: Create or update the pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          FILES=("LinkHelm-Host-Android-${TAG}.apk" "LinkHelm.Desktop-${TAG}-win64.zip")
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "${FILES[@]}" \
+              --title "LinkHelm ${TAG}" \
+              --notes-file RELEASE_NOTES.md \
+              --prerelease \
+              --repo "$GITHUB_REPOSITORY"
+          fi
