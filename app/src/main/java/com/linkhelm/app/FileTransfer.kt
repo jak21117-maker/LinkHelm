@@ -54,22 +54,29 @@ internal object FileTransferProtocol {
  * pairing again.
  */
 internal object FileTransferPairs {
+    // beta1.0.3 hotfix: the pair store is read during UI composition, which can
+    // happen BEFORE HostService has registered the app context (fresh install /
+    // cold start). Every accessor must be crash-safe and degrade to "no pairs".
+    private fun prefs(): android.content.SharedPreferences? =
+        runCatching {
+            appContext().getSharedPreferences("linkhelm_prefs", android.content.Context.MODE_PRIVATE)
+        }.getOrNull()
+
     fun pairedSet(): Set<String> =
-        appContext().getSharedPreferences("linkhelm_prefs", android.content.Context.MODE_PRIVATE)
-            .getStringSet(FileTransferProtocol.PREFS_KEY_PAIRED, emptySet()) ?: emptySet()
+        prefs()?.getStringSet(FileTransferProtocol.PREFS_KEY_PAIRED, emptySet()) ?: emptySet()
 
     fun isPaired(ip: String): Boolean = pairedSet().contains(ip)
 
     fun addPaired(ip: String) {
-        val prefs = appContext().getSharedPreferences("linkhelm_prefs", android.content.Context.MODE_PRIVATE)
-        val next = (prefs.getStringSet(FileTransferProtocol.PREFS_KEY_PAIRED, emptySet()) ?: emptySet()) + ip
-        prefs.edit().putStringSet(FileTransferProtocol.PREFS_KEY_PAIRED, next).apply()
+        prefs()?.edit()?.putStringSet(
+            FileTransferProtocol.PREFS_KEY_PAIRED, pairedSet() + ip
+        )?.apply()
     }
 
     fun removePaired(ip: String) {
-        val prefs = appContext().getSharedPreferences("linkhelm_prefs", android.content.Context.MODE_PRIVATE)
-        val next = (prefs.getStringSet(FileTransferProtocol.PREFS_KEY_PAIRED, emptySet()) ?: emptySet()) - ip
-        prefs.edit().putStringSet(FileTransferProtocol.PREFS_KEY_PAIRED, next).apply()
+        prefs()?.edit()?.putStringSet(
+            FileTransferProtocol.PREFS_KEY_PAIRED, pairedSet() - ip
+        )?.apply()
     }
 
     /**
