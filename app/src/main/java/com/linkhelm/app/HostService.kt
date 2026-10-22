@@ -1,4 +1,4 @@
-package com.linkhelm.app
+﻿package com.linkhelm.app
 
 import android.annotation.SuppressLint
 import android.app.*
@@ -1014,7 +1014,7 @@ class HostService : Service() {
     private fun createNotification(content: String): Notification {
         val channelId = "host_service_channel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, L10n.tr("LinkHelm Sharing Service", "LinkHelm 共享服务"), NotificationManager.IMPORTANCE_LOW)
+            val channel = NotificationChannel(channelId, L10n.tr("LinkHelm Sharing Service", "LinkHelm 分享服务"), NotificationManager.IMPORTANCE_LOW)
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
 
@@ -1022,7 +1022,7 @@ class HostService : Service() {
         val stopPendingIntent = PendingIntent.getService(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE)
 
         return NotificationCompat.Builder(this, channelId)
-            .setContentTitle(L10n.tr("LinkHelm Host", "LinkHelm 共享服务"))
+            .setContentTitle(L10n.tr("LinkHelm Host", "LinkHelm 分享服务"))
             .setContentText(content)
             .setSmallIcon(android.R.drawable.ic_menu_share)
             .setOngoing(true)

@@ -834,6 +834,23 @@ def _build_dns_query(qid, name="example.com"):
 UDP_CHECK_DNS_POOL = ("119.29.29.29", "223.5.5.5", "114.114.114.114")
 
 
+def socks5_rep_meaning(rep):
+    """beta1.0.3: human-readable meaning of a SOCKS5 CONNECT reply code (RFC 1928 §6),
+    so the desktop log reports WHY the host refused instead of a bare hex code."""
+    return {
+        0x01: tr("general failure (host-side error; check the phone log)",
+                 "一般失败（主端内部错误，请看手机端日志）"),
+        0x02: tr("not allowed by the host rules (blocked or quota-rejected)",
+                 "主端规则不允许（被踢除或配额拒绝）"),
+        0x03: tr("network unreachable from the phone", "主端侧网络不可达"),
+        0x04: tr("target host unreachable from the phone", "主端无法连到目标主机"),
+        0x05: tr("target refused by the phone's upstream", "目标连接被主端上游拒绝"),
+        0x06: tr("TTL expired", "TTL 超时"),
+        0x07: tr("command not supported", "命令不支持"),
+        0x08: tr("address type not supported", "地址类型不支持"),
+    }.get(rep, tr("unknown reply", "未知应答"))
+
+
 def socks5_udp_dns_check(host, port, dns_ip="223.5.5.5", dns_port=53, timeout=5.0,
                          socks_user=None, socks_pass=None):
     """v1.4.3: UDP connectivity check — UDP ASSOCIATE to the phone SOCKS5, DNS query via the relay.
@@ -1709,6 +1726,29 @@ class TunManager:
 
     def _read_tun2socks_output(self):
         """Read and log tun2socks stdout/stderr in background threads."""
+        def _annotate(msg):
+            # beta1.0.3: attach the corresponding cause instead of letting
+            # every failure read as a bare "rejected by the remote host".
+            low = msg.lower()
+            if "forcibly closed by the remote host" in low or \
+                    "connection reset by peer" in low:
+                return msg + "  " + tr(
+                    "(hint: the phone closed the session — usual causes: "
+                    "session quota / PROTECT admission on the host, "
+                    "credentials changed in Settings, or the share service restarting)",
+                    "（提示：主端关闭了会话——常见原因：主端会话配额/高压保护准入、"
+                    "设置中修改了凭据、或分享服务正在重启）")
+            if "authentication failed" in low or ("auth" in low and "fail" in low):
+                return msg + "  " + tr(
+                    "(hint: SOCKS5 credentials mismatch — re-check them in Settings on both ends)",
+                    "（提示：SOCKS5 凭据不匹配——请在两端设置中重新核对）")
+            if "no such host" in low or "i/o timeout" in low or \
+                    "network is unreachable" in low:
+                return msg + "  " + tr(
+                    "(hint: the phone is unreachable over Wi-Fi Direct — check the hotspot link)",
+                    "（提示：经 Wi-Fi Direct 无法连到手机——请检查热点连接）")
+            return msg
+
         def _reader(stream, label):
             try:
                 for line in iter(stream.readline, b''):
@@ -1716,7 +1756,7 @@ class TunManager:
                         break
                     msg = line.decode('utf-8', errors='replace').strip()
                     if msg:
-                        self.log(f"[tun2socks:{label}] {msg}")
+                        self.log(f"[tun2socks:{label}] {_annotate(msg)}")
             except Exception:
                 pass
 
@@ -1815,7 +1855,11 @@ class TunManager:
                 if len(resp) >= 2 and resp[0] == 5:
                     if resp[1] == 0:
                         return "ok"
-                    return f"refused(REP=0x{resp[1]:02x})"
+                    # beta1.0.3: surface the actual REP meaning instead of a
+                    # bare hex code — the field log should say WHY the phone
+                    # refused, not just "rejected".
+                    return (f"refused(REP=0x{resp[1]:02x} "
+                            f"{socks5_rep_meaning(resp[1])})")
                 return "egress-silent"
         except socket.timeout:
             return "egress-silent"
@@ -2266,7 +2310,7 @@ class App:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("LinkHelm Desktop beta1.0.2 | Windows")
+        self.root.title("LinkHelm Desktop beta1.0.3 | Windows")
         self.root.geometry(f"460x{min(770, max(620, root.winfo_screenheight() - 90))}")
         self.root.minsize(420, 590)
         self.root.configure(fg_color=self.BG)
@@ -2861,6 +2905,9 @@ class App:
         threading.Thread(target=self._do_refresh_ethernet, daemon=True).start()
 
     # ---- v1.5.45 (beta1.0.1): file-transfer trial -------------------------
+    # beta1.0.3: the dialog now shows the ACTUAL local IP (dynamic — it
+    # follows the current Wi-Fi Direct lease), takes the peer's IP as input,
+    # and requires one-tap mutual IP pairing before any transfer.
     def _open_file_transfer_dialog(self):
         phone_ip = self.phone_ip.get().strip() or "192.168.49.1"
         user = self.phone_user.get().strip() or DEFAULT_PHONE_USER
@@ -2869,7 +2916,7 @@ class App:
 
         win = ctk.CTkToplevel(self.root)
         win.title(tr("File Transfer (trial)", "文件传输（试用版）"))
-        win.geometry("470x380")
+        win.geometry("470x470")
         win.transient(self.root)
         win.grab_set()
 
@@ -2879,11 +2926,64 @@ class App:
                     "Never touches the phone's internet exit; SHA-256 verified.",
                     "单文件最大 1 GB，仅走 Wi-Fi Direct 本地通道。\n不经手机外网出口；传输后校验 SHA-256。")
         ).pack(padx=16, pady=(14, 4))
+        local_label = ctk.CTkLabel(
+            win, font=("Segoe UI", 10), text_color=self.TEXT,
+            text=tr(f"This device address (enter it on the other side): {local_ip}:{file_transfer.FT_PORT}",
+                    f"本机地址（填到另一台设备）：{local_ip}:{file_transfer.FT_PORT}")
+        )
+        local_label.pack(padx=16, pady=(0, 2))
         ctk.CTkLabel(
-            win, font=("Segoe UI", 10), text_color=self.MUTED,
-            text=tr(f"This PC (for the phone to send to): {local_ip}:{file_transfer.FT_PORT}",
-                    f"本机地址（供手机发送到）：{local_ip}:{file_transfer.FT_PORT}")
-        ).pack(padx=16, pady=(0, 8))
+            win, font=("Segoe UI", 9), text_color=self.MUTED,
+            text=tr("The IP changes when the Wi-Fi Direct group is rebuilt — always follow the currently displayed value.",
+                    "IP 随 Wi-Fi Direct 组重建而变化，请以当前显示为准。")
+        ).pack(padx=16, pady=(0, 6))
+
+        # beta1.0.3: peer IP + one-tap mutual pairing.
+        peer_frame = ctk.CTkFrame(win, fg_color="transparent")
+        peer_frame.pack(fill="x", padx=16, pady=(2, 0))
+        peer_entry = ctk.CTkEntry(peer_frame, width=250, placeholder_text=phone_ip)
+        peer_entry.insert(0, phone_ip)
+        peer_entry.pack(side="left", padx=(0, 6))
+        pair_state = {"paired": file_transfer.is_paired(phone_ip)}
+        pair_btn = ctk.CTkButton(
+            peer_frame, width=110,
+            fg_color=self.ACCENT, hover_color=self.STATUS_BG, text_color="#FFFFFF",
+            command=lambda: None)  # replaced below
+        pair_btn.pack(side="left")
+
+        def _refresh_pair_widgets():
+            ip = peer_entry.get().strip() or phone_ip
+            pair_state["paired"] = file_transfer.is_paired(ip)
+            if pair_state["paired"]:
+                pair_btn.configure(text=tr("Re-pair", "重新配对"))
+                pair_tip.configure(text=tr("✓ Paired with this address", "✓ 已与该地址配对"),
+                                   text_color="#4ADE80")
+            else:
+                pair_btn.configure(text=tr("Pair", "配对"))
+                pair_tip.configure(
+                    text=tr("Pair before transferring (both ends tap Pair)", "传输前需配对（两端都要点击配对）"),
+                    text_color="#F87171")
+            send_btn.configure(
+                state="normal" if pair_state["paired"] else "disabled")
+
+        def _do_pair():
+            ip = peer_entry.get().strip() or phone_ip
+            pair_btn.configure(state="disabled", text=tr("Pairing...", "配对中…"))
+
+            def worker():
+                err = file_transfer.pair_with(ip, user, password, log_fn=self.log)
+                self.root.after(0, lambda: pair_btn.configure(state="normal"))
+                self.root.after(0, _refresh_pair_widgets)
+                if err:
+                    _set_status(err, ok=False)
+                else:
+                    _set_status(tr(f"Paired with {ip}.", f"已与 {ip} 完成配对。"), ok=True)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        pair_btn.configure(command=_do_pair)
+        pair_tip = ctk.CTkLabel(win, font=("Segoe UI", 10), text_color=self.MUTED, text="")
+        pair_tip.pack(padx=16, pady=(4, 0))
 
         status = ctk.CTkLabel(win, font=("Segoe UI", 10), text_color=self.MUTED,
                               text=tr("Idle", "空闲"))
@@ -2911,6 +3011,10 @@ class App:
                 text_color=self.MUTED))
 
         def _do_send():
+            ip = peer_entry.get().strip() or phone_ip
+            if not file_transfer.is_paired(ip):
+                _set_status(tr("Pair with the peer first.", "请先与对方配对。"), ok=False)
+                return
             path = filedialog.askopenfilename(
                 parent=win, title=tr("Pick a file to send (<= 1 GB)", "选择要发送的文件（≤ 1 GB）"))
             if not path:
@@ -2920,7 +3024,7 @@ class App:
             def worker():
                 try:
                     file_transfer.send_file(
-                        phone_ip, user, password, path,
+                        ip, user, password, path,
                         progress_cb=_progress, cancel_event=cancel_event, log_fn=self.log)
                     _set_status(tr("Sent and verified.", "已发送并校验。"), ok=True)
                     self.root.after(0, lambda: bar.set(1.0))
@@ -2959,12 +3063,13 @@ class App:
 
         btn_row = ctk.CTkFrame(win, fg_color="transparent")
         btn_row.pack(fill="x", padx=16, pady=(6, 14))
-        ctk.CTkButton(
-            btn_row, text=tr("Send a file to the phone", "发送文件到手机"),
+        send_btn = ctk.CTkButton(
+            btn_row, text=tr("Send a file to the peer", "发送文件到对方"),
             fg_color=self.ACCENT, hover_color=self.STATUS_BG, text_color="#FFFFFF",
-            command=_do_send).pack(side="left", expand=True, fill="x", padx=(0, 4))
+            command=_do_send)
+        send_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
         ctk.CTkButton(
-            btn_row, text=tr("Receive from the phone", "从手机接收文件"),
+            btn_row, text=tr("Receive from the peer", "从对方接收文件"),
             fg_color=self.STATUS_BG, hover_color=self.CARD, text_color=self.ACCENT,
             command=_do_receive).pack(side="left", expand=True, fill="x", padx=4)
         ctk.CTkButton(
@@ -2972,6 +3077,7 @@ class App:
             fg_color="transparent", hover_color=self.CARD, text_color=self.MUTED,
             command=_cancel).pack(side="left", padx=(4, 0))
         win.protocol("WM_DELETE_WINDOW", _close)
+        _refresh_pair_widgets()
 
     def _do_refresh_ethernet(self):
         try:

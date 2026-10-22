@@ -217,7 +217,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                                     Text("LINKHELM", fontWeight = FontWeight.Black, fontSize = 18.sp)
                                     Text(
                                         when {
-                                            isHostRunning.value -> L10n.tr("Host service running", "共享服务运行中")
+                                            isHostRunning.value -> L10n.tr("Host service running", "分享服务运行中")
                                             isClientRunning.value -> L10n.tr("Client service running", "连接服务运行中")
                                             else -> L10n.tr("Ready, waiting for connection", "就绪，等待连接")
                                         },
@@ -272,7 +272,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                         onClick = { selectedTab.intValue = 0 },
                         text = {
                             Text(
-                                L10n.tr("Share (Host)", "共享 (主机)"),
+                                L10n.tr("Share (Host)", "分享 (主机)"),
                                 // Use Theme primary color instead of hardcoded CyberTeal
                                 color = if (selectedTab.intValue == 0) MaterialTheme.colorScheme.primary else Color.Gray,
                                 fontWeight = if (selectedTab.intValue == 0) FontWeight.Bold else FontWeight.Normal
@@ -522,7 +522,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                         }
                         confirmAndRun(
                             L10n.tr("Confirm network settings change", "确认更改网络设置"),
-                            L10n.tr("The network name or password will be changed${if (isHostRunning.value) " and sharing will restart automatically" else ""}.\nConnected devices must re-enter the new credentials.", "网络名称或密码将被更改${if (isHostRunning.value) "，共享将自动重启" else ""}。\n已连接的设备需要重新输入新凭据。"),
+                            L10n.tr("The network name or password will be changed${if (isHostRunning.value) " and sharing will restart automatically" else ""}.\nConnected devices must re-enter the new credentials.", "网络名称或密码将被更改${if (isHostRunning.value) "，分享将自动重启" else ""}。\n已连接的设备需要重新输入新凭据。"),
                         ) {
                             lastSaveAt = System.currentTimeMillis()
                             prefs.edit()
@@ -571,7 +571,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                         }
                         confirmAndRun(
                             L10n.tr("Confirm random password refresh", "确认随机刷新密码"),
-                            L10n.tr("A new random password will be generated${if (isHostRunning.value) " and sharing will restart automatically" else ""}.\nConnected devices must re-enter the new credentials.", "将生成新的随机密码${if (isHostRunning.value) "，共享将自动重启" else ""}。\n已连接的设备需要重新输入新凭据。"),
+                            L10n.tr("A new random password will be generated${if (isHostRunning.value) " and sharing will restart automatically" else ""}.\nConnected devices must re-enter the new credentials.", "将生成新的随机密码${if (isHostRunning.value) "，分享将自动重启" else ""}。\n已连接的设备需要重新输入新凭据。"),
                         ) {
                             lastRefreshAt = System.currentTimeMillis()
                             refreshTimestamps.add(System.currentTimeMillis())
@@ -701,11 +701,11 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
 
     @Composable
     fun HostModeView() {
-        Text(L10n.tr("Share your network", "共享你的网络"), modifier = Modifier.fillMaxWidth(), fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        Text(L10n.tr("Share your network", "分享你的网络"), modifier = Modifier.fillMaxWidth(), fontSize = 24.sp, fontWeight = FontWeight.Bold)
         Text(L10n.tr("Use this phone as a host to provide network access for other devices.", "把这台手机作为主机，为其他设备提供网络。"), modifier = Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(modifier = Modifier.height(20.dp))
         StatusCard(
-            title = L10n.tr("Hotspot sharing", "热点共享"),
+            title = L10n.tr("Hotspot sharing", "热点分享"),
             isActive = isHostRunning.value,
             activeColor = Color(0xFF4CAF50),
             icon = Icons.Default.CellTower
@@ -715,13 +715,13 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
 
         SetupSteps(listOf(
             L10n.tr("Turn on mobile data on this phone.", "打开本手机的移动数据。"),
-            L10n.tr("Tap Start Sharing, then copy the network and proxy info below.", "点击启动共享，然后复制下方的网络与代理信息。"),
+            L10n.tr("Tap Start Sharing, then copy the network and proxy info below.", "点击启动分享，然后复制下方的网络与代理信息。"),
             L10n.tr("Join that Wi-Fi on every client and connect through this app.", "在每台客户端上加入该 Wi-Fi，并通过本应用连接。")
         ))
         Spacer(modifier = Modifier.height(16.dp))
 
         if (isClientRunning.value) {
-            ConflictCard(message = L10n.tr("The connect service is running; sharing cannot be enabled at the same time.", "连接功能正在运行，无法同时开启共享。"))
+            ConflictCard(message = L10n.tr("The connect service is running; sharing cannot be enabled at the same time.", "连接功能正在运行，无法同时开启分享。"))
         }
 
         Card(
@@ -783,7 +783,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                     ) {
                         Icon(Icons.Default.PlayArrow, null)
                         Spacer(Modifier.width(8.dp))
-                        Text(L10n.tr("Start Sharing", "启动共享"), fontWeight = FontWeight.ExtraBold, letterSpacing = 1.sp)
+                        Text(L10n.tr("Start Sharing", "启动分享"), fontWeight = FontWeight.ExtraBold, letterSpacing = 1.sp)
                     }
                 } else {
                     Button(
@@ -797,7 +797,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                     ) {
                         Icon(Icons.Default.Stop, null)
                         Spacer(Modifier.width(8.dp))
-                        Text(L10n.tr("Stop Sharing", "停止共享"), fontWeight = FontWeight.ExtraBold)
+                        Text(L10n.tr("Stop Sharing", "停止分享"), fontWeight = FontWeight.ExtraBold)
                     }
                 }
             }
@@ -869,7 +869,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                                     }
                                 }) {
                                     Text(
-                                        if (autoProbeOn) L10n.tr("Disable auto probe", "关闭自动检测") else L10n.tr("Enable auto probe (takes effect on next share)", "开启自动检测（下次共享生效）"),
+                                        if (autoProbeOn) L10n.tr("Disable auto probe", "关闭自动检测") else L10n.tr("Enable auto probe (takes effect on next share)", "开启自动检测（下次分享生效）"),
                                         fontSize = 12.sp
                                     )
                                 }
@@ -927,16 +927,12 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                                         fontWeight = FontWeight.Bold,
                                         color = MaterialTheme.colorScheme.onSurface
                                     )
+                                    // beta1.0.3: keep the description short —
+                                    // more sessions for many devices, more battery.
                                     Text(
-                                        if (realDeviceCount > 3)
-                                            L10n.tr("${realDeviceCount} device(s) online; enabling this improves multi-device stability (uses more battery)", "当前 ${realDeviceCount} 台设备在线，建议开启以提升多设备稳定性（更耗电）")
-                                        else
-                                            // v1.5.45 (beta1.0.1): the old "480 -> 800 threads" copy is
-                                            // gone — threads now follow BOUNDED session caps.
-                                            L10n.tr("Session caps 96 -> 192 (64 per device); active connections stay capped, never unbounded (uses more battery)", "会话上限 96 → 192（单设备 64）；活动连接数有上限，不会无限增长（更耗电）"),
+                                        L10n.tr("Raises the session cap for multiple devices (uses more battery)", "提升多设备场景的会话数上限（更耗电）"),
                                         fontSize = 11.sp,
-                                        color = if (realDeviceCount > 3) Color(0xFFE65100)
-                                        else MaterialTheme.colorScheme.onSurfaceVariant
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
                                 TextButton(onClick = {
@@ -944,8 +940,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                                         android.app.AlertDialog.Builder(ctxForTurbo)
                                             .setTitle(L10n.tr("Enable turbo mode?", "开启强力模式？"))
                                             .setMessage(
-                                                L10n.tr("Raises the session caps (96 -> 192 TCP sessions, 64 per device) to improve stability when multiple devices share the connection, ", "将会话上限提升（TCP 会话 96 → 192，单设备 64）以改善多设备同时使用的稳定性，") +
-                                                    L10n.tr("but increases power draw and heat.\n\nTakes effect immediately; no sharing restart needed.", "但会增加耗电与发热。\n\n改动立即生效，无需重启共享。")
+                                                L10n.tr("Raises the session cap to improve stability when several devices share the connection, but uses more battery.\n\nTakes effect immediately; no sharing restart needed.", "提升会话数上限，多台设备同时使用更稳定，但更耗电。\n\n改动立即生效，无需重启分享。")
                                             )
                                             .setPositiveButton(L10n.tr("Enable", "开启")) { _, _ ->
                                                 turboOn = true
@@ -972,9 +967,25 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                                     )
                                 }
                             }
-                            // v1.5.41: SOCKS5 compatibility mode - adapts third-party clients such as
-                            // Karing (sing-box) / Streisand (Xray). Manual toggle, immediate effect (UDP reads
-                            // live values per packet, no sharing restart needed). Off by default.
+                            // beta1.0.3: with 3+ downstream devices (host excluded),
+                            // nudge the user toward turbo mode — its 700-session
+                            // budget is what multi-device hosts need.
+                            if (realDeviceCount >= 3 && !turboOn) {
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    L10n.tr(
+                                        "${realDeviceCount} devices connected (excluding this host) — turbo mode recommended",
+                                        "已连接 ${realDeviceCount} 台设备（不含本机）— 建议开启强力模式"
+                                    ),
+                                    fontSize = 11.sp,
+                                    color = Color(0xFFE65100)
+                                )
+                            }
+                            // beta1.0.3: compatibility MICRO-KERNEL. The old
+                            // "compat mode" also shrank the session caps, which
+                            // made almost no difference in practice — now it only
+                            // keeps the core UDP endpoint relaxation that
+                            // Karing/Streisand need, with no capacity trade-off.
                             val ctxForCompat = LocalContext.current
                             var compatOn by remember {
                                 mutableStateOf(
@@ -986,13 +997,13 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        L10n.tr("Compatibility mode (Karing/Streisand)", "兼容模式（Karing/Streisand）"),
+                                        L10n.tr("Compatibility micro-kernel (Karing/Streisand)", "兼容微内核（Karing/Streisand）"),
                                         fontWeight = FontWeight.Bold,
                                         color = MaterialTheme.colorScheme.onSurface
                                     )
                                     Text(
                                         if (compatOn)
-                                            L10n.tr("On: concurrent multi-source-port UDP sessions are returned precisely per target, with conservative session caps (48 TCP / 12 UDP) to keep third-party clients stable", "已开启：UDP 多源端口并发会话按目标精确回发，并采用保守会话上限（TCP 48 / UDP 12）保证第三方客户端稳定")
+                                            L10n.tr("On: UDP sessions from changing source ports are returned per target (core compatibility; no capacity cost)", "已开启：UDP 多源端口会话按目标精确回发（核心兼容功能，不影响会话容量）")
                                         else
                                             L10n.tr("Enable when clients such as Karing/Streisand have working TCP but UDP fails or drops packets; takes effect immediately", "Karing/Streisand 等客户端 TCP 正常但 UDP 不通/丢包时开启；立即生效"),
                                         fontSize = 11.sp,
@@ -1007,7 +1018,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                                     HostService.applySocksCompatLive(next)
                                 }) {
                                     Text(
-                                        if (compatOn) L10n.tr("Off (immediate)", "关闭（立即生效）") else L10n.tr("Enable compatibility mode", "开启兼容模式"),
+                                        if (compatOn) L10n.tr("Off (immediate)", "关闭（立即生效）") else L10n.tr("Enable", "开启"),
                                         fontSize = 12.sp,
                                         color = if (compatOn) MaterialTheme.colorScheme.primary
                                         else Color(0xFFE65100)
@@ -1045,7 +1056,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                 )
                 Spacer(modifier = Modifier.width(12.dp))
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(L10n.tr("iPhone proxy-free networking", "iPhone 免代理联网"), fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    Text(L10n.tr("iOS proxy-free networking (no app)", "iOS 免APP联网"), fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
                     Text(
                         L10n.tr("No VPN needed: browse via the system Wi-Fi manual HTTP proxy - tap to ${if (showIphoneGuide) "collapse" else "expand"}", "无需 VPN，用系统 Wi-Fi 手动 HTTP 代理上网 · 点击${if (showIphoneGuide) "收起" else "展开"}"),
                         fontSize = 12.sp,
@@ -1092,7 +1103,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                             if (activeCount > 0) L10n.tr("$activeCount device(s) online - tap to ${if (showDevices) "collapse" else "expand"}", "$activeCount 台设备在线 · 点击${if (showDevices) "收起" else "展开"}")
                             else L10n.tr("No devices online - tap to ${if (showDevices) "collapse" else "expand"}", "暂无设备在线 · 点击${if (showDevices) "收起" else "展开"}")
                         } else {
-                            L10n.tr("Start sharing to view and manage connected devices here - tap to ${if (showDevices) "collapse" else "expand"}", "启动共享后可在此查看并管理接入设备 · 点击${if (showDevices) "收起" else "展开"}")
+                            L10n.tr("Start sharing to view and manage connected devices here - tap to ${if (showDevices) "collapse" else "expand"}", "启动分享后可在此查看并管理接入设备 · 点击${if (showDevices) "收起" else "展开"}")
                         },
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1136,7 +1147,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                 val clients = endpoint.clients
                 if (clients.isEmpty()) {
                     Text(
-                        L10n.tr("No devices connected. Devices that join via the SOCKS5 proxy (Connect page / desktop) or the HTTP proxy (iPhone proxy-free) will appear here.", "暂无设备连接。设备经 SOCKS5 代理（连接页 / 电脑端）或 HTTP 代理（iPhone 免代理）接入后会显示在这里。"),
+                        L10n.tr("No devices connected. Devices that join via the SOCKS5 proxy (Connect page / desktop) or the HTTP proxy (iOS proxy-free) will appear here.", "暂无设备连接。设备经 SOCKS5 代理（连接页 / 电脑端）或 HTTP 代理（iOS 免APP联网）接入后会显示在这里。"),
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -1150,7 +1161,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                                 Text(device.ip, fontSize = 13.sp, fontWeight = FontWeight.Medium)
                                 Text(
                                     when {
-                                        device.blocked -> L10n.tr("Disconnected and reconnection blocked (restored after restarting sharing)", "已断开并阻止重连（重启共享后恢复）")
+                                        device.blocked -> L10n.tr("Disconnected and reconnection blocked (restored after restarting sharing)", "已断开并阻止重连（重启分享后恢复）")
                                         device.activeConnections > 0 -> L10n.tr("${device.activeConnections} active connection(s)", "${device.activeConnections} 个活动连接")
                                         else -> L10n.tr("Idle", "空闲")
                                     },
@@ -1172,7 +1183,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                         }
                     }
                     Text(
-                        L10n.tr("Disconnect immediately closes all TCP/UDP connections of that device and blocks reconnection; all devices can rejoin after sharing restarts.", "「断开」立即关闭该设备的全部 TCP/UDP 连接并禁止重连；重启共享后所有设备恢复可接入。"),
+                        L10n.tr("Disconnect immediately closes all TCP/UDP connections of that device and blocks reconnection; all devices can rejoin after sharing restarts.", "「断开」立即关闭该设备的全部 TCP/UDP 连接并禁止重连；重启分享后所有设备恢复可接入。"),
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -1189,7 +1200,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
     fun IphoneShareView() {
         val endpoint = HostService.observableEndpoint.value
         Text(
-            L10n.tr("No app or VPN required: iPhone joins the shared network via the built-in Wi-Fi manual HTTP proxy.", "无需安装 App、无需 VPN：iPhone 用系统自带的 Wi-Fi 手动 HTTP 代理接入本机共享网络。"),
+            L10n.tr("No app or VPN required: iPhone joins the shared network via the built-in Wi-Fi manual HTTP proxy.", "无需安装 App、无需 VPN：iPhone 用系统自带的 Wi-Fi 手动 HTTP 代理接入本机分享网络。"),
             modifier = Modifier.fillMaxWidth(),
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -1214,9 +1225,17 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                     label = L10n.tr("HTTP proxy (iPhone, no app needed)", "HTTP 代理 (iPhone 免装应用)"),
                     value = if (endpoint.httpPort > 0) "${endpoint.ip}:${endpoint.httpPort}  " + L10n.tr("Ready", "✓ 已就绪") else L10n.tr("Not started (starts automatically with Share)", "未启动（启动 Share 后自动开启）")
                 )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    // beta1.0.3: keep HTTP, but set expectations — SOCKS5 is the
+                    // main distribution channel; HTTP carries only a small slice.
+                    L10n.tr("HTTP carries only a small slice of this app's traffic distribution (about 1/10); the main channel is SOCKS5.", "HTTP 仅占本应用流量分发的一小部分（约 1/10），主通道为 SOCKS5。"),
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    L10n.tr("Note: the HTTP proxy carries HTTP/HTTPS traffic only (browser, WeChat, most apps). UDP traffic such as games will not pass on either iPhone or another Android - this is expected; use the Connect page or desktop sharing instead.", "说明：HTTP 代理只承载 HTTP/HTTPS 流量（浏览器、微信、绝大多数 App）。无论是 iPhone 还是另一部安卓，游戏等 UDP 流量都走不通——这属于正常现象，请改用「连接」页或电脑端共享。"),
+                    L10n.tr("Note: the HTTP proxy carries HTTP/HTTPS traffic only (browser, WeChat, most apps). UDP traffic such as games will not pass on either iPhone or another Android - this is expected; use the Connect page or desktop sharing instead.", "说明：HTTP 代理只承载 HTTP/HTTPS 流量（浏览器、微信、绝大多数 App）。无论是 iPhone 还是另一部安卓，游戏等 UDP 流量都走不通——这属于正常现象，请改用「连接」页或电脑端分享。"),
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1229,7 +1248,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
         val ip = endpoint.ip ?: "192.168.49.1"
         val httpPort = if (endpoint.httpPort > 0) endpoint.httpPort else HostService.HTTP_PROXY_PORT
         val steps = listOf(
-            L10n.tr("1. Start the sharing service on the Share page first (keep the system hotspot toggle off).", "1. 本机先在 Share 页启动共享服务（保持系统热点开关关闭）。"),
+            L10n.tr("1. Start the sharing service on the Share page first (keep the system hotspot toggle off).", "1. 本机先在 Share 页启动分享服务（保持系统热点开关关闭）。"),
             L10n.tr("2. iPhone Settings -> Wi-Fi -> find the DIRECT-xx hotspot and connect with the password.", "2. iPhone 设置 → 无线局域网 → 找到 DIRECT-xx 热点并输入密码连接。"),
             L10n.tr("3. Tap the (i) icon on that network -> scroll to Configure Proxy -> Manual.", "3. 点击该网络右侧 (i) → 拉到底部「配置代理」→ 选择「手动」。"),
             L10n.tr("4. Enter $ip as the server and $httpPort as the port, then save.", "4. 服务器填 $ip，端口填 $httpPort，存储。"),
@@ -1238,30 +1257,6 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
         )
         steps.forEach { step ->
             Text(step, fontSize = 14.sp, modifier = Modifier.padding(vertical = 3.dp))
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(
-                containerColor = if (isSystemInDarkTheme()) Color(0xFF2B2B1B) else Color(0xFFFFF8E1)
-            ),
-            border = BorderStroke(1.dp, Color(0xFFFFC107))
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Warning, contentDescription = null, tint = Color(0xFFF57F17))
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(L10n.tr("Boundaries of transparent NAT", "透明 NAT 的边界"), fontWeight = FontWeight.Bold)
-                }
-                Spacer(modifier = Modifier.height(6.dp))
-                Text(
-                    L10n.tr("Connect-and-browse zero-configuration transparent forwarding requires system-level routing privileges (ip_forward/Tethering) that ordinary apps cannot modify - this is not a limitation this app can bypass. ", "「连上即上网、零配置」的透明转发需要系统级路由权限（ip_forward/Tethering），普通应用无权修改——这不是本应用可以绕过的限制。") +
-                        L10n.tr("The HTTP proxy on this page is the only system-level entry for iPhone access without installing an app under ordinary privileges; for transparent forwarding of arbitrary traffic, use desktop sharing.", "本页的 HTTP 代理方案是普通权限下 iPhone 免装应用接入的唯一系统级入口；若需任意流量透明转发，请使用电脑端共享。"),
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
         }
     }
 
@@ -1287,7 +1282,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
         Spacer(modifier = Modifier.height(16.dp))
 
         if (isHostRunning.value) {
-            ConflictCard(message = L10n.tr("Hotspot sharing is running; the connection cannot start during sharing.", "热点共享正在运行，共享期间无法启动连接。"))
+            ConflictCard(message = L10n.tr("Hotspot sharing is running; the connection cannot start during sharing.", "热点分享正在运行，分享期间无法启动连接。"))
         }
 
         Card(
@@ -1648,7 +1643,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                 startService(intent)
             }
             isHostRunning.value = true
-            logState.add(L10n.tr("Starting sharing service...", "正在启动共享服务..."))
+            logState.add(L10n.tr("Starting sharing service...", "正在启动分享服务..."))
             saveServiceState(hostRunning = true)
         }
     }
@@ -1658,7 +1653,7 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
         startService(intent)
         hostInfoState.value = null
         isHostRunning.value = false
-        logState.add(L10n.tr("Sharing service stopped.", "共享服务已停止。"))
+        logState.add(L10n.tr("Sharing service stopped.", "分享服务已停止。"))
         saveServiceState(hostRunning = false)
     }
 
@@ -1901,11 +1896,19 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
 fun FileTransferCard() {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("linkhelm_prefs", Context.MODE_PRIVATE) }
-    var targetIp by remember { mutableStateOf("192.168.49.2") }
+    var targetIp by remember { mutableStateOf("") }
     var dirSet by remember {
         mutableStateOf(prefs.getString(FileTransferProtocol.PREFS_KEY_DIR, null) != null)
     }
     val state = FileTransferBus.state
+    // beta1.0.3: show the ACTUAL local IP (dynamic — the Wi-Fi Direct group
+    // re-assigns addresses) and the paired-peer set. A transfer is only
+    // possible after mutual IP pairing.
+    var localIp by remember { mutableStateOf(FileTransferPairs.localLanIp()) }
+    var paired by remember { mutableStateOf(FileTransferPairs.pairedSet()) }
+    var pairMsg by remember { mutableStateOf<String?>(null) }
+    var pairing by remember { mutableStateOf(false) }
+    val isTargetPaired = paired.contains(targetIp.trim())
 
     val dirLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
@@ -1950,7 +1953,7 @@ fun FileTransferCard() {
             Text(
                 L10n.tr(
                     "Single file up to 1 GB, over the Wi-Fi Direct link only — never the phone's internet exit. Independent of sharing; SHA-256 verified.",
-                    "单文件最大 1 GB，仅走 Wi-Fi Direct 本地通道，不经手机外网出口；与网络共享互不影响，传输后校验 SHA-256。"
+                    "单文件最大 1 GB，仅走 Wi-Fi Direct 本地通道，不经手机外网出口；与网络分享互不影响，传输后校验 SHA-256。"
                 ),
                 fontSize = 11.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1972,25 +1975,99 @@ fun FileTransferCard() {
 
             Spacer(modifier = Modifier.height(8.dp))
 
+            // beta1.0.3: local address — the ACTUAL IP obtained on the
+            // Wi-Fi Direct link (host is usually 192.168.49.1, clients get
+            // their own lease); it changes when the group is rebuilt, so it
+            // is re-read on every recomposition of this card.
+            Text(
+                L10n.tr(
+                    "This device address (shown on the other device): ${localIp.ifEmpty { "detecting..." }}",
+                    "本机地址（填到另一台设备）：${localIp.ifEmpty { "检测中…" }}"
+                ),
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Text(
+                L10n.tr(
+                    "The IP changes when the Wi-Fi Direct group is rebuilt — always follow the currently displayed value.",
+                    "IP 随 Wi-Fi Direct 组重建而变化，请以当前显示为准。"
+                ),
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
             OutlinedTextField(
                 value = targetIp,
-                onValueChange = { targetIp = it },
-                label = { Text(L10n.tr("PC address (default 192.168.49.2)", "电脑地址（默认 192.168.49.2）")) },
+                onValueChange = {
+                    targetIp = it
+                    pairMsg = null
+                },
+                label = { Text(L10n.tr("Peer address (the actual IP shown on the other device / host)", "对方地址（另一台设备或主机显示的实际 IP）")) },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
                 shape = RoundedCornerShape(12.dp)
             )
+
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = {
+                    val ip = targetIp.trim()
+                    if (ip.isEmpty()) {
+                        pairMsg = "请先填写对方地址"
+                        return@TextButton
+                    }
+                    pairing = true
+                    pairMsg = null
+                    val user = prefs.getString("socks_user", ProxyServer.DEFAULT_SOCKS_USER)
+                        ?: ProxyServer.DEFAULT_SOCKS_USER
+                    val pass = prefs.getString("socks_pass", ProxyServer.DEFAULT_SOCKS_PASS)
+                        ?: ProxyServer.DEFAULT_SOCKS_PASS
+                    thread(name = "FT-Pair", isDaemon = true) {
+                        val err = FileTransferClient.pair(ip, user, pass)
+                        pairMsg = err ?: "已与 $ip 完成配对"
+                        pairing = false
+                        localIp = FileTransferPairs.localLanIp()
+                        paired = FileTransferPairs.pairedSet()
+                    }
+                }) {
+                    Text(
+                        if (pairing) L10n.tr("Pairing...", "配对中…")
+                        else if (isTargetPaired) L10n.tr("Re-pair", "重新配对")
+                        else L10n.tr("Pair with this address", "与该地址配对")
+                    )
+                }
+                if (isTargetPaired) {
+                    Text(
+                        L10n.tr("Paired", "✓ 已配对"),
+                        fontSize = 12.sp,
+                        color = Color(0xFF4CAF50)
+                    )
+                }
+            }
+            pairMsg?.let { msg ->
+                Text(
+                    msg,
+                    fontSize = 11.sp,
+                    color = if (msg.startsWith("已与")) Color(0xFF4CAF50) else MaterialTheme.colorScheme.error
+                )
+            }
 
             Spacer(modifier = Modifier.height(8.dp))
 
             Button(
                 onClick = { fileLauncher.launch(arrayOf("*/*")) },
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp)
+                shape = RoundedCornerShape(12.dp),
+                enabled = isTargetPaired && !state.active
             ) {
                 Icon(Icons.Default.Send, null)
                 Spacer(Modifier.width(8.dp))
-                Text(L10n.tr("Send a file to the PC", "发送文件到电脑"))
+                Text(
+                    if (isTargetPaired) L10n.tr("Send a file to the peer", "发送文件到对方")
+                    else L10n.tr("Pair first to send files", "配对后才能发送文件")
+                )
             }
 
             if (state.active) {

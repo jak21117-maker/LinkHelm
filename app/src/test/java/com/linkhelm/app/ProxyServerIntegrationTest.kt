@@ -3,6 +3,7 @@ package com.linkhelm.app
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -91,19 +92,22 @@ class ProxyServerIntegrationTest {
         assertEquals(1, proxy.metrics().activeByClient["127.0.0.2"] ?: 0)
     }
 
-    /** v1.4.82/1.4.9: per-IP quota is 200 with ≤2 active devices, 150 once ≥3. */
+    /** beta1.0.3: per-device quota = cap for ≤2 devices, fair share of the
+     *  global session budget (floored at 100) for ≥3. */
     @Test
     fun dynamicPerClientQuotaSwitchesAtThreeDevices() {
         val proxy = startProxy(coreThreads = 1, maxThreads = 480, perClient = 200).also { servers.add(it) }
         assertEquals(200, proxy.perClientQuotaFor(1))
         assertEquals(200, proxy.perClientQuotaFor(2))
-        assertEquals(150, proxy.perClientQuotaFor(3))
-        assertEquals(150, proxy.perClientQuotaFor(10))
+        // fair share: 480/3 = 160, inside the 200 cap
+        assertEquals(160, proxy.perClientQuotaFor(3))
+        // fair share 480/10 = 48 < 100 floor
+        assertEquals(100, proxy.perClientQuotaFor(10))
         // Small explicit configs stay authoritative for ≤2 devices (test harness
-        // relies on this): the 150 ceiling must never RAISE a smaller base.
+        // relies on this): the fair-share floor must never RAISE a smaller base.
         val small = startProxy(coreThreads = 1, maxThreads = 4, perClient = 4).also { servers.add(it) }
         assertEquals(4, small.perClientQuotaFor(2))
-        assertEquals(150, small.perClientQuotaFor(3))
+        assertEquals(4, small.perClientQuotaFor(3))
     }
 
     /**
@@ -115,27 +119,63 @@ class ProxyServerIntegrationTest {
     @Test
     fun congestionModeTightensNewConnectionQuotaAndRecovers() {
         val proxy = startProxy(coreThreads = 1, maxThreads = 480, perClient = 200).also { servers.add(it) }
-        // Normal path untouched when the pool is healthy. NOTE: the (1) probe
-        // must run BEFORE any (3) probe — perClientQuotaFor(3) arms the 30s
-        // debounce, which would legitimately hold 150 for (1) afterwards.
+        // Normal path untouched when the pool is healthy.
         assertEquals(200, proxy.perClientQuotaFor(1))
 
-        // Extreme congestion: both tiers are capped by the overlay.
+        // Extreme pressure: every tier is capped by the overlay.
         proxy.congestionActive.set(true)
         assertEquals(100, proxy.perClientQuotaFor(1))
         assertEquals(100, proxy.perClientQuotaFor(3))
 
-        // Congestion clears: the ≥3 tier returns to 150 (the (1) tier stays
-        // inside the debounce window set by the (3) probe above, so it is
-        // intentionally not re-asserted here).
+        // Pressure clears: the fair-share tier returns.
         proxy.congestionActive.set(false)
-        assertEquals(150, proxy.perClientQuotaFor(3))
+        assertEquals(160, proxy.perClientQuotaFor(3))
 
         // Overlay applies via minOf(base, congestionQuotaPerClient): it can
         // never RAISE a smaller configured base (small test configs keep 4).
         val small = startProxy(coreThreads = 1, maxThreads = 4, perClient = 4).also { servers.add(it) }
         small.congestionActive.set(true)
         assertEquals(4, small.perClientQuotaFor(1))
+    }
+
+    /**
+     * beta1.0.3: TURBO uses the slow dynamic per-device quota (120-170,
+     * starting 140) instead of a fixed cap; ≥3 devices share the 700-session
+     * global budget fairly, and PROTECT floors admission at 100.
+     */
+    @Test
+    fun turboProfileUsesSlowDynamicPerDeviceQuota() {
+        val proxy = ProxyServer(
+            ProxyServer.Config(
+                port = 0,
+                coreThreads = 1,
+                maxThreads = ProxyServer.TURBO_MAX_THREADS,
+                maxConnectionsPerClient = ProxyServer.TURBO_PER_DEVICE_MAX,
+                maxTcpSessions = 700,
+                maxTcpSessionsPerClient = ProxyServer.TURBO_PER_DEVICE_MAX,
+                workerKeepAliveMs = 500,
+                connectTimeoutMs = 2_000,
+                handshakeTimeoutMs = 2_000,
+                socketPollIntervalMs = 100,
+                tcpIdleTimeoutMs = 2_000,
+                udpTargetTimeoutMs = 500,
+                udpIdleTimeoutMs = 2_000,
+                udpCleanupIntervalMs = 100
+            )
+        ).also { servers.add(it) }
+        assertEquals(140, proxy.turboPerDeviceQuota) // starting value
+        assertEquals(140, proxy.perClientQuotaFor(1))
+
+        // Sampler steps are bounded and slow (±10 per 30s).
+        proxy.turboPerDeviceQuota = 150
+        assertEquals(150, proxy.perClientQuotaFor(1))
+
+        // 5 devices: fair share 700/5 = 140, inside the dynamic cap.
+        assertEquals(140, proxy.perClientQuotaFor(5))
+
+        // Extreme pressure floors NEW admission at 100.
+        proxy.congestionActive.set(true)
+        assertEquals(100, proxy.perClientQuotaFor(5))
     }
 
     /**
@@ -279,32 +319,18 @@ class ProxyServerIntegrationTest {
         assertEquals(0, proxy.quotaDeviceCount("192.168.49.9", false))
     }
 
-    /** v1.4.9: the 150 tier is held for quotaDebounceMs after the last ≥3 observation. */
+    /** beta1.0.3: compat is a micro-kernel now — it must NOT switch capacity profiles. */
     @Test
-    fun quotaTierHoldsForDebounceWindowAfterThreeDevices() {
-        val proxy = ProxyServer(
-            ProxyServer.Config(
-                port = 0,
-                coreThreads = 1,
-                maxThreads = 480,
-                maxConnectionsPerClient = 200,
-                quotaDebounceMs = 120,
-                workerKeepAliveMs = 500,
-                connectTimeoutMs = 2_000,
-                handshakeTimeoutMs = 2_000,
-                socketPollIntervalMs = 100,
-                tcpIdleTimeoutMs = 2_000,
-                udpTargetTimeoutMs = 500,
-                udpIdleTimeoutMs = 2_000,
-                udpCleanupIntervalMs = 100
-            )
-        ).also { servers.add(it) }
-        proxy.start()
-        assertTrue("proxy must bind", proxy.awaitStarted(5_000))
-        assertEquals(150, proxy.perClientQuotaFor(3)) // arms the debounce
-        assertEquals(150, proxy.perClientQuotaFor(2)) // still held inside the window
-        Thread.sleep(200) // > 120ms window
-        assertEquals(200, proxy.perClientQuotaFor(2)) // back to base after the window
+    fun compatModeNoLongerChangesCapacityProfile() {
+        val proxy = startProxy(coreThreads = 1, maxThreads = ProxyServer.NORMAL_MAX_THREADS, perClient = 160)
+        val sessionsBefore = proxy.config.maxTcpSessions
+        val threadsBefore = proxy.config.maxThreads
+        proxy.applyCompatMode(true)
+        assertEquals(sessionsBefore, proxy.config.maxTcpSessions)
+        assertEquals(threadsBefore, proxy.config.maxThreads)
+        assertTrue(proxy.compatMode)
+        proxy.applyCompatMode(false)
+        assertFalse(proxy.compatMode)
     }
 
     @Test
@@ -433,6 +459,10 @@ class ProxyServerIntegrationTest {
                 coreThreads = coreThreads,
                 maxThreads = maxThreads,
                 maxConnectionsPerClient = perClient,
+                maxTcpSessions = maxOf(1, maxThreads),
+                maxTcpSessionsPerClient = perClient,
+                maxUdpAssociations = maxOf(1, maxThreads),
+                maxUdpAssociationsPerClient = perClient,
                 workerKeepAliveMs = 500,
                 connectTimeoutMs = 2_000,
                 handshakeTimeoutMs = 2_000,

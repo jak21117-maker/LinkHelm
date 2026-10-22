@@ -134,7 +134,8 @@ def test_healthy_tunnel_survives_refused_egress():
             "greeting-level liveness must not depend on CONNECT egress"
         )
         status = tm._socks_relay_diag(server.port, timeout=2.0)
-        assert status == "refused(REP=0x01)"
+        # beta1.0.3: the diag now appends the REP meaning after the hex code.
+        assert status.startswith("refused(REP=0x01")
     finally:
         server.stop()
 

@@ -39,5 +39,7 @@ host_client_connection_summary.txt
 structure.txt
 
 # Local PyInstaller output dirs (sandbox-safe rebuild workaround)
-laptop_proxy/dist_new/
-laptop_proxy/build_new/
+
+# Local PyInstaller output dirs (sandbox-safe rebuild workaround)
+laptop_proxy/dist*/
+laptop_proxy/build*/

@@ -133,17 +133,21 @@ class ProxyServer internal constructor(
         // Wi-Fi Direct /24 so devices on other networks cannot use the open proxy.
         val allowedClientRanges: List<String> = emptyList(),
         val coreThreads: Int = 16,
-        // v1.5.46 (beta1.0.2): restored to the beta1.0.0 values that are
-        // proven with a single PC tunneling all its traffic. See the
-        // SessionProfile note above for the beta1.0.1 post-mortem.
-        val maxThreads: Int = 480,
-        val maxConnectionsPerClient: Int = 200,
-        // v1.5.45: global session caps — admission ceilings sized below the
-        // thread pool (threads stay the reserve for accept/UDP-cleanup).
-        val maxTcpSessions: Int = 384,
-        val maxTcpSessionsPerClient: Int = 200,
-        val maxUdpAssociations: Int = 48,
-        val maxUdpAssociationsPerClient: Int = 24,
+        // beta1.0.3: field-calibrated capacity per the TCP:UDP ≈ 3:1 measurement
+        // (PC games hold 30-50 UDP target endpoints, phone/tablet games 20-30).
+        // NORMAL = 320 global sessions / 160 per device; TURBO = 700 global
+        // with a slow dynamic per-device quota (see SessionProfile below).
+        val maxThreads: Int = 384,
+        val maxConnectionsPerClient: Int = 160,
+        // Global session caps — admission ceilings sized below the thread pool
+        // (threads stay the reserve for accept/UDP-cleanup).
+        val maxTcpSessions: Int = 320,
+        val maxTcpSessionsPerClient: Int = 160,
+        // UDP sized at ~sessions/3 (the measured 3:1 TCP:UDP mix). The
+        // per-device UDP ceiling is further tightened dynamically to 1/3 of
+        // that device's live TCP quota (see udpPerDeviceCap).
+        val maxUdpAssociations: Int = 96,
+        val maxUdpAssociationsPerClient: Int = 48,
         // v1.5.45: accept backlog = admit queue limit.
         val maxAdmitQueue: Int = 256,
         val workerKeepAliveMs: Long = 60_000L,
@@ -159,21 +163,15 @@ class ProxyServer internal constructor(
         // connectTimeoutMs deliberately UNCHANGED (15s) — shortening it would
         // turn legitimately slow upstream dials into false failures.
         val socketPollIntervalMs: Int = 30_000,
-        // v1.4.7 contract, RESTORED in v1.4.9: an established connection only
-        // ends when the user stops sharing or closes the app. v1.4.82's
-        // the 15min/10min idle reap was a regression driver for the "disconnect" reports —
-        // quiet-but-alive sessions (idle game lobbies, long-poll TCP, suspended
-        // apps that resume without a fresh handshake) were being reaped. Zombie
-        // sockets are still bounded by stop() and per-client kick; per the
-        // regression report we no longer trade connection lifetime for count
-        // hygiene on the hot path.
-        val tcpIdleTimeoutMs: Long = 86_400_000L,
+        // beta1.0.3: established-but-idle TCP sessions are reclaimed after 3h
+        // (field table: default 3h, experimental 6h in TURBO; every real
+        // send/receive refreshes the timer). Active sessions are NEVER
+        // reaped; this only bounds socket/FD waste from long-dead lobbies.
+        val tcpIdleTimeoutMs: Long = 10_800_000L,
         val udpTargetTimeoutMs: Int = 30_000,
-        // v1.5.45 (beta1.0.1, plan 4.1): idle UDP associations are reclaimed
-        // (120s standard / 90s compat). The previous 24h value made the
-        // reaper a no-op — an idle association held its relay socket, its
-        // target sockets and its response threads forever.
-        val udpIdleTimeoutMs: Long = 120_000L,
+        // beta1.0.3: UDP target-endpoint idle reclamation. Field guidance:
+        // start measuring at 300s; interactive/video UDP flows tolerate 600-900s.
+        val udpIdleTimeoutMs: Long = 300_000L,
         // v1.4.9: how long the ≥3-device quota tier (150/IP) is HELD after the
         // last ≥3 observation, so a device briefly dropping its last connection
         // does not flip the ceiling 150<->200 for everyone (report section 4.1 debounce).
@@ -265,14 +263,24 @@ class ProxyServer internal constructor(
     private val activeUdpGlobal = AtomicInteger(0)
     private val activeUdpByClient = ConcurrentHashMap<String, AtomicInteger>()
 
-    // v1.5.46 (beta1.0.2): the ≥3-device tier is RESTORED (150/IP after the
-    // 30s debounce) — beta1.0.1's flat per-device cap broke single-PC use.
-    internal val multiDeviceQuotaPerClient: Int = 150
+    // beta1.0.3: the fixed 150/IP ≥3-device tier is REPLACED by a fair-share
+    // formula (global session budget spread across live devices, floored at
+    // the extreme-pressure value) plus, in TURBO, a slowly stepped dynamic
+    // per-device quota. See perClientQuotaFor and the quota sampler in start().
 
-    // v1.4.9: monotonic timestamp of the most recent ≥3-device observation —
-    // the 150/IP tier is held for config.quotaDebounceMs after this, so the
-    // ceiling does not flap 150↔200 when a device's connection count blips.
-    private val lastMultiDeviceQuotaAt = AtomicLong(0L)
+    /**
+     * beta1.0.3: TURBO per-device NEW-session quota. Range 120-170, adjusted
+     * by ±10 every 30s from measured session utilization — deliberately slow
+     * and non-random (no jitter), so devices never see flapping ceilings.
+     */
+    @Volatile internal var turboPerDeviceQuota: Int = 140
+
+    // beta1.0.3: extreme-pressure (PROTECT) sustain timers. PROTECT engages
+    // only after sessions stay ≥95% of the cap for 15s (filters short CPU
+    // spikes), and relaxes only after ≤80% holds for 120s — no flapping at
+    // the edge.
+    private val highPressureSinceMs = AtomicLong(0L)
+    private val lowPressureSinceMs = AtomicLong(0L)
 
     // v1.4.9: rejections counted by cause (regression report §4.2) instead of
     // one anonymous number — surfaces whether pressure comes from the global
@@ -291,23 +299,31 @@ class ProxyServer internal constructor(
     internal val congestionActive = AtomicBoolean(false)
 
     companion object {
-        // v1.5.45 (beta1.0.1): thread ceilings now track the session profiles
-        // below (sessions + reserve). Was 480/800 — with one worker per
-        // connection that was a 480/800 live-session allowance, the direct
-        // cause of the "active connections exploded" report.
-        const val NORMAL_MAX_THREADS = 480
-        const val TURBO_MAX_THREADS = 800
-        const val COMPAT_MAX_THREADS = 480
+        // beta1.0.3: thread ceilings track the session profiles below
+        // (sessions + accept/UDP-cleanup reserve).
+        const val NORMAL_MAX_THREADS = 384
+        const val TURBO_MAX_THREADS = 768
 
-        // v1.5.46 (beta1.0.2): beta1.0.1's aggressive caps (48/16 per device)
-        // REJECTED the PC's legitimate traffic — the PC tunnels ALL of its
-        // internet through one source IP, and dozens of concurrent TCP flows
-        // are normal (tun2socks log: "connection was forcibly closed by the
-        // remote host"). The caps are restored to generous beta1.0.0-level
-        // values; the compatibility profile stays bounded (192/64) to keep
-        // third-party clients from exploding sessions, and the genuinely safe
-        // beta1.0.1 improvement (UDP idle reclamation + UDP budget) remains.
-        // Numbers are starting points — tune by measurement, not by fear.
+        // beta1.0.3: TURBO dynamic per-device quota bounds and pacing.
+        const val TURBO_PER_DEVICE_MIN = 120
+        const val TURBO_PER_DEVICE_MAX = 170
+        const val TURBO_PER_DEVICE_STEP = 10
+        const val QUOTA_SAMPLE_INTERVAL_MS = 30_000L
+
+        // beta1.0.3: PROTECT sustain windows (sessions ≥95% for 15s to enter,
+        // ≤80% for 120s to leave).
+        const val PROTECT_ENTER_SUSTAIN_MS = 15_000L
+        const val PROTECT_EXIT_SUSTAIN_MS = 120_000L
+
+        // beta1.0.3: profiles calibrated from field measurement (TCP:UDP ≈ 3:1;
+        // a PC game holds 30-50 UDP endpoints, a phone/tablet game 20-30):
+        //  - STANDARD: 320 global TCP sessions, 160 per device, UDP 96 global
+        //    (~sessions/3), UDP idle 300s.
+        //  - TURBO: 700 global sessions — the multi-device capacity tier. The
+        //    per-device figure is the STARTING value of the slow dynamic quota
+        //    (120-170, ±10 per 30s sampler); UDP idle relaxed to 600s.
+        // COMPAT is gone: compatibility is now a micro-kernel (relaxed UDP
+        // source-endpoint tracking only) and no longer trades capacity.
         internal enum class SessionProfile(
             val maxThreads: Int,
             val maxTcpSessions: Int,
@@ -316,11 +332,11 @@ class ProxyServer internal constructor(
             val maxUdpAssociationsPerClient: Int,
             val maxAdmitQueue: Int,
             val udpIdleTimeoutMs: Long,
-            val udpCleanupIntervalMs: Long
+            val udpCleanupIntervalMs: Long,
+            val tcpIdleTimeoutMs: Long
         ) {
-            STANDARD(480, 384, 200, 48, 24, 256, 120_000L, 60_000L),
-            TURBO(800, 640, 300, 64, 32, 256, 180_000L, 90_000L),
-            COMPAT(480, 192, 64, 32, 12, 256, 90_000L, 60_000L)
+            STANDARD(384, 320, 160, 96, 48, 256, 300_000L, 60_000L, 10_800_000L),
+            TURBO(768, 700, 140, 224, 64, 256, 600_000L, 90_000L, 21_600_000L)
         }
 
         // v1.5.43: SOCKS5 credentials (RFC 1929) defaults. System-initial and fixed,
@@ -348,7 +364,8 @@ class ProxyServer internal constructor(
             maxUdpAssociationsPerClient = profile.maxUdpAssociationsPerClient,
             maxAdmitQueue = profile.maxAdmitQueue,
             udpIdleTimeoutMs = profile.udpIdleTimeoutMs,
-            udpCleanupIntervalMs = profile.udpCleanupIntervalMs
+            udpCleanupIntervalMs = profile.udpCleanupIntervalMs,
+            tcpIdleTimeoutMs = profile.tcpIdleTimeoutMs
         )
         clientPool?.let { pool ->
             pool.corePoolSize = minOf(config.coreThreads, profile.maxThreads)
@@ -364,55 +381,43 @@ class ProxyServer internal constructor(
     }
 
     /**
-     * v1.5.45: the profile actually in force. Compatibility mode wins when
-     * both toggles are on — it is the conservative profile by design.
+     * beta1.0.3: the profile actually in force. Compatibility is a
+     * micro-kernel now and does NOT select a capacity profile.
      */
-    internal fun activeProfile(): SessionProfile = when {
-        compatMode -> SessionProfile.COMPAT
-        config.maxThreads >= TURBO_MAX_THREADS -> SessionProfile.TURBO
-        else -> SessionProfile.STANDARD
-    }
+    internal fun activeProfile(): SessionProfile =
+        if (config.maxThreads >= TURBO_MAX_THREADS) SessionProfile.TURBO else SessionProfile.STANDARD
 
     /**
-     * v1.5.0 → v1.5.45: live turbo-mode resize. Was: swap the thread ceiling
-     * 480↔800 (i.e. the live-session allowance). Now: swap the whole TURBO
-     * profile — still a real boost for many-device hosts, but bounded
-     * (192 TCP sessions / 64 per device), so "faster" can never again mean
-     * "unbounded connections". Takes effect IMMEDIATELY on the RUNNING pool;
-     * no share stop/start is needed. Core size is kept (16).
+     * beta1.0.3: live turbo-mode resize — swap the whole TURBO profile on the
+     * RUNNING pool. 700 global sessions target MULTI-device total capacity
+     * (e.g. 5 devices × ~140 ≈ 700); it is not a single-device accelerator.
+     * The per-device ceiling is the slow dynamic quota (see turboPerDeviceQuota
+     * and the 30s sampler). Takes effect IMMEDIATELY; no share stop/start.
      */
     internal fun applyTurboMode(enabled: Boolean) {
         val target = if (enabled) TURBO_MAX_THREADS else NORMAL_MAX_THREADS
-        val previous = config.maxThreads
-        if (previous == target && !compatMode) return
-        if (compatMode) {
-            // Compatibility mode is conservative by design and wins over turbo.
-            log(
-                ProxyLogLevel.WARN,
-                "Turbo mode ${if (enabled) "enabled" else "disabled"} but compatibility mode is on — " +
-                    "staying on the conservative COMPAT profile"
-            )
-            return
-        }
+        if (config.maxThreads == target) return
         applySessionProfile(if (enabled) SessionProfile.TURBO else SessionProfile.STANDARD)
     }
 
-    // v1.5.41: SOCKS5 compatibility mode (third-party clients such as Karing/sing-box, Streisand/Xray).
-    // Manual toggle, immediate effect: every UDP packet reads the live value; toggling needs no share restart.
-    // Enabled = relaxed UDP source-endpoint following (no packet loss when the source port changes under the same IP)
-    //          PLUS the conservative COMPAT session profile (plan 4.1): fewer sessions, shorter UDP idle.
-    // Default (off) keeps the always-on minimum compatibility = correct UDP BND.ADDR replies + lenient reserved bits.
+    // beta1.0.3: compatibility MICRO-KERNEL. Previously this mode also swapped
+    // in a conservative session profile — field use showed that made almost no
+    // difference for its actual purpose while silently cutting capacity, so
+    // the profile coupling was removed. What remains is only the handful of
+    // core behaviours third-party SOCKS5 clients (Karing/Streisand) need:
+    // relaxed UDP source-endpoint following when the source port changes under
+    // the same IP. Default (off) keeps the always-on minimum compatibility =
+    // correct UDP BND.ADDR replies + lenient reserved bits.
     @Volatile internal var compatMode: Boolean = false
         private set
 
     internal fun applyCompatMode(enabled: Boolean) {
         if (compatMode == enabled) return
         compatMode = enabled
-        applySessionProfile(activeProfile())
         log(
             ProxyLogLevel.WARN,
-            "Compatibility mode ${if (enabled) "enabled" else "disabled"} (immediate: " +
-                "new connections and UDP from clients such as Karing/Streisand are handled in the new mode right away)"
+            "Compatibility micro-kernel ${if (enabled) "enabled" else "disabled"} (immediate: " +
+                "relaxed UDP endpoint tracking for Karing/Streisand; session capacity unchanged)"
         )
     }
 
@@ -466,6 +471,7 @@ class ProxyServer internal constructor(
         private set
     @Volatile private var serverThread: Thread? = null
     @Volatile private var cleanupThread: Thread? = null
+    @Volatile private var quotaSamplerThread: Thread? = null
     @Volatile private var startFailure: Throwable? = null
     @Volatile private var listeningPort = -1
 
@@ -506,6 +512,37 @@ class ProxyServer internal constructor(
         cleanupThread = thread(name = "Proxy-UDP-Cleanup", isDaemon = true) {
             runUdpCleanup()
         }
+        // beta1.0.3: 30s quota sampler — slowly steps the TURBO per-device
+        // quota (±10, bounded 120-170) from measured session utilization.
+        // Deliberately NOT random jitter: devices never see flapping ceilings.
+        quotaSamplerThread = thread(name = "Proxy-Quota-Sampler", isDaemon = true) {
+            while (running.get()) {
+                try {
+                    Thread.sleep(QUOTA_SAMPLE_INTERVAL_MS)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                if (!running.get()) break
+                if (config.maxThreads < TURBO_MAX_THREADS) continue
+                val sessions = activeConnections.get()
+                val cap = config.maxTcpSessions
+                if (cap <= 0) continue
+                val utilPct = sessions * 100 / cap
+                val old = turboPerDeviceQuota
+                val next = when {
+                    utilPct >= 85 -> maxOf(TURBO_PER_DEVICE_MIN, old - TURBO_PER_DEVICE_STEP)
+                    utilPct <= 70 -> minOf(TURBO_PER_DEVICE_MAX, old + TURBO_PER_DEVICE_STEP)
+                    else -> old
+                }
+                if (next != old) {
+                    turboPerDeviceQuota = next
+                    log(
+                        ProxyLogLevel.WARN,
+                        "Turbo per-device quota stepped $old -> $next (sessions $sessions/$cap, 30s sampler)"
+                    )
+                }
+            }
+        }
     }
 
     fun stop() {
@@ -516,6 +553,7 @@ class ProxyServer internal constructor(
         tryClose(secondaryServerSocket)
         secondaryServerSocket = null
         cleanupThread?.interrupt()
+        quotaSamplerThread?.interrupt()
 
         activeTcpSessions.toList().forEach { it.close() }
         udpAssociations.values.toList().forEach { it.close() }
@@ -533,9 +571,11 @@ class ProxyServer internal constructor(
         val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
         serverThread?.join(remainingMillis(deadline))
         cleanupThread?.join(remainingMillis(deadline))
+        quotaSamplerThread?.join(remainingMillis(deadline))
         val executor = clientPool
         if (executor != null) executor.awaitTermination(remainingMillis(deadline), TimeUnit.MILLISECONDS)
-        return serverThread?.isAlive != true && cleanupThread?.isAlive != true && executor?.isTerminated != false
+        return serverThread?.isAlive != true && cleanupThread?.isAlive != true &&
+            quotaSamplerThread?.isAlive != true && executor?.isTerminated != false
     }
 
     internal fun localPort(): Int = listeningPort
@@ -800,39 +840,33 @@ class ProxyServer internal constructor(
     }
 
     /**
-     * v1.4.82: dynamic per-IP quota. N = number of device IPs that currently
-     * hold ≥1 live connection (counting the arriving one), evaluated inside the
-     * reserveConnection critical section so admission decisions are consistent:
-     *  - N ≤ 2  → config.maxConnectionsPerClient (default 200)
-     *  - N ≥ 3  → multiDeviceQuotaPerClient (150)
-     * Only NEW connections are gated; a session that outlives a quota cut is
-     * never closed by this mechanism.
+     * beta1.0.3: dynamic per-device NEW-session quota, evaluated inside the
+     * reserveConnection critical section so admission decisions are consistent.
      *
-     * v1.4.9 (regression report §4.1):
-     *  - loopback (127.*) self-test connections NEVER count toward N — the
-     *    bind-time self-test plus two real devices must not silently drop the
-     *    ceiling to 150;
-     *  - after the last ≥3 observation the 150 tier is HELD for
-     *    config.quotaDebounceMs, so the ceiling does not flap 150↔200 while a
-     *    device's connection count blips around the boundary.
+     *  - ≤2 devices → the profile's per-device cap (STANDARD 160; TURBO uses
+     *    the slow dynamic quota 120-170);
+     *  - ≥3 devices → fair share of the global session budget
+     *    (maxTcpSessions / N), floored at congestionQuotaPerClient (100) —
+     *    "6-7 devices settle around 100", and the global cap binds first.
+     *  - PROTECT (extreme pressure) overlays congestionQuotaPerClient on top.
+     *
+     * Only NEW connections are gated; a session that outlives a quota cut is
+     * never closed by this mechanism. Loopback self-test IPs never count
+     * toward N.
      */
     internal fun perClientQuotaFor(deviceCountIncludingNew: Int): Int {
-        // v1.5.46 (beta1.0.2): tier logic RESTORED from beta1.0.0 — a single
-        // PC legitimately holds 200 sessions; with ≥3 device IPs the ceiling
-        // drops to 150 so the pool is spread instead of grabbed.
-        val base = if (deviceCountIncludingNew >= 3) {
-            lastMultiDeviceQuotaAt.set(elapsedRealtimeMs())
-            multiDeviceQuotaPerClient
+        val turbo = config.maxThreads >= TURBO_MAX_THREADS
+        val cap = if (turbo) turboPerDeviceQuota else config.maxTcpSessionsPerClient
+        val base = if (deviceCountIncludingNew <= 2) {
+            cap
         } else {
-            val held = lastMultiDeviceQuotaAt.get()
-            if (held != 0L && elapsedRealtimeMs() - held < config.quotaDebounceMs) {
-                multiDeviceQuotaPerClient
-            } else {
-                config.maxTcpSessionsPerClient
-            }
+            minOf(
+                cap,
+                maxOf(config.congestionQuotaPerClient, config.maxTcpSessions / deviceCountIncludingNew)
+            )
         }
-        // v1.5.0: extreme-congestion overlay — tightens NEW-connection
-        // admission only; existing sessions and the exit path are untouched.
+        // extreme-pressure overlay — tightens NEW-connection admission only;
+        // existing sessions and the exit path are untouched.
         return if (congestionActive.get()) minOf(base, config.congestionQuotaPerClient) else base
     }
 
@@ -860,23 +894,40 @@ class ProxyServer internal constructor(
             if (activeConnections.compareAndSet(current, current + 1)) break
         }
 
-        // v1.5.0: extreme-congestion detector — only when sessions reach ≥95%
-        // of the cap does congestion mode engage (new-connection quotas
-        // tightened; user contract: "only call when resource usage exceeds 95 percent, without
-        // affecting normal connections and usage"); below 80% it relaxes. The hysteresis band
-        // keeps the mode from flapping near the edge.
+        // beta1.0.3: extreme-pressure (PROTECT) detector with SUSTAIN windows —
+        // enters only after sessions hold ≥95% of the session cap for 15s
+        // (filters short CPU spikes), leaves only after ≤80% holds for 120s.
+        // The hysteresis band keeps the mode from flapping near the edge.
         val poolLevel = activeConnections.get()
+        val now = elapsedRealtimeMs()
         if (poolLevel * 100 >= config.maxTcpSessions * 95) {
-            if (congestionActive.compareAndSet(false, true)) {
+            lowPressureSinceMs.set(0L)
+            if (highPressureSinceMs.get() == 0L) highPressureSinceMs.set(now)
+            if (!congestionActive.get() &&
+                now - highPressureSinceMs.get() >= PROTECT_ENTER_SUSTAIN_MS &&
+                congestionActive.compareAndSet(false, true)
+            ) {
                 log(
                     ProxyLogLevel.WARN,
-                    "Extreme congestion detected (worker threads $poolLevel/${config.maxThreads} >= 95%): " +
-                        "per-client concurrency for new connections temporarily tightened to ${config.congestionQuotaPerClient}; established connections are unaffected"
+                    "Extreme pressure PROTECT engaged (sessions $poolLevel/${config.maxTcpSessions} >= 95% for 15s): " +
+                        "per-device NEW-session admission tightened to ${config.congestionQuotaPerClient}; established connections are unaffected"
                 )
             }
-        } else if (poolLevel * 100 < config.maxThreads * 80) {
-            if (congestionActive.compareAndSet(true, false)) {
-                log(ProxyLogLevel.DEBUG, "Congestion eased (worker threads $poolLevel/${config.maxThreads}); normal concurrency quota restored")
+        } else {
+            highPressureSinceMs.set(0L)
+            if (poolLevel * 100 < config.maxTcpSessions * 80) {
+                if (lowPressureSinceMs.get() == 0L) lowPressureSinceMs.set(now)
+                if (congestionActive.get() &&
+                    now - lowPressureSinceMs.get() >= PROTECT_EXIT_SUSTAIN_MS &&
+                    congestionActive.compareAndSet(true, false)
+                ) {
+                    log(
+                        ProxyLogLevel.WARN,
+                        "Pressure eased RECOVER (sessions <=80% for 120s): normal per-device admission restored"
+                    )
+                }
+            } else {
+                lowPressureSinceMs.set(0L)
             }
         }
 
@@ -908,6 +959,18 @@ class ProxyServer internal constructor(
     }
 
     /**
+     * beta1.0.3: per-device UDP ceiling = 1/3 of that device's live TCP quota
+     * (the measured TCP:UDP ≈ 3:1 mix: a PC game holds 30-50 UDP endpoints,
+     * a phone/tablet game 20-30), clamped by the profile's per-device UDP cap
+     * and never below 8 for tiny test configs. Tracks the dynamic quota: as
+     * PROTECT tightens the TCP ceiling, the UDP ceiling follows automatically.
+     */
+    private fun udpPerDeviceCap(clientIp: String): Int {
+        val tcpCap = perClientQuotaFor(quotaDeviceCount(clientIp, false))
+        return minOf(config.maxUdpAssociationsPerClient, maxOf(8, tcpCap / 3))
+    }
+
+    /**
      * v1.5.45 (beta1.0.1): UDP admission budget. Returns the rejection reason,
      * or null when the association may start. Rejections are surfaced to the
      * client as a SOCKS5 general failure (see handleUdpAssociate), never as a
@@ -922,7 +985,7 @@ class ProxyServer internal constructor(
         var reserved = false
         activeUdpByClient.compute(clientIp) { _, existing ->
             val counter = existing ?: AtomicInteger(0)
-            if (counter.get() < config.maxUdpAssociationsPerClient) {
+            if (counter.get() < udpPerDeviceCap(clientIp)) {
                 counter.incrementAndGet()
                 reserved = true
             }

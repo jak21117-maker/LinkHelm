@@ -40,6 +40,61 @@ internal object FileTransferProtocol {
     const val MAX_FILE_BYTES = 1_000_000_000L
     const val CHUNK = 128 * 1024
     const val PREFS_KEY_DIR = "ft_dir_uri"
+    const val PREFS_KEY_PAIRED = "ft_paired_ips"
+}
+
+/**
+ * beta1.0.3: IP pairing. A transfer is only allowed between MUTUALLY paired
+ * devices (host <-> client, client <-> client): the peer's IP must be in this
+ * device's paired set AND this device's IP must be in the peer's set. The
+ * PAIR handshake below establishes both directions in one tap, because the
+ * responder records the requester's IP while the requester records the
+ * responder's from the connection itself. IPs are persisted — Wi-Fi Direct
+ * leases can change, so a failed transfer after a re-group is fixed by
+ * pairing again.
+ */
+internal object FileTransferPairs {
+    fun pairedSet(): Set<String> =
+        appContext().getSharedPreferences("linkhelm_prefs", android.content.Context.MODE_PRIVATE)
+            .getStringSet(FileTransferProtocol.PREFS_KEY_PAIRED, emptySet()) ?: emptySet()
+
+    fun isPaired(ip: String): Boolean = pairedSet().contains(ip)
+
+    fun addPaired(ip: String) {
+        val prefs = appContext().getSharedPreferences("linkhelm_prefs", android.content.Context.MODE_PRIVATE)
+        val next = (prefs.getStringSet(FileTransferProtocol.PREFS_KEY_PAIRED, emptySet()) ?: emptySet()) + ip
+        prefs.edit().putStringSet(FileTransferProtocol.PREFS_KEY_PAIRED, next).apply()
+    }
+
+    fun removePaired(ip: String) {
+        val prefs = appContext().getSharedPreferences("linkhelm_prefs", android.content.Context.MODE_PRIVATE)
+        val next = (prefs.getStringSet(FileTransferProtocol.PREFS_KEY_PAIRED, emptySet()) ?: emptySet()) - ip
+        prefs.edit().putStringSet(FileTransferProtocol.PREFS_KEY_PAIRED, next).apply()
+    }
+
+    /**
+     * The local IP as seen on the Wi-Fi Direct link. The group owner is
+     * conventionally 192.168.49.1, but the displayed value always follows the
+     * ACTUAL bound address (it changes when the group is re-created). Falls
+     * back to the first site-local IPv4 when no 192.168.49.* address exists.
+     */
+    fun localLanIp(): String {
+        return try {
+            val candidates = java.net.NetworkInterface.getNetworkInterfaces().asSequence()
+                .filter { it.isUp && !it.isLoopback }
+                .flatMap { nif -> nif.inetAddresses.asSequence() }
+                .filterIsInstance<java.net.Inet4Address>()
+                .map { it.hostAddress ?: "" }
+                .filter { it.isNotEmpty() && !it.startsWith("127.") }
+                .toList()
+            candidates.firstOrNull { it.startsWith("192.168.49.") }
+                ?: candidates.firstOrNull { it.startsWith("192.168.") }
+                ?: candidates.firstOrNull()
+                ?: ""
+        } catch (_: Exception) {
+            ""
+        }
+    }
 }
 
 /** Compose-observable transfer state (written from background threads). */
@@ -182,11 +237,34 @@ internal class FileTransferServer(
             val input = BufferedInputStream(client.getInputStream())
             val output = BufferedOutputStream(client.getOutputStream())
 
-            val auth = readLine(input)
-            val parts = auth?.split(" ") ?: emptyList()
+            val first = readLine(input) ?: ""
+
+            // beta1.0.3: PAIR handshake — records the requester's IP in the
+            // paired set (mutual pairing is completed on the requester's side
+            // when it sees the PAIRED reply). Reuses the SOCKS5 credentials.
+            if (first == "PAIR $user $pass") {
+                FileTransferPairs.addPaired(remote)
+                writeLine(output, "PAIRED")
+                Log.i("FileTransfer", "Paired with $remote")
+                return
+            }
+            if (first == "UNPAIR $user $pass") {
+                FileTransferPairs.removePaired(remote)
+                writeLine(output, "UNPAIRED")
+                Log.i("FileTransfer", "Unpaired from $remote")
+                return
+            }
+
+            val parts = first.split(" ")
             if (parts.size != 3 || parts[0] != "AUTH" || parts[1] != user || parts[2] != pass) {
                 writeLine(output, "ERR auth")
                 Log.w("FileTransfer", "Auth failed from $remote")
+                return
+            }
+            // beta1.0.3: a transfer requires prior IP pairing on BOTH ends.
+            if (!FileTransferPairs.isPaired(remote)) {
+                writeLine(output, "ERR pair")
+                Log.w("FileTransfer", "Transfer refused from $remote: not paired")
                 return
             }
             writeLine(output, "OK")
@@ -303,6 +381,51 @@ internal object FileTransferClient {
         runCatching { socket?.close() }
     }
 
+    /**
+     * beta1.0.3: one-tap mutual IP pairing with the peer (host <-> client or
+     * client <-> client). The peer records our IP; we record the peer's from
+     * the successful reply. Returns null on success, else a human-readable
+     * reason. Runs on the calling thread (short request, 5s timeouts).
+     */
+    fun pair(targetIp: String, user: String, pass: String): String? {
+        return runCatching {
+            Socket().use { client ->
+                client.connect(InetSocketAddress(targetIp, FileTransferProtocol.PORT), 5_000)
+                client.soTimeout = 5_000
+                val output = BufferedOutputStream(client.getOutputStream())
+                val input = BufferedInputStream(client.getInputStream())
+                writeLine(output, "PAIR $user $pass")
+                when (readLine(input)) {
+                    "PAIRED" -> {
+                        FileTransferPairs.addPaired(targetIp)
+                        null
+                    }
+                    "ERR busy" -> "对端正忙，请稍后再试"
+                    else -> "对端未确认配对（请检查两端版本与凭据）"
+                }
+            }
+        }.getOrElse {
+            when {
+                it.message?.contains("timeout", true) == true -> "连接超时：请确认对方 IP 正确且与主机在同一 Wi-Fi Direct 网络"
+                else -> "无法连接 ${targetIp}:${FileTransferProtocol.PORT}（${it.message ?: "未知错误"}）"
+            }
+        }
+    }
+
+    fun unpair(targetIp: String, user: String, pass: String) {
+        runCatching {
+            Socket().use { client ->
+                client.connect(InetSocketAddress(targetIp, FileTransferProtocol.PORT), 5_000)
+                client.soTimeout = 5_000
+                val output = BufferedOutputStream(client.getOutputStream())
+                val input = BufferedInputStream(client.getInputStream())
+                writeLine(output, "UNPAIR $user $pass")
+                readLine(input)
+            }
+        }
+        FileTransferPairs.removePaired(targetIp)
+    }
+
     fun send(targetIp: String, user: String, pass: String, resolver: ContentResolver, fileUri: Uri) {
         cancelled.set(false)
         val info = fileDisplayInfo(resolver, fileUri)
@@ -338,7 +461,11 @@ internal object FileTransferClient {
                 val input = BufferedInputStream(client.getInputStream())
                 val output = BufferedOutputStream(client.getOutputStream())
                 writeLine(output, "AUTH $user $pass")
-                if (readLine(input) != "OK") throw IOException("Authentication rejected by the receiver")
+                when (readLine(input)) {
+                    "OK" -> {}
+                    "ERR pair" -> throw IOException("对方尚未与本机配对：请先在两端分别点击「配对」")
+                    else -> throw IOException("认证被对端拒绝（请核对 SOCKS5 凭据）")
+                }
                 val nameB64 = Base64.encodeToString(name.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
                 writeLine(output, "OFFER $nameB64 $size $sha")
                 val reply = readLine(input)

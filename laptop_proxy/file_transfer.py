@@ -1,17 +1,29 @@
 """v1.5.45 (beta1.0.1): file-transfer TRIAL — single file, <= 1 GB, Wi-Fi Direct only.
 
 Wire protocol (newline-terminated ASCII headers, then raw bytes), port 8765:
-    -> "AUTH <user> <pass>\n"               <- "OK\n" | "ERR auth\n"
+    -> "PAIR <user> <pass>\n"               <- "PAIRED\n" | "ERR busy\n"   (beta1.0.3)
+    -> "UNPAIR <user> <pass>\n"             <- "UNPAIRED\n"                  (beta1.0.3)
+    -> "AUTH <user> <pass>\n"               <- "OK\n" | "ERR auth\n" | "ERR pair\n"
     -> "OFFER <nameB64> <size> <sha256>\n"  <- "ACCEPT\n" | "REJECT <reason>\n"
     -> <raw file bytes>                     <- "DONE\n" | "FAIL <reason>\n"
 Closing the socket at any point cancels the transfer; the receiver deletes
 its partial file. The channel is independent of the SOCKS5 exit: files never
 touch the phone's uplink and the transfer cannot change system routes.
+
+beta1.0.3: IP PAIRING. A transfer is only allowed between mutually paired
+devices: the peer's IP must be in this device's paired set AND this device's
+IP must be in the peer's set. The PAIR handshake establishes both directions
+in one tap — the responder records the requester's IP, and the requester
+records the responder's from the successful reply. Paired IPs persist in
+ft_paired.json next to the executable (Wi-Fi Direct leases change when the
+group is rebuilt; pairing again fixes a stale entry).
 """
 import base64
 import hashlib
+import json
 import os
 import socket
+import sys
 import threading
 
 FT_PORT = 8765
@@ -21,6 +33,89 @@ FT_CHUNK = 128 * 1024
 
 class FileTransferError(Exception):
     pass
+
+
+def _pair_store_path():
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(sys.executable), "ft_paired.json")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "ft_paired.json")
+
+
+def paired_ips():
+    try:
+        with open(_pair_store_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return set(str(x) for x in data)
+    except Exception:
+        pass
+    return set()
+
+
+def _save_paired_ips(ips):
+    try:
+        with open(_pair_store_path(), "w", encoding="utf-8") as f:
+            json.dump(sorted(ips), f)
+    except Exception:
+        pass
+
+
+def add_paired_ip(ip):
+    ips = paired_ips()
+    ips.add(ip)
+    _save_paired_ips(ips)
+
+
+def remove_paired_ip(ip):
+    ips = paired_ips()
+    ips.discard(ip)
+    _save_paired_ips(ips)
+
+
+def is_paired(ip):
+    return ip in paired_ips()
+
+
+def pair_with(target_ip, user, password, log_fn=None):
+    """One-tap mutual IP pairing. Returns None on success, else a reason."""
+    try:
+        sock = socket.create_connection((target_ip, FT_PORT), timeout=5)
+    except Exception as exc:
+        return (f"无法连接 {target_ip}:{FT_PORT}（{exc}）——"
+                "请确认对方 IP 正确且与本机在同一 Wi-Fi Direct 网络")
+    try:
+        sock.settimeout(5)
+        _send_line(sock, f"PAIR {user} {password}")
+        reply = _recv_line(sock)
+        if reply == "PAIRED":
+            add_paired_ip(target_ip)
+            if log_fn:
+                log_fn(f"File transfer: paired with {target_ip}")
+            return None
+        if reply == "ERR busy":
+            return "对端正忙，请稍后再试"
+        return "对端未确认配对（请检查两端版本与凭据）"
+    except Exception as exc:
+        return f"配对握手失败（{exc}）"
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def unpair_with(target_ip, user, password):
+    try:
+        sock = socket.create_connection((target_ip, FT_PORT), timeout=5)
+        try:
+            sock.settimeout(5)
+            _send_line(sock, f"UNPAIR {user} {password}")
+            _recv_line(sock)
+        finally:
+            sock.close()
+    except Exception:
+        pass
+    remove_paired_ip(target_ip)
 
 
 def _recv_line(sock):
@@ -88,12 +183,23 @@ def send_file(target_ip, user, password, file_path, progress_cb=None,
     if log_fn:
         log_fn(f"File transfer: sending {name} ({size:,} bytes) to {target_ip}:{FT_PORT}")
     digest = sha256_file(file_path)
+    # beta1.0.3: pairing is checked BEFORE dialling — a rejected attempt must
+    # not consume the receiver's one-shot accept slot.
+    if not is_paired(target_ip):
+        raise FileTransferError(
+            "尚未与对方配对：请先在对话框中输入对方 IP 并点击「配对」")
     sock = socket.create_connection((target_ip, FT_PORT), timeout=8)
     try:
         sock.settimeout(60)
         _send_line(sock, f"AUTH {user} {password}")
-        if _recv_line(sock) != "OK":
-            raise FileTransferError("Authentication rejected by the receiver")
+        auth_reply = _recv_line(sock)
+        if auth_reply == "OK":
+            pass
+        elif auth_reply == "ERR pair":
+            raise FileTransferError(
+                "对方尚未与本机配对：请先在两端分别点击「配对」")
+        else:
+            raise FileTransferError("认证被对端拒绝（请核对 SOCKS5 凭据）")
         name_b64 = base64.b64encode(name.encode("utf-8")).decode("ascii")
         _send_line(sock, f"OFFER {name_b64} {size} {digest}")
         reply = _recv_line(sock)
@@ -174,10 +280,15 @@ class ReceiverServer:
                     continue
                 except OSError:
                     break
-                t = threading.Thread(target=self._handle, args=(conn,), daemon=True)
+                outcome = {"transfer": False}
+                t = threading.Thread(target=self._handle,
+                                     args=(conn, outcome), daemon=True)
                 t.start()
                 t.join(timeout=FT_MAX_BYTES)  # a trial transfer is bounded
-                break
+                # beta1.0.3: PAIR/UNPAIR handshakes do NOT consume the receive
+                # slot — only an actual file transfer ends the wait.
+                if outcome["transfer"]:
+                    break
         except Exception as exc:
             if self.log_fn:
                 self.log_fn(f"File transfer receiver stopped: {exc}")
@@ -189,16 +300,41 @@ class ReceiverServer:
                 pass
             self._sock = None
 
-    def _handle(self, conn):
+    def _handle(self, conn, outcome):
         part_path = self.save_path + ".part"
         try:
             conn.settimeout(60)
-            auth = _recv_line(conn)
-            parts = (auth or "").split(" ")
+            remote = conn.getpeername()[0]
+            first = _recv_line(conn) or ""
+            # beta1.0.3: PAIR/UNPAIR handshake — records/removes the
+            # requester's IP in this device's paired set.
+            if first == f"PAIR {self.user} {self.password}":
+                add_paired_ip(remote)
+                _send_line(conn, "PAIRED")
+                if self.log_fn:
+                    self.log_fn(f"File transfer: paired with {remote}")
+                return
+            if first == f"UNPAIR {self.user} {self.password}":
+                remove_paired_ip(remote)
+                _send_line(conn, "UNPAIRED")
+                if self.log_fn:
+                    self.log_fn(f"File transfer: unpaired from {remote}")
+                return
+            # beta1.0.3: a blank/dropped connection is not a transfer attempt —
+            # keep waiting for the real sender.
+            if not first:
+                return
+            outcome["transfer"] = True
+            parts = first.split(" ")
             if len(parts) != 3 or parts[0] != "AUTH" or \
                     parts[1] != self.user or parts[2] != self.password:
                 _send_line(conn, "ERR auth")
                 raise FileTransferError("Authentication failed")
+            # beta1.0.3: a transfer requires prior IP pairing on BOTH ends.
+            if not is_paired(remote):
+                _send_line(conn, "ERR pair")
+                raise FileTransferError(
+                    f"Refused {remote}: not paired (pair on both ends first)")
             _send_line(conn, "OK")
             offer = (_recv_line(conn) or "").split(" ")
             if len(offer) != 4 or offer[0] != "OFFER":
