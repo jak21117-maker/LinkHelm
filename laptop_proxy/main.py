@@ -2863,24 +2863,6 @@ class App:
         # beta1.0.57: store accelerator (Mihomo subprocess; no bundled nodes)
         self.accel = store_accel.StoreAccel(CONFIG_DIR, self.log)
 
-    def _startup_route_sweep(self):
-        """beta1.0.55: heal stale tunnel routes without racing a live session.
-
-        The sweep deletes 0.0.0.0/0, 0.0.0.0/1 and 128.0.0.0/1 when they point
-        at our TUN gateway. Those are exactly the routes start() installs, so if
-        the user connected while this thread was still pending it would delete
-        the tunnel it was meant to protect — one more way to end up with a
-        session that reports "TCP/UDP 不通". Bail out when an engine is up.
-        """
-        try:
-            mgr = self.tun_mgr
-            proc = getattr(mgr, "process", None) if mgr is not None else None
-            if proc is not None and proc.poll() is None:
-                self.log("Startup route sweep skipped: a tunnel is already running.")
-                return
-            _sweep_stale_tunnel_routes(self.log)
-        except Exception:
-            pass  # best effort — never break startup on hygiene
         self._bridge_lock = threading.RLock()
         self._bridge_busy = False
         self._ethernet_choices = {}
@@ -3322,6 +3304,26 @@ class App:
         self._update_bridge_button()
         threading.Thread(target=self._load_hotspot_info, daemon=True).start()
 
+
+
+    def _startup_route_sweep(self):
+        """beta1.0.55: heal stale tunnel routes without racing a live session.
+
+        The sweep deletes 0.0.0.0/0, 0.0.0.0/1 and 128.0.0.0/1 when they point
+        at our TUN gateway. Those are exactly the routes start() installs, so if
+        the user connected while this thread was still pending it would delete
+        the tunnel it was meant to protect — one more way to end up with a
+        session that reports "TCP/UDP 不通". Bail out when an engine is up.
+        """
+        try:
+            mgr = self.tun_mgr
+            proc = getattr(mgr, "process", None) if mgr is not None else None
+            if proc is not None and proc.poll() is None:
+                self.log("Startup route sweep skipped: a tunnel is already running.")
+                return
+            _sweep_stale_tunnel_routes(self.log)
+        except Exception:
+            pass  # best effort — never break startup on hygiene
     def _load_hotspot_info(self):
         try:
             ssid, password = self.ics_mgr.hotspot_info()
