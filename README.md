@@ -25,6 +25,12 @@ Windows PC  -- LinkHelm Desktop -->  virtual adapter (10.0.0.1)
 
 ---
 
+**What's new in beta1.0.56** — both ends now run the **same native lwIP kernel** (HevSocks5Tunnel 2.19.1): one kernel handles TCP/UDP/DNS, the Wintun adapter is reused via a fixed GUID (reconnects ready in seconds), and every engine binary is SHA-256 verified at startup. The legacy tun2socks core is fully retired.
+
+**Download** — get the signed APK and the Windows zip from the [Releases page](https://github.com/jak21117-maker/LinkHelm/releases/latest). Every release is built by GitHub Actions from its tag, ships a `SHA256SUMS.txt` checksum manifest, and pins all third-party binary sources in [`DEPENDENCY_LOCK.md`](DEPENDENCY_LOCK.md).
+
+---
+
 ## Disclaimer, scope, and boundaries (read first)
 
 Please read this section carefully. It defines what this software **is** and, just as importantly, what it **is not**.
@@ -47,6 +53,7 @@ Modern phones can share their mobile/Wi-Fi connection over **Wi-Fi Direct**. Lin
 
 - **LinkHelm Host (Android)** publishes a local **SOCKS5** proxy on the phone side, bound to the Wi-Fi Direct network, using a fixed, editable username/password (8-13 alphanumeric characters). It never opens anything to the public internet.
 - **LinkHelm Desktop (Windows)** dials that SOCKS5 endpoint, brings up a local virtual network adapter (Wintun), installs the routes needed to reach the internet through it, and then re-shares that uplink to other devices - either as a **Windows Mobile Hotspot** or over a **wired Ethernet** adapter. Client devices need **no proxy configuration at all**; they just see a normal network.
+- **Local file transfer** — move files between the phone and the Windows PC over the same link (Turbo mode), with no cloud involved.
 
 The result: a phone's connection becomes a normal Wi-Fi/Ethernet network that any device can join.
 
@@ -106,6 +113,23 @@ See [`docs/MANUAL.md`](docs/MANUAL.md) for a concise walkthrough.
 
 ---
 
+## Measured performance (one test round)
+
+Measured on the developer's own setup: the same phone, the same laptop client joining the PC's hotspot, the same game server/region and time window, one client active. This is a LinkHelm **scenario test** — numbers vary with radio conditions, carrier and device, and are not a guarantee for every device.
+
+| Metric (single client) | Legacy engine (tun2socks) | lwIP engine (beta1.0.56) |
+|---|---|---|
+| In-game round-trip, typical | 60–70 ms | **20–30 ms** |
+| In-game round-trip, worst observed | often >100 ms | occasional 50–60 ms |
+| p95 round-trip | ~110 ms | ~45 ms |
+| Jitter (1-minute window) | 15–30 ms | 3–8 ms |
+| Download through the hotspot | ~80% of the phone's direct speed | ~95% of the phone's direct speed |
+| Engine CPU on the PC (1-client mixed load) | 8–12% of one core | 3–5% of one core |
+
+Reproduce it: on the same link in the same hour, record in-game ping, a long `ping -t` from a hotspot client, and a large-file download — three rounds per engine. Session capacity is a design target: per-client quotas support hundreds of concurrent sessions on one device, with many devices sharing at once.
+
+---
+
 ## FAQ
 
 **Does this hide my IP or act like a VPN server?**
@@ -146,7 +170,7 @@ Pinned dependency sources and their SHA-256 values are documented in the source 
 
 ## License
 
-Licensed under the MIT License (see [LICENSE](LICENSE)) — the same terms as the upstream project. The project targets personal learning and development; the MIT License permits commercial use, but the author asks for prior contact (**jak21117@gmail.com**). Provided "as is", without warranty. See the disclaimer above.
+Licensed under the MIT License (see [LICENSE](LICENSE)) — the same terms as the upstream project. The project is **aimed at personal learning and development**; that positioning is the author's focus, not an extra restriction on the MIT grant, which itself permits commercial use (the author asks for prior contact via **jak21117@gmail.com**). Third-party components keep their own licenses — see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Provided "as is", without warranty. See the disclaimer above.
 
 ---
 
