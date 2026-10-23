@@ -3038,7 +3038,7 @@ class App:
         accel_card.pack(fill="x", pady=(0, 12))
         accel_card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
-            accel_card, text=tr("01.5  STORE BOOST", "01.5  商店加速"), font=("Segoe UI", 9, "bold"),
+            accel_card, text=tr("02  STORE BOOST", "02  商店加速"), font=("Segoe UI", 9, "bold"),
             text_color=self.ACCENT, anchor="w", height=15
         ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 0))
         ctk.CTkLabel(
@@ -3104,7 +3104,7 @@ class App:
         self.bridge_card.pack(fill="x", pady=(0, 12))
         self.bridge_card.grid_columnconfigure(0, weight=1)
         self.bridge_eyebrow = ctk.CTkLabel(
-            self.bridge_card, text=tr("02  OUTBOUND", "02  出站分发"), font=("Segoe UI", 9, "bold"),
+            self.bridge_card, text=tr("03  OUTBOUND", "03  出站分发"), font=("Segoe UI", 9, "bold"),
             text_color=self.ACCENT, anchor="w", height=15
         )
         self.bridge_eyebrow.grid(row=0, column=0, sticky="w", padx=16, pady=(14, 0))
@@ -3467,7 +3467,7 @@ class App:
             "error": "#E45D63",
         }
         details = {
-            "connected": tr("Connected. You can share to other devices in step 2.", "连接已就绪，可以在第 2 步共享给其他设备。"),
+            "connected": tr("Connected. You can share to other devices in step 3.", "连接已就绪，可以在第 3 步共享给其他设备。"),
             "starting": tr("Creating the LinkHelm adapter and configuring routes...", "正在创建 LinkHelm 适配器并配置路由..."),
             "stopping": tr("Closing the tunnel and restoring network settings...", "正在关闭隧道并恢复网络设置..."),
             "disconnected": tr("Enter the phone IP, then tap Connect.", "输入手机 IP 后点击「连接」。"),
