@@ -8,13 +8,18 @@ This repository is a modified version of **Hotspot-Bypass-VPN-Unlimited-Hotspot*
 
 | Component | Version | License | Source |
 |---|---|---|---|
-| tun2socks (xjasonlyu) Windows binary | v2.7.0 (pinned build) | **GPL-3.0** (that tag's LICENSE; the upstream main-branch MIT does not apply) | github.com/xjasonlyu/tun2socks/releases |
+| tun2socks (xjasonlyu) Windows binary | v2.7.0 — **REMOVED in beta1.0.5** | (was GPL-3.0) | github.com/xjasonlyu/tun2socks/releases |
 | Wintun prebuilt DLL | 0.14.1 | dedicated license text shipped with the official prebuilt package (see `wintun/LICENSE.txt`) | www.wintun.net/builds |
+| Mihomo kernel Windows binary (`laptop_proxy/mihomo/mihomo.exe`) | v1.19.33 (pinned) | **GPL-3.0** | github.com/MetaCubeX/mihomo/releases/tag/v1.19.33 |
 
-**GPL-3.0 obligations**: when distributing the tun2socks binary you must also
-provide the complete corresponding source of that version (or a written offer
-to provide it, valid for at least 3 years) together with the full GPL-3.0 text.
-Corresponding source: https://github.com/xjasonlyu/tun2socks
+**GPL-3.0 obligations (Mihomo)**: the binary is shipped **UNMODIFIED** and runs
+as a **separate process** (it is never linked or compiled into LinkHelm), so
+the GPL does not extend to LinkHelm (MIT). When distributing the binary you
+must also provide the complete corresponding source of that version (or a
+written offer, valid for at least 3 years) together with the full GPL-3.0
+text. Corresponding source: https://github.com/MetaCubeX/mihomo
+(tag `v1.19.33`). LinkHelm bundles and fetches **no proxy nodes**; users
+import their own subscription or config locally.
 
 Every bundled binary is SHA-256 verified against pinned values before use.
 

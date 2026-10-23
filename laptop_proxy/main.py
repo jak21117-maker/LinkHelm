@@ -4,6 +4,7 @@ from tkinter import filedialog
 import atexit
 import traceback
 import file_transfer
+import store_accel
 import queue
 import random
 import re
@@ -2845,7 +2846,7 @@ class App:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("LinkHelm Desktop beta1.0.56 | Windows")
+        self.root.title("LinkHelm Desktop beta1.0.57 | Windows")
         self.root.geometry(f"460x{min(770, max(620, root.winfo_screenheight() - 90))}")
         self.root.minsize(420, 590)
         self.root.configure(fg_color=self.BG)
@@ -2859,6 +2860,8 @@ class App:
         # routes when the user connects. Best-effort, never blocks the UI.
         threading.Thread(target=self._startup_route_sweep, daemon=True).start()
         self.ics_mgr = IcsManager(self.log)
+        # beta1.0.57: store accelerator (Mihomo subprocess; no bundled nodes)
+        self.accel = store_accel.StoreAccel(CONFIG_DIR, self.log)
 
     def _startup_route_sweep(self):
         """beta1.0.55: heal stale tunnel routes without racing a live session.
@@ -3041,6 +3044,76 @@ class App:
             font=("Segoe UI", 11), command=self.stop
         )
         self.btn_stop.grid(row=0, column=1, sticky="ew")
+
+        # beta1.0.57: store accelerator (Steam / Epic) — Mihomo kernel as a
+        # separate helper process. Uses the EXISTING network path (no new
+        # adapter): local mixed port + optional WinINET system proxy. No
+        # nodes are bundled; the user imports their own subscription/config.
+        accel_card = ctk.CTkFrame(
+            self.content, fg_color=self.CARD, corner_radius=13,
+            border_width=1, border_color=self.BORDER
+        )
+        accel_card.pack(fill="x", pady=(0, 12))
+        accel_card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            accel_card, text=tr("01.5  STORE BOOST", "01.5  商店加速"), font=("Segoe UI", 9, "bold"),
+            text_color=self.ACCENT, anchor="w", height=15
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 0))
+        ctk.CTkLabel(
+            accel_card, text=tr("Steam / Epic store booster", "Steam / Epic 商店加速"),
+            font=("Segoe UI", 16, "bold"), text_color=self.TEXT, anchor="w", height=24
+        ).grid(row=1, column=0, sticky="w", padx=16, pady=(1, 0))
+        ctk.CTkLabel(
+            accel_card, text=tr(
+                "Unmodified Mihomo kernel, separate process, same network adapter - no new TUN device. "
+                "Store domains only; NO nodes are bundled - import your own subscription or config.",
+                "Mihomo 内核独立子进程运行，沿用现有网卡，不创建新 TUN 设备。仅商店域名走代理；不内置任何节点，请自行导入订阅或配置。"),
+            font=("Segoe UI", 10), text_color=self.MUTED, anchor="w", height=19,
+            wraplength=400, justify="left"
+        ).grid(row=2, column=0, sticky="w", padx=16, pady=(0, 11))
+        self.accel_sub = ctk.CTkEntry(
+            accel_card, height=33, corner_radius=7, fg_color=self.INPUT_BG,
+            border_color=self.INPUT_BORDER, font=("Segoe UI", 11),
+            placeholder_text=tr("Subscription URL or config.yaml path", "订阅链接或 config.yaml 路径")
+        )
+        self.accel_sub.grid(row=3, column=0, sticky="ew", padx=16)
+        _accel_pref = self.accel.load_pref()
+        if _accel_pref.get("subUrl"):
+            self.accel_sub.insert(0, _accel_pref["subUrl"])
+        accel_row = ctk.CTkFrame(accel_card, fg_color="transparent")
+        accel_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(10, 0))
+        accel_row.grid_columnconfigure(0, weight=1)
+        accel_row.grid_columnconfigure(1, weight=1)
+        self.accel_start = ctk.CTkButton(
+            accel_row, text=tr("▷  Start boost", "▷  启动加速"), height=33, corner_radius=7,
+            fg_color=self.ACCENT, hover_color="#005AAB",
+            font=("Segoe UI", 11, "bold"), command=self._accel_start
+        )
+        self.accel_start.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.accel_stop = ctk.CTkButton(
+            accel_row, text=tr("Stop", "停止加速"), height=33, corner_radius=7,
+            state="disabled", fg_color=self.INPUT_BG,
+            border_width=1, border_color=self.BORDER,
+            text_color=self.TEXT, hover_color=self.STATUS_BG,
+            font=("Segoe UI", 11), command=self._accel_stop
+        )
+        self.accel_stop.grid(row=0, column=1, sticky="ew")
+        accel_bottom = ctk.CTkFrame(accel_card, fg_color="transparent")
+        accel_bottom.grid(row=5, column=0, sticky="ew", padx=16, pady=(8, 14))
+        accel_bottom.grid_columnconfigure(0, weight=1)
+        accel_bottom.grid_columnconfigure(1, weight=0)
+        self.accel_sysproxy = ctk.CTkCheckBox(
+            accel_bottom, text=tr("Set system proxy", "设置系统代理"),
+            font=("Segoe UI", 10), text_color=self.TEXT,
+        )
+        self.accel_sysproxy.select()
+        self.accel_sysproxy.grid(row=0, column=1, sticky="e")
+        self.accel_status = ctk.StringVar(value=tr(
+            "Idle. Import a subscription, then start.", "未运行。先导入订阅，再启动加速。"))
+        ctk.CTkLabel(
+            accel_bottom, textvariable=self.accel_status,
+            font=("Segoe UI", 10), text_color=self.MUTED, anchor="w"
+        ).grid(row=0, column=0, sticky="w")
 
         self.bridge_card = ctk.CTkFrame(
             self.content, fg_color=self.CARD, corner_radius=13,
@@ -4177,6 +4250,32 @@ class App:
             text_color=self.MUTED, anchor="w", wraplength=410, justify="left"
         ).pack(fill="x", pady=(0, 4))
 
+    def _accel_start(self):
+        # beta1.0.57: launch the store accelerator with the USER's own
+        # subscription/config — LinkHelm bundles and fetches no nodes.
+        ok, msg = self.accel.start(self.accel_sub.get(),
+                                   bool(self.accel_sysproxy.get()))
+        if not ok:
+            self.accel_status.set(tr("Start failed: ", "启动失败：") + msg)
+            self.log("[accel] start failed: %s" % msg)
+        else:
+            self.log("[accel] store accelerator started (%s)" % msg)
+        # re-check shortly — an invalid subscription makes mihomo exit fast
+        self.root.after(2500, self._accel_refresh_status)
+
+    def _accel_stop(self):
+        self.accel.stop()
+        self._accel_refresh_status()
+
+    def _accel_refresh_status(self):
+        running = self.accel.is_running()
+        self.accel_start.configure(state="disabled" if running else "normal")
+        self.accel_stop.configure(state="normal" if running else "disabled")
+        if running:
+            self.accel_status.set(self.accel.status_text())
+        else:
+            self.accel_status.set(tr("Stopped.", "已停止。"))
+
     def _ics_diagnose(self, phone_ip):
         """v1.5.44: READ-ONLY ICS diagnostic (docx §7). Reports:
         SharedAccess service state, per-adapter ICS roles (COM HNetCfg), and
@@ -4461,6 +4560,13 @@ def main(startup_hidden=False):
         # v1.4.63/91: TRUE exit — the VPN must never outlive the window; the
         # client itself force-exits after destroy so no half-alive teardown
         # state lingers.
+        # beta1.0.57: stop the store accelerator and restore the system
+        # proxy before the process dies — never leave WinINET pointing at a
+        # dead 127.0.0.1:7890.
+        try:
+            app.accel.shutdown()
+        except Exception:
+            pass
         _kill_engine_procs_all()
         root.destroy()
         os._exit(0)

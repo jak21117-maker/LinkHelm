@@ -20,6 +20,15 @@ _lwip_binaries = [
     if os.path.isfile('engine/' + name)
 ]
 
+# beta1.0.57: store accelerator kernel — UNMODIFIED official mihomo binary
+# (MetaCubeX/mihomo v1.19.33, GPL-3.0) shipped as a SEPARATE process file
+# (GPL does not extend to LinkHelm; see THIRD_PARTY_NOTICES.md for the
+# required source link). Optional like engine/: packed when present.
+_mihomo_datas = (
+    [('mihomo/mihomo.exe', 'mihomo')]
+    if os.path.isfile('mihomo/mihomo.exe') else []
+)
+
 block_cipher = None
 
 a = Analysis(
@@ -31,6 +40,7 @@ a = Analysis(
     # hev-socks5-tunnel.exe + wintun.dll + msys-2.0.dll）。
     binaries=[
         *_lwip_binaries,
+        *_mihomo_datas,
     ],
     datas=datas,
     # v1.4.93: pystray picks its Windows backend dynamically (pystray._win32)

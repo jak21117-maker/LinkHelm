@@ -5,6 +5,7 @@ Builder verification date: 2026-10-15. All hashes are SHA-256 computed on the **
 | Component | Version | Official source URL | SHA-256 (file) |
 |---|---|---|---|
 | HevSocks5Tunnel (Windows win64 exe) | 2.19.1 | https://github.com/heiher/hev-socks5-tunnel/releases/download/2.19.1/hev-socks5-tunnel-win64.zip | exe `242557dc4ada5a45bcc02d98a558e86dd29025efdf7960b8e302bfc2ad1901c5` |
+| Mihomo (Windows win64 exe, store accelerator kernel) | v1.19.33 | https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-windows-amd64-v1.19.33.zip | zip `6ab2180875f9f6fff8b19386d760daec257f66b45f72b3afc650634272fa837a`；exe `1cde41cfffd3de0aedad63c0a8515e1ce5eea507e8133aed0f637d316c93800a`（61247488 B） |
 | Wintun | 0.14.1 | https://www.wintun.net/builds/wintun-0.14.1.zip | `07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51` |
 | HevSocks5Tunnel (Android AAR) | 2.19.1 | https://github.com/heiher/hev-socks5-tunnel/releases/download/2.19.1/hev-socks5-tunnel.aar | `107958f7a07051386248ba8dba778b63d8dcefdfb2c3665b0ee9a8c93de5f6ca` (605512 B) |
 
