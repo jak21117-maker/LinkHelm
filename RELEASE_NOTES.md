@@ -1,60 +1,76 @@
 # LinkHelm beta1.0.56
 
-Windows 与 Android 双端统一版本号 beta1.0.56（Android versionCode 45）。
-本版完成双端数据面架构统一，连接体验、会话容量、速率与稳定性全面升级。
-研发测试构建。
+Windows and Android now share one version number: **beta1.0.56** (Android
+versionCode 45). This release unifies the data-plane architecture on both
+ends and upgrades connection experience, session capacity, throughput and
+stability across the board. Development/test build.
 
-## 架构更新：双端统一 lwIP 内核（HevSocks5Tunnel 2.19.1）
+## Architecture: unified lwIP engine on both ends (HevSocks5Tunnel 2.19.1)
 
-- Windows 与 Android 的数据面统一为同一原生 lwIP 内核：TCP / UDP / DNS
-  全部由 lwIP 的 PCB 栈在单一内核内处理，消除旧架构多链路并存的额外开销。
-- 引擎三件套随包分发（`hev-socks5-tunnel.exe` + `wintun.dll` +
-  `msys-2.0.dll`），启动前按固化 SHA-256 校验，运行时零下载、零回退，
-  行为完全可复现。
-- Windows 侧保持轻量 Python GUI 与编排（PyInstaller 打包），数据面全部
-  下沉到原生引擎。
+- The data plane on Windows and Android now runs the **same native lwIP
+  kernel**: TCP / UDP / DNS are all handled by lwIP's PCB stack in a single
+  kernel, removing the overhead of the old multi-link design.
+- The engine trio ships inside the package (`hev-socks5-tunnel.exe` +
+  `wintun.dll` + `msys-2.0.dll`); SHA-256 is verified at startup against
+  pinned values. No downloads and no fallback paths at runtime — behavior
+  is fully reproducible.
+- Windows keeps a lightweight Python GUI/orchestration layer (PyInstaller
+  packaged); the data plane lives entirely in the native engine.
 
-## 体验提升
+## Experience
 
-- 虚拟网卡 **LinkHelm-IwIP** 采用固定 GUID：Wintun 按 GUID 直接重开同一
-  适配器，再次连接秒级就绪，不再累积 "LinkHelm-IwIP 2/3/4" 冗余网卡。
-- 单实例互斥 + 托盘"退出并清理网络"；开机自启、静默启动后自动连接，
-  手机代理一出现即完成拨号。
-- 中英文双语界面即时切换；SOCKS5 账号修改即时生效，隧道在线重建。
+- The **LinkHelm-IwIP** virtual adapter uses a fixed GUID: Wintun reopens
+  the same adapter directly, so reconnects are ready in seconds and the
+  old "LinkHelm-IwIP 2/3/4" adapter accumulation is gone.
+- Single-instance guard plus a tray "Quit & Clean Up Network"; start at
+  logon with silent auto-connect — dialing completes as soon as the phone
+  proxy appears.
+- Instant English/Chinese UI switching; SOCKS5 credential changes apply
+  live and the tunnel rebuilds on the fly.
 
-## 会话数量与并发
+## Sessions & concurrency
 
-- 安卓侧把原先分散的三路握手（TCP 预检 / SOCKS5 保活 / UDP 自测）收敛为
-  **单次统一握手**，深度探测改为任一候选成功即过，活动连接与会话数
-  大幅下降，多设备并发更从容。
-- 按客户端的会话配额与队列统一管理，多设备同时共享互不挤占。
+- On Android, the previously separate three-way probing (TCP pre-check /
+  SOCKS5 keep-alive / UDP self-test) is consolidated into a **single
+  unified handshake** — active connections and session count drop sharply,
+  so many devices can share comfortably at once.
+- Per-client session quotas and unified queue management keep concurrent
+  devices from starving each other.
 
-## 速率与延时
+## Speed & latency
 
-- lwIP 单栈处理显著减少内核态 / 用户态往返，转发路径更短，**延时更低**。
-- 链路参数按手机 Wi-Fi Direct 场景整体调优（连接窗口、保活周期、
-  重传节奏），弱信号下吞吐更平稳。
+- Single-stack lwIP processing cuts kernel/user-mode round-trips and
+  shortens the forwarding path for **lower latency**.
+- Link parameters are tuned for phone Wi-Fi Direct (connection window,
+  keep-alive cadence, retransmission pacing) to keep throughput smooth
+  under weak signal.
 
-## 稳定性
+## Stability
 
-- 引擎以前台直接子进程运行，配合进程守护与自动重建，长时运行更稳。
-- 过期隧道路由自动清扫、NCSI 探测状态随断开自动还原，网络环境始终干净。
-- 手机端看门狗兜底，共享意外中断后自动拉起。
+- The engine runs as a foreground child process with a supervisor and
+  automatic rebuild, for steady long-running sessions.
+- Stale tunnel routes are swept automatically and NCSI probing state is
+  restored on disconnect, keeping the network environment clean.
+- A phone-side watchdog re-arms sharing automatically after an
+  interruption.
 
-## 打包
+## Packaging
 
-- Windows zip 只含应用目录（`LinkHelm_Desktop/`）；Android APK 仅打包
-  arm64-v8a，体积更小。
-- 引擎二进制来源与 SHA-256 见 `DEPENDENCY_LOCK.md`（官方 GitHub release /
-  wintun.net，哈希固化）。
+- The Windows zip contains only the app folder (`LinkHelm_Desktop/`); the
+  Android APK ships arm64-v8a only, for a smaller download.
+- Engine binary sources and SHA-256 values are pinned in
+  `DEPENDENCY_LOCK.md`.
 
-## 验证
+## Verification
 
-- Windows：pytest 单测 102 passed（引擎启动、隧道生命周期、UDP/DNS 池、
-  单实例、二进制完整性等）。
-- Android：单元 + 集成测试通过（客户端名册、代理服务器、UDP 探针）。
+- Windows: 102 pytest tests passed (engine launch, tunnel lifecycle,
+  UDP/DNS pool, single instance, binary integrity, and more).
+- Android: unit + integration tests passed (client roster, proxy server,
+  UDP probe).
 
 ---
 
-Binaries: signed Android APK (versionCode 45) + Windows win64 zip, both built
-and published by GitHub Actions from this tag.
+Binaries: signed Android APK (versionCode 45) + Windows win64 zip, both
+built and published by GitHub Actions from this tag. `SHA256SUMS.txt` lists
+the asset checksums; the Source code archives are generated automatically
+by GitHub.

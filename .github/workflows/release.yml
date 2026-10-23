@@ -96,12 +96,16 @@ jobs:
         with:
           name: desktop-zip
 
+      # Publish a checksum manifest alongside the binaries.
+      - name: Generate SHA256SUMS.txt
+        run: sha256sum LinkHelm-Host-Android-*.apk LinkHelm.Desktop-*.zip > SHA256SUMS.txt
+
       - name: Create or update the pre-release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          FILES=("LinkHelm-Host-Android-${TAG}.apk" "LinkHelm.Desktop-${TAG}-win64.zip")
+          FILES=("LinkHelm-Host-Android-${TAG}.apk" "LinkHelm.Desktop-${TAG}-win64.zip" "SHA256SUMS.txt")
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             # If a stale draft survived a tag force-move, publish it too.
             gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY" || true
