@@ -189,7 +189,7 @@ def test_failover_monitor_keeps_lane_on_refused_egress(monkeypatch):
         tm._use_lane_b = False
         tm._lane_a_fail_strikes = 0
         switches = []
-        monkeypatch.setattr(tm, "_restart_tun2socks", lambda: switches.append(1))
+        monkeypatch.setattr(tm, "_restart_engine", lambda: switches.append(1))
 
         real_probe = tm._probe_socks_port
         calls = {"n": 0}

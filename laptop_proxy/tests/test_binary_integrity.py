@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
-"""v1.4.4 — runtime integrity lock for bundled/installed VPN binaries.
+"""beta1.0.5 — runtime integrity lock for the bundled lwIP engine.
 
-The program runs elevated, so a swapped tun2socks.exe / wintun.dll in BIN_DIR
-must never execute. _check_dependencies must (a) refuse a tampered installed
-copy, (b) self-heal from a verified bundled copy, (c) fail loudly when the
-bundled copies no longer match the integrity lock.
+The program runs elevated, so a swapped hev-socks5-tunnel.exe / wintun.dll /
+msys-2.0.dll under BIN_DIR/engine/ must never execute. _check_dependencies
+must (a) trust a verified engine/ trio, (b) refuse a tampered or missing
+component with a loud RuntimeError. No runtime download exists anymore —
+tun2socks (and its bundled_bin self-heal) was removed entirely; the engine
+ships with the package and the SHA-256 lock pins the official 2.19.1 build.
 """
 import os
 import sys
@@ -12,105 +14,107 @@ import types
 
 import pytest
 
+import engine
 import main
 
 
-@pytest.fixture(autouse=True)
-def fake_version_ok(monkeypatch):
-    """v1.5.4: placeholder bytes can't report a real `--version`; the P0-1
-    runtime version gate is monkeypatched per-test (these tests exercise the
-    HASH path). test_version_gate_* re-patches it to test the version path.
-    """
-    monkeypatch.setattr(main, "_tun2socks_version_ok", lambda path: True)
-
-
 @pytest.fixture()
-def fake_dirs(tmp_path, monkeypatch):
-    """Isolated BIN_DIR + bundled_bin with valid placeholder content."""
+def fake_engine_dir(tmp_path, monkeypatch):
+    """Isolated engine.BIN_DIR with an engine/ subdir holding valid placeholder files.
+
+    EXPECTED_BIN_SHA256 is re-pinned to the placeholder hashes for the duration
+    of the test (the official hashes cannot be reproduced from placeholder
+    bytes) and restored afterwards.
+    """
     bin_dir = tmp_path / "bin"
-    bundled = tmp_path / "bundled_bin"
-    bin_dir.mkdir()
-    bundled.mkdir()
-    good = {name: (b"OFFICIAL-" + name.encode()) for name in main.EXPECTED_BIN_SHA256}
+    engine_dir = bin_dir / "engine"
+    engine_dir.mkdir(parents=True)
+    names = (engine.LWIP_EXE_NAME, engine.WINTUN_DLL_NAME, engine.MSYS_DLL_NAME)
+    saved = dict(main.EXPECTED_BIN_SHA256)
+    good = {name: (b"OFFICIAL-" + name.encode()) for name in names}
     for name, data in good.items():
-        (bundled / name).write_bytes(data)
-        main.EXPECTED_BIN_SHA256[name] = main._file_sha256(str(bundled / name))
-    monkeypatch.setattr(main, "BIN_DIR", str(bin_dir))
-    monkeypatch.setattr(main, "_bundled_bin_dir", lambda: str(bundled))
-    return types.SimpleNamespace(bin_dir=bin_dir, bundled=bundled, good=good)
+        (engine_dir / name).write_bytes(data)
+        main.EXPECTED_BIN_SHA256[name] = main._file_sha256(str(engine_dir / name))
+    monkeypatch.setattr(engine, "BIN_DIR", str(bin_dir))
+    try:
+        yield types.SimpleNamespace(bin_dir=bin_dir, engine_dir=engine_dir, good=good)
+    finally:
+        main.EXPECTED_BIN_SHA256.clear()
+        main.EXPECTED_BIN_SHA256.update(saved)
 
 
 def _make_app(logs):
     app = object.__new__(main.TunManager)
     app.log = logs.append
-    app.confirm_download = lambda: False
     return app
 
 
-def test_valid_installed_binaries_are_trusted(fake_dirs):
-    for name, data in fake_dirs.good.items():
-        (fake_dirs.bin_dir / name).write_bytes(data)
+def test_valid_engine_binaries_are_trusted(fake_engine_dir):
     logs = []
     app = _make_app(logs)
     result = app._check_dependencies()
-    assert result == os.path.join(str(fake_dirs.bin_dir), "tun2socks.exe")
-    assert not any("安全警告" in line for line in logs)
+    assert result == os.path.join(
+        str(fake_engine_dir.engine_dir), "hev-socks5-tunnel.exe"
+    )
+    assert any("lwIP engine verified" in line for line in logs)
 
 
-def test_tampered_installed_binary_is_removed_and_healed_from_bundled(fake_dirs):
-    t2s = fake_dirs.bin_dir / "tun2socks.exe"
-    t2s.write_bytes(b"TAMPERED-PAYLOAD")
+def test_tampered_engine_binary_is_rejected(fake_engine_dir):
+    (fake_engine_dir.engine_dir / "wintun.dll").write_bytes(b"TAMPERED-PAYLOAD")
     logs = []
     app = _make_app(logs)
-    result = app._check_dependencies()
-    assert result == str(t2s)
-    assert main._file_sha256(str(t2s)) == main.EXPECTED_BIN_SHA256["tun2socks.exe"]
-    assert any("Security warning" in line for line in logs)
-    # healed copy equals the bundled (official) bytes
-    assert t2s.read_bytes() == (fake_dirs.bundled / "tun2socks.exe").read_bytes()
-
-
-def test_tampered_bundled_copy_is_rejected(fake_dirs):
-    (fake_dirs.bundled / "wintun.dll").write_bytes(b"EVIL")
-    logs = []
-    app = _make_app(logs)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="fails SHA-256"):
         app._check_dependencies()
-    assert any("failed hash verification" in line for line in logs)
-    assert not (fake_dirs.bin_dir / "wintun.dll").exists()
+    assert any("lwIP engine component" in line for line in logs)
 
 
-def test_v154_legacy_versioned_backups_are_swept_from_cache(fake_dirs):
-    """v1.5.4: the runtime cache must never keep per-version backups such as
-    tun2socks_v2.5.2_backup.exe — only the two pinned files may live there."""
-    (fake_dirs.bin_dir / "tun2socks_v2.5.2_backup.exe").write_bytes(b"OLD")
-    (fake_dirs.bin_dir / "tun2socks_v2.7.0_official.exe").write_bytes(b"REF")
-    logs = []
-    app = _make_app(logs)
-    app._check_dependencies()
-    assert not (fake_dirs.bin_dir / "tun2socks_v2.5.2_backup.exe").exists()
-    assert not (fake_dirs.bin_dir / "tun2socks_v2.7.0_official.exe").exists()
-    assert any("Cleaned legacy cache component" in line for line in logs)
+def test_missing_engine_binary_is_rejected(fake_engine_dir):
+    (fake_engine_dir.engine_dir / "msys-2.0.dll").unlink()
+    app = _make_app([])
+    with pytest.raises(RuntimeError, match="missing or fails SHA-256"):
+        app._check_dependencies()
 
 
-def test_v154_version_gate_reinstalls_stale_cached_build(fake_dirs, monkeypatch):
-    """v1.5.4 (P0-1): a cached binary that passes the HASH gate but reports a
-    foreign build (e.g. 2.5.2) is removed and reinstalled from the bundled
-    v2.7.0 build — the only recovery source."""
-    for name, data in fake_dirs.good.items():
-        (fake_dirs.bin_dir / name).write_bytes(data)
-    calls = []
+def test_engine_dir_is_the_only_source(fake_engine_dir):
+    """beta1.0.5: no runtime download / no bundled_bin self-heal — the engine
+    trio must live in BIN_DIR/engine/ and nowhere else."""
+    app = _make_app([])
+    exe = app._check_dependencies()
+    assert exe == os.path.join(str(fake_engine_dir.bin_dir), "engine",
+                               "hev-socks5-tunnel.exe")
 
-    def fake_version(path):
-        calls.append(path)
-        # first call inspects the CACHED copy → foreign build; every later
-        # call inspects the freshly installed bundled copy → pinned build.
-        return len(calls) > 1
 
-    monkeypatch.setattr(main, "_tun2socks_version_ok", fake_version)
-    logs = []
-    app = _make_app(logs)
-    result = app._check_dependencies()
-    assert result == os.path.join(str(fake_dirs.bin_dir), "tun2socks.exe")
-    assert any("version check failed" in line for line in logs)
-    assert any("version verified" in line for line in logs)
+def test_integrity_lock_matches_shipped_engine():
+    """The shipped engine/ binaries must hash-match the lock exactly (this is
+    what the elevated runtime re-verification relies on). Skipped when the
+    engine/ directory is not present (e.g. a source-only checkout)."""
+    engine_dir = engine.engine_bin_dir()
+    if not os.path.isdir(engine_dir):
+        pytest.skip("engine/ not shipped in this checkout")
+    for name in (engine.LWIP_EXE_NAME, engine.WINTUN_DLL_NAME, engine.MSYS_DLL_NAME):
+        path = os.path.join(engine_dir, name)
+        assert os.path.isfile(path), f"{name} missing from engine/"
+        assert main._file_sha256(path) == main.EXPECTED_BIN_SHA256[name], (
+            f"{name} does not match the integrity lock"
+        )
+
+
+def test_frozen_mode_anchors_bin_dir_to_meipass(tmp_path, monkeypatch):
+    """beta1.0.5 regression: in the frozen onedir package the engine trio
+    lives at <app>/_internal/engine/ (LaptopProxy.spec binaries target
+    'engine'). engine.py itself is PYZ-embedded — NOT a file on disk — so
+    __file__ must NOT be the anchor. sys._MEIPASS is the canonical
+    PyInstaller root and equals <app>/_internal in onedir mode."""
+    with open(engine.__file__, "r", encoding="utf-8") as f:
+        src = f.read()
+    meipass = tmp_path / "_internal"
+    (meipass / "engine").mkdir(parents=True)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(meipass), raising=False)
+    probe = types.ModuleType("engine_frozen_probe")
+    exec(compile(src, "engine_frozen_probe", "exec"), probe.__dict__)
+    assert probe.BIN_DIR == str(meipass)
+    assert probe.engine_bin_dir() == os.path.join(str(meipass), "engine")
+    assert probe.engine_exe_path() == os.path.join(
+        str(meipass), "engine", "hev-socks5-tunnel.exe"
+    )

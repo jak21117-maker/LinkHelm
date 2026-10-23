@@ -92,17 +92,61 @@ class ProxyServerIntegrationTest {
         assertEquals(1, proxy.metrics().activeByClient["127.0.0.2"] ?: 0)
     }
 
-    /** beta1.0.3: per-device quota = cap for ≤2 devices, fair share of the
-     *  global session budget (floored at 100) for ≥3. */
+    /**
+     * beta1.0.51: ONE shared session budget — TCP sessions and UDP
+     * associations draw from the SAME per-device quota (user contract:
+     * TCP 和 UDP 不设比例). Each association costs TWO slots (its control
+     * connection + the association itself). With perClient=6, 2 TCP tunnels +
+     * 2 UDP associations exhaust the device's 6 slots; the next connection
+     * must be refused at accept time.
+     */
+    @Test
+    fun tcpAndUdpSessionsShareOnePerDeviceBudget() {
+        val echo = TcpEchoServer().also { resources.add(it) }
+        val udpEcho = UdpEchoServer().also { resources.add(it) }
+        val proxy = startProxy(coreThreads = 1, maxThreads = 8, perClient = 6)
+
+        val tcp1 = openTcpTunnel(proxy.localPort(), echo.port).also { resources.add(it) }
+        val tcp2 = openTcpTunnel(proxy.localPort(), echo.port).also { resources.add(it) }
+        val udp1 = openUdpAssociation(proxy.localPort()).also { resources.add(it) }
+        val udp2 = openUdpAssociation(proxy.localPort()).also { resources.add(it) }
+        assertEcho(tcp1, "tcp-1")
+        assertEcho(tcp2, "tcp-2")
+        assertUdpEcho(DatagramSocket().apply { soTimeout = 2_000 }.also { resources.add(it) }, udp1.relayPort, udpEcho.port, "udp-1")
+
+        // 2 TCP + 2 associations (2 control + 2 association slots) = the whole
+        // 6-slot per-device budget; the next connection is refused at accept.
+        assertTrue(awaitCondition { proxy.metrics().activeSessions == 6 })
+        val refused = connectToProxy(proxy.localPort()).also { resources.add(it) }
+        try {
+            refused.soTimeout = 2_000
+            refused.getOutputStream().write(byteArrayOf(5, 1, 0))
+            refused.getOutputStream().flush()
+            assertSocks5Refused(refused)
+        } finally {
+            refused.close()
+        }
+        assertTrue(awaitCondition { proxy.metrics().rejectedConnections == 1 })
+
+        // Freeing a TCP slot re-opens exactly one shared slot.
+        tcp2.close()
+        assertTrue(awaitCondition { proxy.metrics().activeSessions == 5 })
+        val admitted = openTcpTunnel(proxy.localPort(), echo.port).also { resources.add(it) }
+        assertEcho(admitted, "after-release")
+    }
+
+    /** beta1.0.51: per-device quota = shared dynamic quota for ≤2 devices,
+     *  fair share of the shared session budget (floored at 200 — 资源占满时
+     *  最少两百) for ≥3. */
     @Test
     fun dynamicPerClientQuotaSwitchesAtThreeDevices() {
         val proxy = startProxy(coreThreads = 1, maxThreads = 480, perClient = 200).also { servers.add(it) }
         assertEquals(200, proxy.perClientQuotaFor(1))
         assertEquals(200, proxy.perClientQuotaFor(2))
-        // fair share: 480/3 = 160, inside the 200 cap
-        assertEquals(160, proxy.perClientQuotaFor(3))
-        // fair share 480/10 = 48 < 100 floor
-        assertEquals(100, proxy.perClientQuotaFor(10))
+        // fair share: 480/3 = 160 < 200 floor → the floor binds
+        assertEquals(200, proxy.perClientQuotaFor(3))
+        // fair share 480/10 = 48 < 200 floor
+        assertEquals(200, proxy.perClientQuotaFor(10))
         // Small explicit configs stay authoritative for ≤2 devices (test harness
         // relies on this): the fair-share floor must never RAISE a smaller base.
         val small = startProxy(coreThreads = 1, maxThreads = 4, perClient = 4).also { servers.add(it) }
@@ -111,48 +155,21 @@ class ProxyServerIntegrationTest {
     }
 
     /**
-     * v1.5.0: the ONLY network-side tuning added this release — extreme
-     * congestion (≥90% pool busy) tightens NEW-connection per-IP admission
-     * to congestionQuotaPerClient; it must overlay (never raise) the normal
-     * tiers and disappear entirely when congestion clears.
+     * beta1.0.51: extreme congestion (≥95% of the SHARED session budget)
+     * tightens NEW-session per-device admission to 300 (拥堵时 300); it must
+     * overlay (never raise) the normal tiers and disappear entirely when
+     * congestion clears.
      */
     @Test
     fun congestionModeTightensNewConnectionQuotaAndRecovers() {
-        val proxy = startProxy(coreThreads = 1, maxThreads = 480, perClient = 200).also { servers.add(it) }
-        // Normal path untouched when the pool is healthy.
-        assertEquals(200, proxy.perClientQuotaFor(1))
-
-        // Extreme pressure: every tier is capped by the overlay.
-        proxy.congestionActive.set(true)
-        assertEquals(100, proxy.perClientQuotaFor(1))
-        assertEquals(100, proxy.perClientQuotaFor(3))
-
-        // Pressure clears: the fair-share tier returns.
-        proxy.congestionActive.set(false)
-        assertEquals(160, proxy.perClientQuotaFor(3))
-
-        // Overlay applies via minOf(base, congestionQuotaPerClient): it can
-        // never RAISE a smaller configured base (small test configs keep 4).
-        val small = startProxy(coreThreads = 1, maxThreads = 4, perClient = 4).also { servers.add(it) }
-        small.congestionActive.set(true)
-        assertEquals(4, small.perClientQuotaFor(1))
-    }
-
-    /**
-     * beta1.0.3: TURBO uses the slow dynamic per-device quota (120-170,
-     * starting 140) instead of a fixed cap; ≥3 devices share the 700-session
-     * global budget fairly, and PROTECT floors admission at 100.
-     */
-    @Test
-    fun turboProfileUsesSlowDynamicPerDeviceQuota() {
         val proxy = ProxyServer(
             ProxyServer.Config(
                 port = 0,
                 coreThreads = 1,
-                maxThreads = ProxyServer.TURBO_MAX_THREADS,
-                maxConnectionsPerClient = ProxyServer.TURBO_PER_DEVICE_MAX,
-                maxTcpSessions = 700,
-                maxTcpSessionsPerClient = ProxyServer.TURBO_PER_DEVICE_MAX,
+                maxThreads = 1216,
+                maxConnectionsPerClient = 400,
+                maxTcpSessions = 1200,
+                maxTcpSessionsPerClient = 400,
                 workerKeepAliveMs = 500,
                 connectTimeoutMs = 2_000,
                 handshakeTimeoutMs = 2_000,
@@ -163,19 +180,71 @@ class ProxyServerIntegrationTest {
                 udpCleanupIntervalMs = 100
             )
         ).also { servers.add(it) }
-        assertEquals(140, proxy.turboPerDeviceQuota) // starting value
-        assertEquals(140, proxy.perClientQuotaFor(1))
+        proxy.start()
+        assertTrue("Proxy did not bind", proxy.awaitStarted())
+        // Normal path untouched when the budget is healthy: the shared dynamic
+        // quota (starting value 375).
+        assertEquals(375, proxy.perClientQuotaFor(1))
 
-        // Sampler steps are bounded and slow (±10 per 30s).
-        proxy.turboPerDeviceQuota = 150
-        assertEquals(150, proxy.perClientQuotaFor(1))
-
-        // 5 devices: fair share 700/5 = 140, inside the dynamic cap.
-        assertEquals(140, proxy.perClientQuotaFor(5))
-
-        // Extreme pressure floors NEW admission at 100.
+        // Congestion: every big-profile tier is capped by the 300 overlay.
         proxy.congestionActive.set(true)
-        assertEquals(100, proxy.perClientQuotaFor(5))
+        assertEquals(300, proxy.perClientQuotaFor(1))
+        // 3 devices: fair share 1200/3 = 400, inside the 375 cap → 375; overlay → 300.
+        assertEquals(300, proxy.perClientQuotaFor(3))
+
+        // Pressure clears: the dynamic quota returns.
+        proxy.congestionActive.set(false)
+        assertEquals(375, proxy.perClientQuotaFor(3))
+
+        // Overlay applies via minOf(base, 300): it can never RAISE a smaller
+        // configured base (small test configs keep 4).
+        val small = startProxy(coreThreads = 1, maxThreads = 4, perClient = 4).also { servers.add(it) }
+        small.congestionActive.set(true)
+        assertEquals(4, small.perClientQuotaFor(1))
+    }
+
+    /**
+     * beta1.0.51: TURBO uses the SAME shared dynamic per-device quota
+     * (350-400, starting 375) as STANDARD — one session budget, no TCP:UDP
+     * ratio — with a 1400 global total; ≥3 devices share it fairly (floor
+     * 200) and congestion overlays 300.
+     */
+    @Test
+    fun turboProfileSharesOneSessionBudget() {
+        val proxy = ProxyServer(
+            ProxyServer.Config(
+                port = 0,
+                coreThreads = 1,
+                maxThreads = ProxyServer.TURBO_MAX_THREADS,
+                maxConnectionsPerClient = ProxyServer.PER_DEVICE_MAX,
+                maxTcpSessions = 1400,
+                maxTcpSessionsPerClient = ProxyServer.PER_DEVICE_MAX,
+                workerKeepAliveMs = 500,
+                connectTimeoutMs = 2_000,
+                handshakeTimeoutMs = 2_000,
+                socketPollIntervalMs = 100,
+                tcpIdleTimeoutMs = 2_000,
+                udpTargetTimeoutMs = 500,
+                udpIdleTimeoutMs = 2_000,
+                udpCleanupIntervalMs = 100
+            )
+        ).also { servers.add(it) }
+        proxy.start()
+        assertTrue("Proxy did not bind", proxy.awaitStarted())
+        assertEquals(ProxyServer.PER_DEVICE_START, proxy.dynamicPerDeviceQuota) // starting value
+        assertEquals(ProxyServer.PER_DEVICE_START, proxy.perClientQuotaFor(1))
+
+        // Sampler steps are bounded and slow (±5 per 30s, 350-400).
+        proxy.dynamicPerDeviceQuota = 390
+        assertEquals(390, proxy.perClientQuotaFor(1))
+
+        // 5 devices: fair share 1400/5 = 280, inside the dynamic cap.
+        assertEquals(280, proxy.perClientQuotaFor(5))
+
+        // Congestion overlays 300 — but never below the fair-share result.
+        proxy.congestionActive.set(true)
+        assertEquals(300, proxy.perClientQuotaFor(1))
+        assertEquals(280, proxy.perClientQuotaFor(5))
     }
 
     /**
@@ -319,7 +388,8 @@ class ProxyServerIntegrationTest {
         assertEquals(0, proxy.quotaDeviceCount("192.168.49.9", false))
     }
 
-    /** beta1.0.3: compat is a micro-kernel now — it must NOT switch capacity profiles. */
+    /** beta1.0.51: compat is a NO-OP switch now — it must NOT change capacity,
+     *  and it no longer gates UDP behaviour (multi-port tracking is always on). */
     @Test
     fun compatModeNoLongerChangesCapacityProfile() {
         val proxy = startProxy(coreThreads = 1, maxThreads = ProxyServer.NORMAL_MAX_THREADS, perClient = 160)
@@ -350,7 +420,15 @@ class ProxyServerIntegrationTest {
             DatagramPacket(byteArrayOf(0, 0, 1, 1), 4, InetAddress.getByName("127.0.0.1"), first.relayPort)
         )
         assertUdpEcho(firstUdp, first.relayPort, udpEcho.port, "after-malformed")
-        assertUdpEndpointRejected(secondUdp, first.relayPort, udpEcho.port)
+        // beta1.0.51: an ALTERNATE source port of the SAME client IP is now
+        // ACCEPTED (always-on multi-port tracking) and its reply is routed
+        // precisely back to that port — this is what fixes "UDP check OK but
+        // the game gets nothing" for clients that rotate source ports
+        // (hev per-PCB sockets, sing-box/Xray pools, power-saving rebuilds).
+        assertUdpEcho(secondUdp, first.relayPort, udpEcho.port, "rotated-port")
+        // The security boundary is the client IP, not the port: a datagram
+        // from a DIFFERENT IP is still dropped.
+        assertUdpForeignIpDropped(first.relayPort, udpEcho.port)
         assertUdpEcho(firstUdp, first.relayPort, udpEcho.port, "still-isolated")
         assertEquals(2, proxy.metrics().activeUdpAssociations)
 
@@ -365,6 +443,55 @@ class ProxyServerIntegrationTest {
         assertTrue(awaitCondition { proxy.metrics().activeConnections == 0 })
         assertEquals(0, proxy.metrics().activeTcpSessions)
         assertEquals(0, proxy.metrics().activeUdpAssociations)
+    }
+
+    /**
+     * beta1.0.52 ROOT-CAUSE regression: the UDP ASSOCIATE reply must advertise a
+     * REACHABLE BND.ADDR — never 0.0.0.0. The old relay-socket construction
+     * (`DatagramSocket()` then `bind(...)`) always threw "Already bound", fell
+     * back to a wildcard socket and replied BND=0.0.0.0. hev-socks5-tunnel then
+     * connect()s its UDP socket to 0.0.0.0 — Linux tolerates it, Windows refuses
+     * with WSAEADDRNOTAVAIL (10049) — so EVERY tunneled UDP session (all DNS)
+     * died while the direct relay probe still answered. This test replicates
+     * hev's exact flow: connect -> auth -> ASSOCIATE -> parse BND -> UDP
+     * connect(BND) -> relayed datagram.
+     */
+    @Test
+    fun udpAssociateRepliesReachableBndAddrAndRelayWorksWithhevStyleConnect() {
+        val udpEcho = UdpEchoServer().also { resources.add(it) }
+        val proxy = startProxy(coreThreads = 1, maxThreads = 4, perClient = 4)
+
+        val control = Socket("127.0.0.1", proxy.localPort()).also { resources.add(it) }
+        control.soTimeout = 2_000
+        negotiate(control)
+        control.getOutputStream().write(byteArrayOf(5, 3, 0, 1, 0, 0, 0, 0, 0, 0))
+        control.getOutputStream().flush()
+        val reply = readExactly(control.getInputStream(), 10)
+        assertEquals("ASSOCIATE failed", 0, reply[1].toInt())
+        assertEquals("BND must be ATYP=IPv4", 1, reply[3].toInt())
+        val bndAddr = InetAddress.getByAddress(reply.copyOfRange(4, 8))
+        val bndPort = ((reply[8].toInt() and 0xFF) shl 8) or (reply[9].toInt() and 0xFF)
+        assertFalse(
+            "BND.ADDR must never be 0.0.0.0 (hev on Windows cannot connect to it)",
+            bndAddr.isAnyLocalAddress
+        )
+        assertEquals(
+            "BND.ADDR must be the address the client faces (the control connection's local address)",
+            "127.0.0.1", bndAddr.hostAddress
+        )
+
+        // Exactly what hev does: bind-free UDP socket, connect() to the advertised BND.
+        val datagram = DatagramSocket().apply { soTimeout = 2_000 }.also { resources.add(it) }
+        datagram.connect(bndAddr, bndPort)
+        val payload = "hev-style".toByteArray()
+        val request = Socks5Parser.buildUdpHeader(InetAddress.getByName("127.0.0.1"), udpEcho.port) + payload
+        datagram.send(DatagramPacket(request, request.size))
+        val buffer = ByteArray(1024)
+        val response = DatagramPacket(buffer, buffer.size)
+        datagram.receive(response)
+        val target = Socks5Parser.parseUdpHeader(buffer, response.length)
+        assertTrue(target != null)
+        assertArrayEquals(payload, buffer.copyOfRange(target!!.headerLength, response.length))
     }
 
     @Test
@@ -403,7 +530,9 @@ class ProxyServerIntegrationTest {
                 allowedClientRanges = listOf("127.0.0.0/8", "192.168.49.0/24"),
                 coreThreads = 1,
                 maxThreads = 4,
-                maxConnectionsPerClient = 4
+                maxConnectionsPerClient = 4,
+                maxTcpSessions = 4,
+                maxTcpSessionsPerClient = 4
             )
         ).also { servers.add(it) }
         proxy.start()
@@ -431,7 +560,9 @@ class ProxyServerIntegrationTest {
                 allowedClientRanges = listOf("192.168.49.0/24"),
                 coreThreads = 1,
                 maxThreads = 4,
-                maxConnectionsPerClient = 4
+                maxConnectionsPerClient = 4,
+                maxTcpSessions = 4,
+                maxTcpSessionsPerClient = 4
             )
         ).also { servers.add(it) }
         proxy.start()
@@ -542,19 +673,25 @@ class ProxyServerIntegrationTest {
         assertArrayEquals(payload, response.data.copyOfRange(target!!.headerLength, response.length))
     }
 
-    private fun assertUdpEndpointRejected(socket: DatagramSocket, relayPort: Int, targetPort: Int) {
-        val previousTimeout = socket.soTimeout
-        socket.soTimeout = 250
-        val payload = "wrong-endpoint".toByteArray()
-        val request = Socks5Parser.buildUdpHeader(InetAddress.getByName("127.0.0.1"), targetPort) + payload
-        socket.send(DatagramPacket(request, request.size, InetAddress.getByName("127.0.0.1"), relayPort))
+    private fun assertUdpForeignIpDropped(relayPort: Int, targetPort: Int) {
+        // beta1.0.51: the association's security boundary is the client IP —
+        // a datagram from a different IP must be dropped even though same-IP
+        // source ports are now always accepted.
+        val socket = DatagramSocket(InetSocketAddress("127.0.0.2", 0)).apply {
+            soTimeout = 250
+        }
         try {
-            socket.receive(DatagramPacket(ByteArray(1024), 1024))
-            throw AssertionError("UDP association accepted traffic from a different source endpoint")
-        } catch (_: SocketTimeoutException) {
-            // Expected: an association stays bound to the first UDP source endpoint it observes.
+            val payload = "foreign-ip".toByteArray()
+            val request = Socks5Parser.buildUdpHeader(InetAddress.getByName("127.0.0.1"), targetPort) + payload
+            socket.send(DatagramPacket(request, request.size, InetAddress.getByName("127.0.0.1"), relayPort))
+            try {
+                socket.receive(DatagramPacket(ByteArray(1024), 1024))
+                throw AssertionError("UDP association accepted traffic from a foreign client IP")
+            } catch (_: SocketTimeoutException) {
+                // Expected: only the association's own client IP is served.
+            }
         } finally {
-            socket.soTimeout = previousTimeout
+            socket.close()
         }
     }
 

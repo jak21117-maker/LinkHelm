@@ -101,6 +101,19 @@ class HostService : Service() {
     private lateinit var p2pManager: WifiP2pManager
     private lateinit var p2pChannel: WifiP2pManager.Channel
     private var preferredBand = 1 // 1 for 2.4GHz, 2 for 5GHz
+    /** beta1.0.55: set only when the user pressed Stop — used for logging, so
+     *  a teardown can be told apart from a silent system reclaim.
+     *
+     *  It deliberately NO LONGER gates the persisted sharing flag. beta1.0.54
+     *  left the flag set on every non-user teardown so the watchdog could
+     *  resurrect the service, and that was too aggressive: each resurrection
+     *  re-ran setupWifiDirectGroup() (removeGroup + createGroup), so the phone
+     *  kept re-forming the Wi-Fi Direct group under the laptop — which is what
+     *  dropped the PC's Wi-Fi and left the tunnel reporting "TCP/UDP 不通".
+     *  Keeping the phone alive is now done by staying in the foreground and
+     *  holding the locks, not by resurrect-rebuild loops. */
+    @Volatile
+    private var userStopped = false
 
     /** Guards against late/stale async callbacks: any callback whose epoch does not
      *  match the current one (e.g. after STOP) must be ignored. */
@@ -152,18 +165,26 @@ class HostService : Service() {
             return instance.applyAuth(user, pass)
         }
 
-        // v1.5.46 (beta1.0.2): 15min -> 5min. START_STICKY + the 1s
-        // task-removed alarm handle most kills; this alarm is the last-resort
-        // resurrection when an OEM silently kills the process, and 15 minutes
-        // of dead air was too long ("connects but the phone side died").
-        private const val WATCHDOG_INTERVAL_MS = 5 * 60 * 1000L
+        // v1.5.46 (beta1.0.2): 15min -> 5min.
+        // beta1.0.54: 5min -> 3min. The laptop tunnel gives up well before 5
+        // minutes of dead air, so a watchdog that only fires after that is
+        // indistinguishable from "the phone died". Kept in beta1.0.55: the
+        // interval is harmless now that a resurrection no longer rebuilds the
+        // Wi-Fi Direct group on every tick (see `userStopped`).
+        private const val WATCHDOG_INTERVAL_MS = 3 * 60 * 1000L
         private const val WATCHDOG_REQUEST_CODE = 1001
+
         /**
          * v1.5.33: (re)arm the AlarmManager watchdog tick. The alarm is
          * registered with the SYSTEM, so it keeps firing even after the
          * process is killed by aggressive OEM battery savers — the receiver
          * then notices the missing service and brings it back. Safe to call
          * repeatedly; each call replaces the previous tick.
+         *
+         * beta1.0.53 briefly used two staggered slots; beta1.0.54 goes back to
+         * one. The second slot doubled the wake-ups without measurably
+         * improving survival, and the extra moving parts made the failure mode
+         * much harder to reason about when 1.0.53 broke the connection.
          */
         fun scheduleWatchdog(context: Context) {
             val am = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
@@ -216,6 +237,10 @@ class HostService : Service() {
             }
         }
 
+        /** Is sharing supposed to be on? Persisted, so it outlives the process. */
+        fun isSharingFlagSet(context: Context): Boolean =
+            context.getSharedPreferences("linkhelm_prefs", Context.MODE_PRIVATE)
+                .getBoolean("host_is_running_flag", false)
 
         private const val MAX_IP_WAIT_ATTEMPTS = 10
         private const val IP_RETRY_INTERVAL_MS = 1_000L
@@ -381,9 +406,15 @@ class HostService : Service() {
         val prefs = getSharedPreferences("linkhelm_prefs", Context.MODE_PRIVATE)
 
         if (intent?.action == "STOP") {
+            // beta1.0.55: this flag is now diagnostic only (see its field
+            // comment) — the persisted sharing flag is cleared on every
+            // teardown. It still marks the difference between "the user turned
+            // sharing off" and "the system took the service away" in the log.
+            userStopped = true
             stateEpoch.incrementAndGet()
             isServiceRunning = false
             prefs.edit().putBoolean("host_is_running_flag", false).apply()
+            cancelWatchdog(this)
             stopGroupAndService()
             return START_NOT_STICKY
         }
@@ -418,6 +449,10 @@ class HostService : Service() {
                 startForeground(2, notification)
             }
             acquireLocks()
+            // beta1.0.54: a repeat onStartCommand must re-arm the watchdog —
+            // if an OEM killed us and START_STICKY handed us a null intent,
+            // the old code returned here without re-arming it.
+            scheduleWatchdog(this)
             return START_STICKY
         }
 
@@ -440,6 +475,7 @@ class HostService : Service() {
 
         // v1.5.33: arm the anti-battery-saver watchdog for as long as the
         // sharing flag is set (see HostWatchdogReceiver).
+        // beta1.0.54: the alarm is the only channel again (3 min).
         scheduleWatchdog(this)
 
         publishEndpoint(STATUS_GROUP_CREATING)
@@ -940,63 +976,70 @@ class HostService : Service() {
             putExtra("WIFI_BAND", savedBand)
         }
 
-        val pendingIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            PendingIntent.getForegroundService(
-                applicationContext, 1, restartIntent,
-                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
-            )
-        } else {
-            PendingIntent.getService(
-                applicationContext, 1, restartIntent,
-                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
-            )
-        }
-
         val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val triggerTime = SystemClock.elapsedRealtime() + 1000L
 
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                if (alarmManager.canScheduleExactAlarms()) {
+        // beta1.0.53: two staggered restart alarms (1s and 6s) instead of one.
+        // A single FLAG_ONE_SHOT slot is silently dropped by several OEM
+        // "recent apps cleared" implementations; the second slot is what
+        // actually brings sharing back on those devices.
+        for (slot in intArrayOf(0, 1)) {
+            val code = if (slot == 0) 1 else 2
+            val delayMs = if (slot == 0) 1_000L else 6_000L
+            val pendingIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                PendingIntent.getForegroundService(
+                    applicationContext, code, restartIntent,
+                    PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+                )
+            } else {
+                PendingIntent.getService(
+                    applicationContext, code, restartIntent,
+                    PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+                )
+            }
+            val triggerTime = SystemClock.elapsedRealtime() + delayMs
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    if (alarmManager.canScheduleExactAlarms()) {
+                        alarmManager.setExactAndAllowWhileIdle(
+                            AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                            triggerTime,
+                            pendingIntent
+                        )
+                    } else {
+                        alarmManager.setAndAllowWhileIdle(
+                            AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                            triggerTime,
+                            pendingIntent
+                        )
+                    }
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     alarmManager.setExactAndAllowWhileIdle(
                         AlarmManager.ELAPSED_REALTIME_WAKEUP,
                         triggerTime,
                         pendingIntent
                     )
                 } else {
-                    alarmManager.setAndAllowWhileIdle(
+                    alarmManager.set(
                         AlarmManager.ELAPSED_REALTIME_WAKEUP,
                         triggerTime,
                         pendingIntent
                     )
                 }
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                alarmManager.setExactAndAllowWhileIdle(
-                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                    triggerTime,
-                    pendingIntent
-                )
-            } else {
-                alarmManager.set(
-                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                    triggerTime,
-                    pendingIntent
-                )
-            }
-        } catch (e: SecurityException) {
-            Log.e("HostService", "Exact alarm permission missing, using inexact fallback", e)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                alarmManager.setAndAllowWhileIdle(
-                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                    triggerTime,
-                    pendingIntent
-                )
-            } else {
-                alarmManager.set(
-                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                    triggerTime,
-                    pendingIntent
-                )
+            } catch (e: SecurityException) {
+                Log.e("HostService", "Exact alarm permission missing, using inexact fallback", e)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    alarmManager.setAndAllowWhileIdle(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        triggerTime,
+                        pendingIntent
+                    )
+                } else {
+                    alarmManager.set(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        triggerTime,
+                        pendingIntent
+                    )
+                }
             }
         }
 
@@ -1057,7 +1100,18 @@ class HostService : Service() {
 
     override fun onDestroy() {
         val prefs = getSharedPreferences("linkhelm_prefs", Context.MODE_PRIVATE)
+        // beta1.0.55: back to beta1.0.52 behaviour — the flag is cleared on
+        // EVERY teardown, including a system reclaim. Leaving it set made the
+        // watchdog resurrect the service, and every resurrection re-formed the
+        // Wi-Fi Direct group under the laptop (see the field comment on
+        // `userStopped`). Resurrection is therefore limited to the cases where
+        // Android never ran onDestroy() at all (a hard kill): there the flag is
+        // still set, so the watchdog can bring sharing back as before.
+        if (!userStopped) {
+            Log.w("HostService", "onDestroy without a user stop — the system is reclaiming the service")
+        }
         prefs.edit().putBoolean("host_is_running_flag", false).apply()
+        cancelWatchdog(this)
         stateEpoch.incrementAndGet()
         stateHandler.removeCallbacksAndMessages(null)
         stopProxyLocked()
@@ -1066,8 +1120,6 @@ class HostService : Service() {
         fileTransferServer = null
         resetEndpoint()
         unregisterP2pRecoveryReceiver()
-        // v1.5.34: stop the watchdog alarm on a clean shutdown.
-        cancelWatchdog(this)
         wakeLock?.let { if (it.isHeld) it.release() }
         wifiLock?.let { if (it.isHeld) it.release() }
         // v1.5.0: drop the live handle — the toggle then only writes the pref,

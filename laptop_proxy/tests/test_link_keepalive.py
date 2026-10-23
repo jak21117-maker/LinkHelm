@@ -82,7 +82,7 @@ def test_transient_blips_never_rebuild_and_recover_silently(monkeypatch):
     mgr = _make_mgr(logs)
     fired = {"n": 0}
     monkeypatch.setattr(
-        main.TunManager, "_restart_tun2socks",
+        main.TunManager, "_restart_engine",
         lambda self: fired.__setitem__("n", fired["n"] + 1),
     )
     _run_iterations(mgr, stop_after=10)
@@ -106,7 +106,7 @@ def test_sustained_loss_never_rebuilds_and_keeps_probing(monkeypatch):
     mgr = _make_mgr(logs)
     fired = {"n": 0}
     monkeypatch.setattr(
-        main.TunManager, "_restart_tun2socks",
+        main.TunManager, "_restart_engine",
         lambda self: fired.__setitem__("n", fired["n"] + 1),
     )
     # 8 probes ≈ 2 full 3-strike windows + 2 extra misses.
@@ -135,7 +135,7 @@ def test_domestic_touch_failure_never_rebuilds(monkeypatch):
     mgr = _make_mgr(logs)
     fired = {"n": 0}
     monkeypatch.setattr(
-        main.TunManager, "_restart_tun2socks",
+        main.TunManager, "_restart_engine",
         lambda self: fired.__setitem__("n", fired["n"] + 1),
     )
     _run_iterations(mgr, stop_after=24)  # crosses two domestic-touch windows

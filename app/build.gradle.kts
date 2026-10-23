@@ -12,8 +12,8 @@ android {
         applicationId = "com.linkhelm.app"
         minSdk = 24
         targetSdk = 35
-        versionCode = 38
-        versionName = "beta1.0.4"
+        versionCode = 45
+        versionName = "beta1.0.56"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -61,8 +61,11 @@ dependencies {
     androidTestImplementation(libs.androidx.espresso.core)
 
 
-    // Local AAR library - tun2socks
-    implementation(files("libs/tun2socks-1.0.4.aar"))
+    // Local AAR library - lwIP engine (hev-socks5-tunnel, official 2.19.1 build).
+    // beta1.0.5: replaces tun2socks entirely. The JNI class hev.htproxy.TProxyService
+    // receives the VpnService TUN fd and runs the lwIP PCB stack (TCP/UDP/DNS in one
+    // kernel) — see Myvpnservicetun2socks.kt and DEPENDENCY_LOCK.md.
+    implementation(files("libs/hev-socks5-tunnel.aar"))
 
     val composeBom = platform("androidx.compose:compose-bom:2024.02.00")
     implementation(composeBom)

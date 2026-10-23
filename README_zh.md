@@ -56,7 +56,7 @@ Windows 电脑  -- LinkHelm Desktop -->  虚拟网卡（10.0.0.1）
 
 ### Windows（LinkHelm Desktop）
 - Windows 10/11（64 位）。正常使用无需管理员；仅在需要配置共享 / 路由时才会请求提权。
-- 已内置 `tun2socks` + `Wintun` 组件，运行时不会下载任何东西。
+- 已内置 lwIP 引擎（`hev-socks5-tunnel` + `Wintun`）组件，运行时不会下载任何东西。
 - 若要共享：需要一个支持移动热点的 Wi-Fi 网卡，**或**一块有线以太网网卡。
 
 ### 安卓（LinkHelm Host）
@@ -101,7 +101,7 @@ Windows 电脑  -- LinkHelm Desktop -->  虚拟网卡（10.0.0.1）
 
 - **仅本地。** SOCKS5 端点绑定在手机与电脑之间的 Wi-Fi Direct 链路上，互联网无法访问。
 - **固定但可改的凭据。** 初始用户名 / 密码两端一致且永不随机化。若与他人共享网络，请在设置中修改。
-- **已校验的二进制。** 内置的 `tun2socks` / `Wintun` 在使用前会按固化的 SHA-256 值校验。
+- **已校验的二进制。** 内置的 `hev-socks5-tunnel` / `Wintun` 引擎文件在使用前会按固化的 SHA-256 值校验。
 - **ICS 诊断为只读。** Windows 诊断永远不会修改共享配置。
 
 ---
@@ -169,7 +169,7 @@ LinkHelm 是在 nestchao 的开源项目 **Hotspot-Bypass-VPN-Unlimited-Hotspot*
 
 LinkHelm 保留了原项目的核心思路——通过 Wi-Fi Direct + SOCKS5 代理在本地共享手机连接，但进行了大量重写与扩展。相对于原项目，主要提升如下：
 
-- **tun2socks 升级到 2.7.0** —— 内置核心代理更新为更新、更稳定的版本。
+- **双端统一 lwIP 引擎** —— 旧 tun2socks 内核被彻底替换为原生 lwIP 栈引擎（HevSocks5Tunnel 2.19.1）：TCP/UDP/DNS 由同一内核在安卓与 Windows 两端统一处理，二进制按固化 SHA-256 校验，运行时无下载、无回退路径。
 - **TCP 与 UDP 连接稳定性增强** —— 在游戏 / 高 UDP 负载等场景下，对连接生命周期、空闲保活、重传的处理更加稳健。
 - **多 DNS 备选** —— 依次尝试多个 DNS 服务器，当其中一个不可达时解析仍能继续。
 - **SOCKS5 账号密码认证（RFC 1929）** —— 主机强制用户名 / 密码认证，不再存在开放、未认证的端口。

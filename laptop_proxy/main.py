@@ -1,6 +1,8 @@
 import customtkinter as ctk
 from tkinter import messagebox
 from tkinter import filedialog
+import atexit
+import traceback
 import file_transfer
 import queue
 import random
@@ -33,7 +35,7 @@ if IS_WINDOWS:
 # v1.4.93: keep the system awake while the tunnel runs. Long sessions were
 # dying after Windows entered Modern Standby / idle sleep (the user reports
 # "a process mounted too long gets killed by the Windows power policy" — the OS suspends the process tree
-# and the Wi-Fi Direct link, tun2socks freezes, the tunnel looks dead).
+# and the Wi-Fi Direct link, the engine freezes, the tunnel looks dead).
 # ES_SYSTEM_REQUIRED holds the *system* awake (display/free CPU policy is NOT
 # touched, so this stays light); ES_CONTINUOUS keeps the effect until we
 # clear it. Effect is per-thread → refreshed by a dedicated tunnel-scoped
@@ -164,7 +166,7 @@ BIN_DIR = os.path.join(CONFIG_DIR, "bin")
 # --- v1.5.47: legacy dual-lane ROUTER removed ------------------------------------
 # The lane router (v1.5.2, opt-in since v1.5.34 via a flag file) caused more
 # failures than it fixed and was never enabled by default. Removed entirely in
-# v1.5.47 — tun2socks always dials the phone's 8080 lane directly, with the
+# v1.5.47 — the lwIP engine always dials the phone's 8080 lane directly, with the
 # lightweight 8082 standby-lane failover (no router process) kept.
 SECONDARY_LANE_PORT = 8082
 
@@ -193,26 +195,21 @@ LANE_A_RECOVER_STRIKES = 6
 # --- Minimal hardening (Patch B, see CHANGES.md / DEPENDENCY_LOCK.md) -----------
 # Pinned dependency sources. SHA-256 values are of the exact ZIP files from the
 # official distribution points and were verified at build time.
-TUN2SOCKS_VERSION = "2.7.0"
+# beta1.0.5: tun2socks 已彻底移除，Windows 内核完全由 lwIP (hev-socks5-tunnel)
+# 承接。以下仅保留版本说明；原生二进制随安装包 engine/ 目录提供，不再运行时下载。
 WINTUN_VERSION = "0.14.1"
-TUN2SOCKS_URLS = {
-    "amd64": (
-        "https://github.com/xjasonlyu/tun2socks/releases/download/v2.7.0/tun2socks-windows-amd64.zip",
-        "c5d46e9452f6c9cc7c15ab9158d6d6a0169ceecd6bca019ce476b49337d2be43",
-        "tun2socks-windows-amd64.exe",
-    ),
-    "arm64": (
-        "https://github.com/xjasonlyu/tun2socks/releases/download/v2.7.0/tun2socks-windows-arm64.zip",
-        "74497771068da13f42921adfc540f2abb9ac822404582c8cbe34d30e8c0ea1f5",
-        "tun2socks-windows-arm64.exe",
-    ),
-}
-WINTUN_URL = "https://www.wintun.net/builds/wintun-0.14.1.zip"
-WINTUN_ZIP_SHA256 = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
+LWIP_ENGINE_VERSION = "2.19.1"  # hev-socks5-tunnel，见 DEPENDENCY_LOCK.md
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 # The virtual adapter created by this program always uses this gateway, so route
 # cleanup can target only routes that belong to LaptopProxy.
 OUR_TUN_GATEWAY = "10.0.0.1"
+# beta1.0.51: canonical Windows CONNECTION name of the tunnel adapter. The
+# network flyout and ncpa.cpl show the connection name, and every netsh
+# config call addresses the adapter by it — a drifted name ("LinkHelm 31"
+# in the field) made those calls silent no-ops: no IP/DNS on the tunnel,
+# ERR_NAME_NOT_RESOLVED pages, and a confusing duplicate network entry.
+# _normalize_adapter_connection_name renames it back at every start.
+TUN_ADAPTER_NAME = "LinkHelm-IwIP"
 
 # v1.4.6: silent-elevation scheduled task + stale adapter cleanup.
 
@@ -280,86 +277,340 @@ def save_app_settings(settings):
     os.replace(tmp_path, SETTINGS_PATH)
 
 
+def _resolve_tun_connection_name(timeout=15):
+    """beta1.0.51: resolve the ACTUAL connection name of our tunnel adapter.
+
+    hev-socks5-tunnel reopens the adapter by its fixed GUID, and Windows does
+    NOT rename an existing adapter — so on machines where the connection name
+    drifted (the field "LinkHelm 31" flyout entry), every netsh
+    `name=LinkHelm-IwIP` call matched nothing: the IP/DNS configuration never
+    applied, the tunnel came up without a resolver, and pages failed with
+    ERR_NAME_NOT_RESOLVED (computer-manager DNS scans flag it as 异常).
+
+    Finds the adapter by its own IP (10.0.0.1 / 10.0.0.2) instead of by name,
+    because `netsh interface ipv4 show addresses` prints the name in quotes
+    per interface block and the IP literals are locale-independent. Returns
+    the current name, or None when the adapter is not up (yet).
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        _, out, _ = _run_decoded(
+            ["netsh", "interface", "ipv4", "show", "addresses"], timeout=timeout
+        )
+    except Exception:
+        return None
+    current = None
+    for line in (out or "").splitlines():
+        quoted = re.search(r'"([^"]+)"', line)
+        if quoted and ("interface" in line.lower() or "接口" in line):
+            current = quoted.group(1)
+            continue
+        if current and ("10.0.0.1" in line or "10.0.0.2" in line):
+            return current
+    return None
+
+
 def _cleanup_stale_tun_adapters(log_fn):
-    """Remove orphaned LinkHelm* Wintun devices AND their NLA profiles.
+    """beta1.0.5: remove LEGACY LinkHelm*/LaptopProxyVPN* Wintun adapters,
+    always PRESERVING the current LinkHelm-IwIP adapter.
 
-    A crashed or force-killed run leaves its Wintun adapter behind; every new
-    run then adds another numbered copy ("LinkHelm 14", "... 27") that
-    shows as a dead VPN entry forever. pnputil /remove-device (Win10 2004+)
-    uninstalls them; failures are ignored — this is cosmetic hygiene.
+    A crashed/force-killed run (and the old tun2socks engine) leaves its Wintun
+    adapter behind; every new run would otherwise collide with a stale name and
+    Windows would append "LinkHelm 2/3/4...". beta1.0.5 names the adapter
+    LinkHelm-IwIP (fixed GUID — see engine.ADAPTER_NAME / engine.ADAPTER_GUID),
+    so the sweep targets ONLY the old names and never touches the live one:
+      - first launch  : legacy LinkHelm / LinkHelm N / LaptopProxyVPN* are
+                        removed (incl. tun2socks leftovers), hev then creates
+                        LinkHelm-IwIP fresh;
+      - later launches: only LinkHelm-IwIP exists; it is excluded from the sweep
+                        and reused as-is — WintunCreateAdapter reopens the same
+                        adapter by GUID, so no "LinkHelm-IwIP 2/3/4" appears.
+    This is the "先清理旧的 → 建立新的 → 后续复用" lifecycle; the distinct name
+    is what makes "旧的清理不掉、新的也用不了" impossible.
 
-    v1.4.62: pnputil alone is not enough — Windows keeps every network
-    profile under HKLM\\...\\Network\\Profiles forever.
+    Sweeps three layers: PnP devices, NetCfg connection-name entries (the real
+    source of the climbing number), and NLA network profiles. Best-effort:
+    failures are ignored so startup is never blocked by hygiene.
 
-    v1.4.63: the ACTUAL source of the climbing number ("LinkHelm 32",
-    "... 41") is the connection name in the NetCfg hive —
-    HKLM\\SYSTEM\\CurrentControlSet\\Control\\Network\\{4D36E972-...}\\<GUID>
-    \\Connection\\Name. pnputil removes the device but leaves that connection
-    entry behind, so every newly created adapter collides with a stale name
-    and Windows appends the next number. Sweeping BOTH the NetCfg connection
-    entries and the NLA profiles means the fresh adapter is ALWAYS plain
-    "LinkHelm" — one stable, unique name. Safe here: this runs after
-    the old processes are killed and devices removed, before the new adapter
-    is created, so every entry present at this moment is dead history.
-
-    v1.5.42 (P0): the adapter GUID is now FIXED (TUN_ADAPTER_GUID), so the
-    sweep must NOT delete our own identity — deleting the fixed-GUID NetCfg
-    entry / device on every start forced Windows to recreate them each run
-    (registry churn the user measured as "the registry keeps growing"). The sweep now spares
-    anything whose PnP instance / NetCfg key carries OUR GUID and only
-    removes the legacy random-GUID leftovers ("LinkHelm 2/3/4" era). The
-    fixed identity then survives across runs: same device, same NetCfg
-    entry, same NLA profile — nothing deleted-and-recreated, nothing grows.
+    beta1.0.51: the NetCfg layer now ALSO excludes our adapter by its fixed
+    GUID (the registry key IS the GUID), not just by its canonical name — a
+    drifted connection name ("LinkHelm 31") must never make the sweep delete
+    the LIVE tunnel adapter.
     """
     if not IS_WINDOWS:
         return
-    # NetCfg keys and PnP instance IDs carry the GUID without braces.
-    our_guid = TUN_ADAPTER_GUID.strip("{}").upper()
     try:
-        # v1.5.2: the adapter was renamed LaptopProxyVPN -> LinkHelm. The
-        # sweep must cover BOTH names — pre-upgrade leftovers (an old
-        # crashed run's "LaptopProxyVPN 41") would otherwise linger in the
-        # network list forever.
+        adapter_guid = None
+        try:
+            from engine import ADAPTER_GUID
+            adapter_guid = ADAPTER_GUID
+        except Exception:
+            adapter_guid = None
+        guid_guard = (
+            f" -and $_.PSChildName -ne '{adapter_guid}'" if adapter_guid else ""
+        )
         ps = (
-            # v1.5.42: keep the device that carries OUR fixed GUID —
-            # tun2socks will simply reopen it (same identity, config kept).
+            # Remove every legacy LinkHelm*/LaptopProxyVPN* PnP device (incl.
+            # tun2socks random-GUID leftovers) EXCEPT the live LinkHelm-IwIP.
             "Get-PnpDevice -FriendlyName 'LinkHelm*','LaptopProxyVPN*' | "
-            "Where-Object { $_.InstanceId -notlike '*" + our_guid + "*' } | "
+            "Where-Object { $_.FriendlyName -ne 'LinkHelm-IwIP' } | "
             "ForEach-Object { pnputil /remove-device $_.InstanceId } | Out-Null; "
-            # v1.4.63: NetCfg connection entries — the numbering source.
-            # v1.5.42: keep the key whose PSChildName IS our GUID.
+            # NetCfg connection entries — the numbering source. The registry
+            # key is the adapter GUID, so the fixed-GUID adapter is excluded
+            # even when its display name has drifted.
             "Get-ChildItem 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Network"
             "\\{4D36E972-E325-11CE-BFC1-08002BE10318}' -ErrorAction SilentlyContinue | "
-            "Where-Object { $_.PSChildName -ne '" + our_guid + "' -and ( "
-            "(Get-ItemProperty -Path ($_.PSPath + '\\Connection') "
-            "-Name Name -ErrorAction SilentlyContinue).Name "
-            "-like 'LinkHelm*' -or "
-            "(Get-ItemProperty -Path ($_.PSPath + '\\Connection') "
-            "-Name Name -ErrorAction SilentlyContinue).Name "
-            "-like 'LaptopProxyVPN*' ) } | "
+            "Where-Object { "
+            "$n = (Get-ItemProperty -Path ($_.PSPath + '\\Connection') "
+            "-Name Name -ErrorAction SilentlyContinue).Name; "
+            "($n -like 'LinkHelm*' -or $n -like 'LaptopProxyVPN*') "
+            "-and $n -ne 'LinkHelm-IwIP'" + guid_guard + " } | "
             "Remove-Item -Recurse -ErrorAction SilentlyContinue; "
-            # v1.4.62: NLA network profiles.
+            # NLA network profiles.
             "Get-ChildItem 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"
             "\\Network\\Profiles' -ErrorAction SilentlyContinue | "
             "Where-Object { "
-            "$_.GetValue('ProfileName') -like 'LinkHelm*' -or "
-            "$_.GetValue('ProfileName') -like 'LaptopProxyVPN*' } | "
+            "($_.GetValue('ProfileName') -like 'LinkHelm*' -or "
+            "$_.GetValue('ProfileName') -like 'LaptopProxyVPN*') -and "
+            "($_.GetValue('ProfileName') -ne 'LinkHelm-IwIP') } | "
             "Remove-Item -Recurse -ErrorAction SilentlyContinue"
         )
         _run_decoded(
             ["powershell", "-NoProfile", "-Command", ps], timeout=60
         )
-        log_fn("Cleaned up historical leftover virtual NICs and network config (fixed identity kept; only old random leftovers removed).")
+        log_fn("Cleaned up legacy leftover virtual NICs (kept LinkHelm-IwIP for reuse).")
     except Exception:
         pass  # best effort — never block startup on hygiene
 
 
-def _find_foreign_tun2socks():
-    """v1.4.62: image names of any tun2socks process already running.
+def _cleanup_stale_wlan_profiles(log_fn):
+    """beta1.0.52: drop numbered duplicate WLAN profiles ("LinkHelm 2".."LinkHelm 31").
 
-    Old pre-1.4.5 exes have no process mutex and a crashed run
-    can leave its tun2socks child alive. The only reliable cross-version
-    signal is the tun2socks child process itself. Returns an empty tuple when
+    beta1.0.55: NO LONGER CALLED AUTOMATICALLY. Deleting the profile of the
+    network Windows is currently associated with drops the association, which
+    is the reported "检测连通性 / 连接失败时电脑会断开 WiFi". Kept for manual
+    hygiene only, and hardened so that even if it is ever re-enabled it skips
+    the profile of any currently connected interface (see the guard below).
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        # beta1.0.55: safety guard. Windows drops the association when you
+        # delete the profile of the network it is currently using, so collect
+        # every profile/SSID that is live on any WLAN interface and never
+        # touch those. (zh-CN output uses "配置文件", en-US uses "Profile".)
+        active = set()
+        _, iface_out, _ = _run_decoded(
+            ["netsh", "wlan", "show", "interfaces"], timeout=15
+        )
+        for line in (iface_out or "").splitlines():
+            if ":" not in line:
+                continue
+            key, _, val = line.partition(":")
+            if key.strip().lower() in ("ssid", "profile", "配置文件"):
+                v = val.strip()
+                if v:
+                    active.add(v)
+
+        _, out, _ = _run_decoded(["netsh", "wlan", "show", "profiles"], timeout=15)
+        stale = set()
+        for line in (out or "").splitlines():
+            name = line.split(":", 1)[1].strip() if ":" in line else ""
+            # Keep "LinkHelm", "DIRECT-LinkHelm"; sweep "LinkHelm 2".."LinkHelm N".
+            if re.fullmatch(r"(DIRECT-)?LinkHelm \d+", name):
+                stale.add(name)
+        stale -= active
+        for name in sorted(stale):
+            _run_decoded(
+                ["netsh", "wlan", "delete", "profile", f"name={name}"], timeout=15
+            )
+        if stale:
+            log_fn(
+                f"Removed {len(stale)} stale duplicate WLAN profile(s): {', '.join(sorted(stale))}."
+            )
+    except Exception:
+        pass  # best effort — never block startup on hygiene
+
+
+# ---------------------------------------------------------------------------
+# beta1.0.55: Windows connectivity indicator ("No Internet" / "无法访问 Internet")
+#
+# The network flyout and the Network & Internet settings page show EVERY
+# LinkHelm network — the Wi-Fi Direct group and the tunnel adapter — as
+# "No Internet", even while pages load fine. That label is produced by NCSI
+# (Network Connectivity Status Indicator), and it is not cosmetic: a large
+# number of desktop apps (Store/UWP, launchers, game clients) ask Windows
+# "do I have internet?" before they will start, which is the reported "网页能
+# 打开，但应用打不开".
+#
+# NCSI decides by actively probing Microsoft-owned endpoints
+# (dns.msftncsi.com / www.msftncsi.com). Those are unreachable or very slow on
+# most domestic networks and are additionally forced through the tunnel, so the
+# probe times out and Windows labels a perfectly working link as offline.
+#
+# Fix: pause NCSI active probing for the duration of the session (the standard
+# corporate workaround) and restore the original value on disconnect. With
+# active probing off, NLA reports the link that owns the routes as
+# Internet-connected. The change is one DWORD, is reverted on every exit path,
+# and never touches Wi-Fi or routing.
+# ---------------------------------------------------------------------------
+NCSI_REG_KEY = r"HKLM\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet"
+NCSI_PROBE_VALUE = "EnableActiveProbing"
+
+
+def _read_ncsi_probing():
+    """beta1.0.55: current EnableActiveProbing state as (present, value)."""
+    if not IS_WINDOWS:
+        return (False, None)
+    try:
+        rc, out, _ = _run_decoded(
+            ["reg", "query", NCSI_REG_KEY, "/v", NCSI_PROBE_VALUE], timeout=15
+        )
+        if rc != 0 or not out:
+            return (False, None)
+        match = re.search(
+            r"EnableActiveProbing\s+REG_DWORD\s+(0x[0-9a-fA-F]+|\d+)", out or ""
+        )
+        if not match:
+            return (False, None)
+        raw = match.group(1)
+        return (True, int(raw, 16) if raw.lower().startswith("0x") else int(raw))
+    except Exception:
+        # Best-effort hygiene only: a locked-down registry (or a blocked reg.exe)
+        # must never influence startup. "Not present" → caller uses the default.
+        return (False, None)
+
+
+def _set_ncsi_probing(enabled, log_fn=lambda _m: None):
+    """beta1.0.55: enable/disable NCSI active probing. Returns True on success."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        rc, _, _ = _run_decoded(
+            ["reg", "add", NCSI_REG_KEY, "/v", NCSI_PROBE_VALUE,
+             "/t", "REG_DWORD", "/d", "1" if enabled else "0", "/f"],
+            timeout=20,
+        )
+    except Exception:
+        rc = 1
+    if rc != 0:
+        log_fn(
+            "NOTE: could not change the Windows connectivity-probe setting "
+            "(needs administrator rights). The network list may still show "
+            "\"No Internet\" — the connection itself is unaffected."
+        )
+        return False
+    return True
+
+
+# beta1.0.55: safety net. Every normal exit path goes through TunManager.stop(),
+# but a hard kill (Task Manager, power loss) would leave NCSI probing disabled
+# for good. atexit covers the ordinary "close the window / Ctrl-C" cases.
+_ACTIVE_TUN_MANAGER = None
+
+
+def _atexit_restore_ncsi():
+    manager = _ACTIVE_TUN_MANAGER
+    if manager is None:
+        return
+    try:
+        manager._restore_ncsi_probing()
+    except Exception:
+        pass
+
+
+atexit.register(_atexit_restore_ncsi)
+
+
+def _thread_excepthook(args):
+    """beta1.0.55: never let a worker-thread exception vanish silently.
+
+    The route sweep, the health monitor, the UDP/TCP probes and the tray
+    poller all run on their own threads. Before this hook, an exception in any
+    of them died with nothing but a bare interpreter line on stderr —
+    invisible in a --windowed build — and the user just saw a feature stop
+    working. Now every one is written to the console with the thread name so a
+    report can be acted on. Deliberately never re-raises: a crashed hygiene
+    thread must not take the GUI down with it.
+    """
+    try:
+        name = getattr(args.thread, "name", "?")
+        print(
+            f"[thread {name}] {args.exc_type.__name__}: {args.exc_value}",
+            file=sys.stderr,
+        )
+        traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+    except Exception:
+        pass
+
+
+threading.excepthook = _thread_excepthook
+
+
+def _route_gateways(dest, mask):
+    """beta1.0.52: module-level route lookup — list of gateways serving dest/mask.
+
+    Extracted from TunManager so the App-launch route sweep can use it without
+    instantiating a full TunManager.
+    """
+    try:
+        # v1.3.2: _run_decoded — text=True lost GBK "route print" output on
+        # zh-CN Windows, silently disabling route ownership detection.
+        _, out, _ = _run_decoded(["route", "print", "-4"], timeout=15)
+    except Exception:
+        return []
+    if not out:
+        return []
+    gateways = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == dest and parts[1] == mask:
+            gateways.append(parts[2])
+    return gateways
+
+
+def _sweep_stale_tunnel_routes(log_fn):
+    """beta1.0.52: delete stale routes pointing at our TUN gateway (10.0.0.1).
+
+    A crashed/force-killed previous run — or any pre-beta1.0.52 build, whose
+    `netsh set address ... <gateway>` side effect installed an automatic
+    DEFAULT route — leaves 0.0.0.0/0 (and possibly the /1 pair) pointing at
+    10.0.0.1 after the engine is gone. With metric 1 those beats the WLAN
+    default route and the whole PC loses internet ("检测时电脑断网"). Called
+    at App launch (elevated) so the machine self-heals even before the user
+    connects; start() re-adds the tracked routes right after when sharing
+    begins. Never touches other software's routes.
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        deleted = []
+        for dest, mask in (("0.0.0.0", "0.0.0.0"), ("0.0.0.0", "128.0.0.0"),
+                           ("128.0.0.0", "128.0.0.0")):
+            if OUR_TUN_GATEWAY in _route_gateways(dest, mask):
+                subprocess.run(
+                    ["route", "delete", dest, "mask", mask, OUR_TUN_GATEWAY],
+                    capture_output=True,
+                )
+                deleted.append(f"{dest}/{mask}")
+        if deleted:
+            log_fn(
+                "Removed stale tunnel routes via 10.0.0.1 (left behind by a crashed run): "
+                + ", ".join(deleted)
+                + ". Network connectivity restored."
+            )
+    except Exception:
+        pass  # best effort — never block startup on hygiene
+
+
+def _find_foreign_engine_procs():
+    """beta1.0.5: image names of any hev-socks5-tunnel process already running.
+
+    Old pre-lwIP runs (and a crashed beta1.0.5 run) can leave the native engine
+    process alive. The only reliable cross-version signal is the engine process
+    itself. Both the full image name and its 15-char truncated form are probed
+    (some Windows builds truncate long image names). Returns an empty tuple when
     none is running; errors degrade to empty (never block start).
     """
     if not IS_WINDOWS:
@@ -368,7 +619,7 @@ def _find_foreign_tun2socks():
         _, out, _ = _run_decoded(
             [
                 "powershell", "-NoProfile", "-Command",
-                "Get-Process tun2socks-windows-amd64, tun2socks-windows-arm64"
+                "Get-Process hev-socks5-tunnel, hev-socks5-tun"
                 " -ErrorAction SilentlyContinue | "
                 "Select-Object -ExpandProperty ProcessName",
             ],
@@ -377,33 +628,33 @@ def _find_foreign_tun2socks():
         return tuple(
             line.strip().lower()
             for line in (out or "").splitlines()
-            if line.strip().lower().startswith("tun2socks-")
+            if line.strip().lower().startswith("hev-socks5-tun")
         )
     except Exception:
         return ()
 
 
-def _kill_tun2socks_all(log_fn=None):
-    """v1.4.63: force-kill EVERY tun2socks process and its children.
+def _kill_engine_procs_all(log_fn=None):
+    """beta1.0.5: force-kill EVERY hev-socks5-tunnel process and its children.
 
     Two call sites share one contract — "the software owns the whole VPN
-    lifecycle, nothing tun2socks-related outlives it":
+    lifecycle, nothing engine-related outlives it":
     - TunManager.start(): reconnect takes over. A leftover process (crashed
-      run, or one started by an old pre-1.4.5 exe) would keep the old VPN
-      alive and its adapter name climbing ("LinkHelm 41"); instead of
-      refusing, the new run kills it and proceeds.
-    - App window close: TRUE exit. Even if graceful teardown fails, no
-      tun2socks child is allowed to outlive the window.
+      run, or one started by an old build) would keep the old tunnel alive and
+      its adapter stuck; instead of refusing, the new run kills it and proceeds.
+    - App window close: TRUE exit. Even if graceful teardown fails, no engine
+      child is allowed to outlive the window.
     taskkill /T /F also reaps child processes of the tree. Returns the image
     names that were seen before the kill (may be empty).
     """
-    names = _find_foreign_tun2socks()
+    names = _find_foreign_engine_procs()
     if not names:
         return ()
     if log_fn:
-        log_fn(f"Force-terminating leftover connection processes ({', '.join(names)})...")
+        log_fn(f"Force-terminating leftover engine processes ({', '.join(names)})...")
     # taskkill /T /F kills the whole tree, Stop-Process is the fallback;
-    # run both, both are best-effort.
+    # run both, both are best-effort. /IM matches the full 18-char image name
+    # (verified on Windows 10/11; the /FI filter form is the belt-and-braces).
     for name in names:
         try:
             subprocess.run(
@@ -416,20 +667,20 @@ def _kill_tun2socks_all(log_fn=None):
         _run_decoded(
             [
                 "powershell", "-NoProfile", "-Command",
-                "Stop-Process -Name tun2socks-windows-amd64,"
-                " tun2socks-windows-arm64 -Force -ErrorAction SilentlyContinue",
+                "Stop-Process -Name hev-socks5-tunnel,"
+                " hev-socks5-tun -Force -ErrorAction SilentlyContinue",
             ],
             timeout=15,
         )
     except Exception:
         pass
-    # v1.4.91: VERIFY death instead of a fixed 0.8s nap. Windows can take a
+    # beta1.0.5: VERIFY death instead of a fixed 0.8s nap. Windows can take a
     # few seconds to actually reap a force-killed process; a reconnect issued
     # in that window saw the old tunnel still holding the TUN adapter ("always
     # occupied, cannot connect"). Poll until the image names are gone (max ~6s).
     leftover = ()
     for _ in range(12):
-        leftover = _find_foreign_tun2socks()
+        leftover = _find_foreign_engine_procs()
         if not leftover:
             break
         time.sleep(0.5)
@@ -444,12 +695,12 @@ def _kill_tun2socks_all(log_fn=None):
             except Exception:
                 pass
         time.sleep(1.0)
-        leftover = _find_foreign_tun2socks()
+        leftover = _find_foreign_engine_procs()
     if log_fn:
         if leftover:
-            log_fn(f"Warning: some leftover connection processes could not be terminated ({', '.join(leftover)}).")
+            log_fn(f"Warning: some leftover engine processes could not be terminated ({', '.join(leftover)}).")
         else:
-            log_fn("All leftover connection processes have been ended.")
+            log_fn("All leftover engine processes have been ended.")
     return names
 
 
@@ -579,32 +830,19 @@ RESUME_GRACE_DELAYS_S = (2, 5, 10)
 # an swapped cached binary would be a real privilege-escalation vector, so both
 # the installed copies and the bundled copies are re-verified before every use.
 EXPECTED_BIN_SHA256 = {
-    # v1.5.4: tun2socks v2.7.0 rebuilt from the OFFICIAL v2.7.0 source tag
-    # with ONE patched constant (tunnel/tunnel.go tcpConnectTimeout 5s->20s —
-    # see DEPENDENCY_LOCK.md). Version string reports
-    # "tun2socks-2.7.0 windows/amd64, go1.27.2, 8dda19e-linkhelm".
-    # v1.5.4: the legacy v2.5.2 backup binary is REMOVED — the ONLY allowed
-    # recovery source is the bundled v2.7.0 build verified below, and a
-    # runtime `--version` check (P0-1) refuses any binary that does not
-    # report that exact build. The unpatched official v2.7.0 (076b3c3d...)
-    # stays out of the package as a build-time reference only.
-    # wintun.dll unchanged (0.14.1).
-    "tun2socks.exe": "9c27b029f751fccda8f8c948f21f0a2c7676752ae207215d4bc5b461961be70b",
+    # beta1.0.5: tun2socks 已移除，内核完全由 lwIP (hev-socks5-tunnel) 承接。
+    # 以下为随安装包 engine/ 目录提供的原生二进制，构建时 SHA-256 锁定，
+    # 运行时再次校验（程序以管理员权限运行，防止被替换的缓存二进制提权）。
+    "hev-socks5-tunnel.exe": "242557dc4ada5a45bcc02d98a558e86dd29025efdf7960b8e302bfc2ad1901c5",
     "wintun.dll": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce",
+    "msys-2.0.dll": "1410599ee2efcede0869abec8910398d688755952e59cf7983b15cac6de78201",
 }
 
-# v1.5.4 (P0-1): the exact build marker our pinned tun2socks must report.
-# Hash alone proves bytes; this proves *which* build the bytes are.
-TUN2SOCKS_BUILD_MARK = "8dda19e-linkhelm"
-
-# v1.5.41 (P0): FIXED Wintun adapter GUID. tun2socks v2.7.0 natively supports
-# this via the device URL query (`tun://<name>?guid=<guid>` sets
-# WintunStaticRequestedGUID, engine/parse_windows.go) — a pure CLI-level
-# setting: no driver swap, no tun2socks core change. With a stable GUID
-# Windows keeps ONE network identity for the adapter: no "LinkHelm 2/3/4"
-# renumbering, no fresh "unidentified network" profile on every start/stop
-# (the source of the OS-level notification spam), and IP/DNS config reuse.
-TUN_ADAPTER_GUID = "{F4E4A1B2-9C3D-4E5F-8A7B-6C5D4E3F2A1B}"
+# beta1.0.5: lwIP (hev-socks5-tunnel) 以固定 GUID 复用同一个 Wintun 适配器
+# （engine.ADAPTER_GUID → YAML tunnel.guid，WintunCreateAdapter 按 GUID 重开），
+# 适配器名为 LinkHelm-IwIP；启动时 _cleanup_stale_tun_adapters 只清除旧模式
+# （LinkHelm/LinkHelm N/LaptopProxyVPN*，含 tun2socks 遗留）而保留本适配器，
+# 实现"先清旧 → 建新 → 后续复用"，不再出现 "LinkHelm-IwIP 2/3/4"。
 
 
 def _file_sha256(path):
@@ -615,14 +853,17 @@ def _file_sha256(path):
     return h.hexdigest()
 
 
-def _verify_bin_pair(t2s_path, wt_path):
-    """Verify both binaries against the integrity lock.
+def _verify_bins(pairs):
+    """Verify a list of (name, path) against the integrity lock.
 
-    Returns (ok, bad_name_or_None); missing files count as failures so callers
-    can fall back to the bundled copies or a pinned download.
+    `name` indexes EXPECTED_BIN_SHA256; entries not in the lock are skipped
+    (best-effort). Returns (ok, bad_name_or_None); missing files fail.
     """
-    for name, path in (("tun2socks.exe", t2s_path), ("wintun.dll", wt_path)):
-        if not os.path.exists(path) or _file_sha256(path) != EXPECTED_BIN_SHA256[name]:
+    for name, path in pairs:
+        expected = EXPECTED_BIN_SHA256.get(name)
+        if expected is None:
+            continue
+        if not os.path.exists(path) or _file_sha256(path) != expected:
             return False, name
     return True, None
 
@@ -636,22 +877,6 @@ def _bundled_bin_dir():
     if os.path.isdir(local):
         return local
     return None
-
-
-def _tun2socks_version_ok(t2s_path):
-    """v1.5.4 (P0-1): confirm the executing binary IS our pinned v2.7.0 build.
-
-    Runs `tun2socks.exe --version` and requires both the 2.7.0 version and
-    the LinkHelm build marker. A hash match already proves the bytes; this
-    additionally catches a stale %APPDATA% cache (e.g. a leftover 2.5.2)
-    that somehow passes, and makes the field log name the exact build.
-    """
-    try:
-        _, out, _ = _run_decoded([t2s_path, "--version"], timeout=10)
-    except Exception:
-        return False
-    text = " ".join((out or "").split())
-    return "2.7.0" in text and TUN2SOCKS_BUILD_MARK in text
 
 
 def socks5_greet(conn, socks_user=None, socks_pass=None, timeout=3.0):
@@ -748,32 +973,6 @@ def is_transient_precheck(result):
     return result in TRANSIENT_PRECHECK_RESULTS or result.startswith(
         TRANSIENT_PRECHECK_PREFIXES
     )
-
-
-def tun2socks_cmd(t2s_exe, proxy_url):
-    """Build the tun2socks launch command (v1.5.37).
-
-    tun2socks v2.7.0 switched its CLI from Go's stdlib flag to pflag: long
-    flags now REQUIRE the double-dash form. The old single-dash long form
-    (`-loglevel`) is parsed as shorthand `-l` + garbage → "unknown shorthand
-    flag: 'l'" → the process prints usage and exits → "exited before its
-    adapter was ready". v2.5.2 accepted both spellings, so use the pflag-safe
-    long form (`--device/--proxy/--loglevel/--tcp-auto-tuning`) which is also
-    valid on v2.5.2 — one command shape for every bundled version.
-    """
-    return [
-        t2s_exe,
-        # v1.5.41: fixed GUID — same adapter identity every run (see
-        # TUN_ADAPTER_GUID). tun2socks v2.7.0 reads `guid` from the device
-        # URL query; v2.5.2 ignores unknown query params, so the shape is
-        # safe across bundled versions.
-        "--device", f"tun://LinkHelm?guid={TUN_ADAPTER_GUID}",
-        "--proxy", proxy_url,
-        "--loglevel", "warning",
-        # v1.4.61: netstack TCP receive-buffer auto-tuning — keeps long
-        # sessions responsive instead of degrading after hours of uptime.
-        "--tcp-auto-tuning",
-    ]
 
 
 def check_socks5_with_retry(host, port, attempts=4, delay=2.0, timeout=6.0,
@@ -956,6 +1155,107 @@ def socks5_udp_dns_check(host, port, dns_ip="223.5.5.5", dns_port=53, timeout=5.
             pass
 
 
+def tunnel_udp_dns_check(dns_ip="223.5.5.5", dns_port=53, timeout=5.0):
+    """beta1.0.51: through-tunnel UDP probe — the REAL data plane games use.
+
+    socks5_udp_dns_check talks to the phone's SOCKS5 relay DIRECTLY (one
+    control connection + one datagram socket, single source port): it proves
+    the relay answers, NOT that the tunnel data plane works. That is exactly
+    how "UDP OK" shipped while games failed — and why the Windows DNS client
+    (queries to the tunnel's resolvers travel TUN -> lwIP engine -> phone
+    relay) died with ERR_NAME_NOT_RESOLVED.
+
+    This probe walks the real path: it binds a plain UDP socket to the TUN
+    adapter address and sends a DNS query to the internet. With the tunnel up,
+    the /1 catch-all routes force the datagram into the adapter
+    (hev -> phone relay -> resolver -> back). Binding to the TUN source IP is
+    what makes the result honest: if the tunnel is down, the address does not
+    exist and the bind fails — the probe can never pass by leaking out the
+    physical NIC. Returns (True, description) / (False, reason).
+    """
+    sock = None
+    bind_error = None
+    for bind_ip in ("10.0.0.2", "10.0.0.1"):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind((bind_ip, 0))  # force the TUN source address
+            break
+        except OSError as exc:
+            bind_error = exc
+            try:
+                sock.close()
+            except Exception:
+                pass
+            sock = None
+    if sock is None:
+        return False, f"tunnel address unavailable ({type(bind_error).__name__}: {bind_error})"
+    try:
+        sock.settimeout(timeout)
+        qid = random.randint(1, 0xFFFF)
+        sock.sendto(_build_dns_query(qid), (dns_ip, dns_port))
+        data, _addr = sock.recvfrom(2048)
+        if len(data) < 12:
+            return False, "UDP reply through the tunnel too short"
+        resp_id = (data[0] << 8) | data[1]
+        if resp_id != qid or not (data[2] & 0x80):
+            return False, "UDP reply received through the tunnel but not a valid DNS response"
+        return True, (
+            f"UDP tunnel data plane reachable (DNS query {dns_ip}:{dns_port} answered via "
+            "TUN -> lwIP engine -> phone relay)"
+        )
+    except socket.timeout:
+        return False, f"UDP timed out through the tunnel (no response within {timeout:.0f}s)"
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def tunnel_tcp_check(host="www.baidu.com", port=80, timeout=8.0):
+    """beta1.0.51: through-tunnel TCP probe — end-to-end validation of the TCP
+    data plane (TUN -> lwIP engine -> phone relay -> internet), source-bound
+    to the TUN address so it can never leak out the physical NIC. Sends a
+    minimal HTTP HEAD and accepts any HTTP status line as proof the path
+    works. Returns (True, description) / (False, reason); never raises.
+    """
+    sock = None
+    bind_error = None
+    for bind_ip in ("10.0.0.2", "10.0.0.1"):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind((bind_ip, 0))
+            break
+        except OSError as exc:
+            bind_error = exc
+            try:
+                sock.close()
+            except Exception:
+                pass
+            sock = None
+    if sock is None:
+        return False, f"tunnel address unavailable ({type(bind_error).__name__}: {bind_error})"
+    try:
+        sock.settimeout(timeout)
+        sock.connect((host, port))
+        sock.sendall(f"HEAD / HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode("ascii"))
+        data = sock.recv(64)
+        if data.startswith(b"HTTP/"):
+            return True, f"TCP tunnel data plane reachable ({host}:{port} answered through the tunnel)"
+        return False, "TCP connected through the tunnel but no HTTP response"
+    except socket.timeout:
+        return False, f"TCP timed out through the tunnel (no response within {timeout:.0f}s)"
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
 def _run_decoded(cmd, timeout=None):
     """v1.3.2: run a command and decode its output regardless of console code page.
 
@@ -1022,7 +1322,7 @@ def diagnose_tcp_failure(host, precheck):
 
 class TunManager:
     """
-    Manages tun2socks & wintun.dll.
+    Manages the native lwIP engine (hev-socks5-tunnel).
     Creates a Virtual Network Adapter to capture 100% of Windows traffic.
     """
     # v1.5.47: class-level credential defaults so tests / subclasses that
@@ -1037,7 +1337,7 @@ class TunManager:
         self.phone_ip = phone_ip
         self.phone_port = phone_port
         self.local_port = local_port
-        # v1.5.47: SOCKS5 credentials dialled by every probe + tun2socks.
+        # v1.5.47: SOCKS5 credentials dialled by every probe + the lwIP engine.
         self.socks_user = socks_user or DEFAULT_PHONE_USER
         self.socks_pass = socks_pass or DEFAULT_PHONE_PASS
         self.log = log_fn
@@ -1052,12 +1352,18 @@ class TunManager:
         # can remove exactly what we added.
         self._phone_route_gw = None
         # v1.5.34: lightweight lane FAILOVER (no router, no 19:1 spreading).
-        # tun2socks dials the primary lane (8080) directly — the proven 1.4.93
+        # the lwIP engine dials the primary lane (8080) directly — the proven 1.4.93
         # data plane. Only when the primary times out on several consecutive
         # short probes does the tunnel move to the standby 8082 lane, and it
         # moves back the moment the primary answers again.
         self._use_lane_b = False
         self._lane_a_fail_strikes = 0
+        # beta1.0.51: the tunnel adapter's RESOLVED Windows connection name.
+        # Windows never renames a reopened adapter, so a drifted name
+        # ("LinkHelm 31") makes every netsh name= call a silent no-op — no
+        # IP/DNS on the tunnel → ERR_NAME_NOT_RESOLVED + "DNS配置异常" scans.
+        # _normalize_adapter_connection_name keeps this canonical.
+        self._tun_conn_name = None
         # v1.5.35 (R3): switch-back hysteresis state.
         self._lane_b_since = 0.0
         self._lane_a_recover_strikes = 0
@@ -1080,6 +1386,18 @@ class TunManager:
                     ["route", "delete", dest, "mask", "128.0.0.0", OUR_TUN_GATEWAY],
                     capture_output=True,
                 )
+        # beta1.0.52: the automatic DEFAULT route via our TUN gateway (installed
+        # as a side effect of the old `netsh set address ... <gateway>` config)
+        # is ours too — a 0.0.0.0/0 pointing at 10.0.0.1 black-holes the WHOLE
+        # PC the moment the engine stops (the reported "检测时电脑断网"). The /1
+        # pair already covers the entire unicast space; the default route is
+        # redundant while sharing and lethal afterwards.
+        if OUR_TUN_GATEWAY in self._find_route_gateways("0.0.0.0", "0.0.0.0"):
+            self.log(f"Removing automatic default route 0.0.0.0/0 via {OUR_TUN_GATEWAY} (added by LaptopProxy)...")
+            subprocess.run(
+                ["route", "delete", "0.0.0.0", "mask", "0.0.0.0", OUR_TUN_GATEWAY],
+                capture_output=True,
+            )
         # Round-2: remove the host route back to the phone (only ours, via saved gw).
         phone_gw = self._phone_route_gw
         if phone_gw and self.phone_ip:
@@ -1090,73 +1408,172 @@ class TunManager:
             )
         self._phone_route_gw = None
         self._owned_routes = []
+        # beta1.0.55: do NOT clear _ncsi_restore here.
+        #
+        # beta1.0.53/1.0.54 zeroed it in this method, but _clean_routes() runs
+        # on every rollback path — including the one right before
+        # _restore_ncsi_probing(). Since _restore_ncsi_probing() returns early
+        # when _ncsi_restore is None, the pending value was destroyed before it
+        # could be written back and Windows' connectivity probe stayed disabled
+        # for the rest of the session. Restoring is owned solely by
+        # _restore_ncsi_probing() (plus the atexit net).
 
     def _find_route_gateways(self, dest, mask):
         """Return the list of gateways currently serving dest/mask (empty = none)."""
-        try:
-            # v1.3.2: _run_decoded — text=True lost GBK "route print" output on
-            # zh-CN Windows, silently disabling route ownership detection.
-            _, out, _ = _run_decoded(["route", "print", "-4"], timeout=15)
-        except Exception:
-            return []
-        if not out:
-            return []
-        gateways = []
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) >= 3 and parts[0] == dest and parts[1] == mask:
-                gateways.append(parts[2])
-        return gateways
+        return _route_gateways(dest, mask)
 
     def _wait_adapter_ip_ready(self, timeout_s):
-        """v1.5.46: poll until the LinkHelm adapter reports 10.0.0.2.
+        """beta1.0.5: poll until the LinkHelm-IwIP adapter reports an address.
 
-        With the fixed-GUID adapter reused across runs (v1.5.41+) this is
-        typically instant, so rebuilds can skip the old blind 2.0s+1.0s
-        sleeps — measured rebuild path shrinks by ~3s. Returns False on
-        timeout or if tun2socks exited early.
+        hev-socks5-tunnel assigns tunnel.ipv4 (10.0.0.1/32) to the adapter at
+        every start; _configure_adapter_if_needed then layers the routable
+        10.0.0.2/24 (gateway 10.0.0.1) on top via netsh. Either address means
+        the adapter is up — waiting for BOTH would always burn the full timeout
+        on the first launch. With the fixed-GUID adapter reused across runs
+        (engine.ADAPTER_GUID) this is typically instant. Returns False on
+        timeout or if the lwIP engine exited early.
+
+        beta1.0.51: addresses the adapter by its RESOLVED connection name
+        (self._tun_conn_name) — the hardcoded canonical name silently matched
+        nothing on machines where the name had drifted.
         """
+        name = self._tun_conn_name or TUN_ADAPTER_NAME
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             if self.process is not None and self.process.poll() is not None:
                 return False
             _, out, _ = _run_decoded(
-                ["netsh", "interface", "ipv4", "show", "addresses", "name=LinkHelm"],
+                ["netsh", "interface", "ipv4", "show", "addresses", f"name={name}"],
                 timeout=15,
             )
-            if "10.0.0.2" in (out or ""):
+            if "10.0.0.1" in (out or "") or "10.0.0.2" in (out or ""):
                 return True
             time.sleep(0.25)
         return False
 
-    def _configure_adapter_if_needed(self):
-        """v1.5.41 (P0): idempotent adapter config — reuse what is correct.
+    def _normalize_adapter_connection_name(self):
+        """beta1.0.51: make the tunnel's Windows connection name canonical.
 
-        With the fixed adapter GUID (TUN_ADAPTER_GUID) Windows keeps the
-        interface's static IP/DNS across runs, so re-running `netsh set` on
-        every start is wasted work AND extra churn on the network stack
-        (each set can bounce NLA state). Check first:
+        The network flyout shows the CONNECTION name, and every netsh config
+        call addresses the adapter by it. When it drifted (the field
+        "LinkHelm 31" entry), the IP/DNS configuration silently applied to
+        nothing: Windows had no resolver on the tunnel, pages died with
+        ERR_NAME_NOT_RESOLVED, and computer-manager DNS scans flagged 异常.
+        Renaming back to the canonical name fixes the display AND the
+        configuration in one step. Idempotent — a no-op when already
+        canonical. Returns the name now in force (for subsequent netsh calls).
+        """
+        actual = _resolve_tun_connection_name()
+        if not actual:
+            # Adapter not resolvable yet — keep the canonical name; the
+            # caller's netsh calls will surface any real problem via the
+            # follow-up probe, exactly as before beta1.0.51.
+            return TUN_ADAPTER_NAME
+        if actual == TUN_ADAPTER_NAME:
+            return actual
+        self.log(
+            f"Tunnel connection name drifted to \"{actual}\"; renaming to "
+            f"\"{TUN_ADAPTER_NAME}\" (fixes the network-list entry and makes "
+            "adapter IP/DNS configuration effective again)."
+        )
+        try:
+            res = subprocess.run(
+                ["netsh", "interface", "set", "interface", "name", actual,
+                 "newname", TUN_ADAPTER_NAME],
+                capture_output=True, timeout=20,
+            )
+        except Exception as error:
+            self.log(f"Connection-name normalization failed ({error}); continuing with \"{actual}\".")
+            return actual
+        if res.returncode == 0:
+            self.log(f"Connection name normalized to \"{TUN_ADAPTER_NAME}\".")
+            return TUN_ADAPTER_NAME
+        self.log(
+            f"Connection-name normalization failed (rc={res.returncode}); "
+            f"continuing with \"{actual}\" — adapter config still works by that name."
+        )
+        return actual
+
+    def _configure_adapter_if_needed(self):
+        """beta1.0.55: apply the adapter config and self-heal a drifted name.
+
+        Windows never renames an adapter on its own, but a Wintun adapter that
+        was created while an older one still existed comes up as
+        "LinkHelm 2/3/.../31". Every `netsh ... name=LinkHelm-IwIP` call then
+        matches nothing and silently does nothing — the tunnel ends up with no
+        address and no resolver, which is exactly the beta1.0.54 field report
+        ("TCP 和 UDP 不通", WinError 10049/10051 on the tunnel probes while the
+        phone relay still answers).
+
+        So the apply step is now verified, and a failed apply triggers one
+        re-normalise-and-retry cycle instead of silently continuing.
+        """
+        for attempt in (1, 2):
+            if self._apply_adapter_config_once():
+                return
+            if attempt == 1:
+                self.log(
+                    "Tunnel adapter configuration did not take effect — the "
+                    "connection name has most likely drifted (the network list "
+                    "shows something like \"LinkHelm 31\"). Re-normalising it "
+                    "and applying the configuration once more."
+                )
+                self._tun_conn_name = self._normalize_adapter_connection_name()
+
+    def _apply_adapter_config_once(self):
+        """beta1.0.5: idempotent adapter config — reuse what is correct.
+
+        Returns True when the adapter ends up with a usable resolver.
+
+        lwIP (hev-socks5-tunnel) recreates a fresh LinkHelm adapter each run,
+        so re-running `netsh set` on every start is wasted work AND extra churn
+        on the network stack (each set can bounce NLA state). Check first:
         - address already 10.0.0.2/24 via 10.0.0.1 → skip `set address`
         - DNS already 223.5.5.5 (+119.29.29.29)   → skip `set/add dns`
         Only genuinely missing config is applied. Never raises: a failed
         config application must surface via the follow-up probe, not here.
+
+        beta1.0.51 (DNS 连通性修复): the adapter is addressed by its RESOLVED
+        connection name (self._tun_conn_name) — the hardcoded canonical name
+        silently no-op'd on drifted machines, leaving the tunnel WITHOUT a
+        resolver (ERR_NAME_NOT_RESOLVED, "DNS配置异常" scans). After applying,
+        the DNS servers are VERIFIED on the adapter and a third domestic
+        resolver (114.114.114.114) is added so one blocked/slow resolver
+        cannot take name resolution down with it.
         """
+        name = self._tun_conn_name or TUN_ADAPTER_NAME
         _, out, _ = _run_decoded(
-            ["netsh", "interface", "ipv4", "show", "addresses", "name=LinkHelm"],
+            ["netsh", "interface", "ipv4", "show", "addresses", f"name={name}"],
             timeout=15,
         )
         if "10.0.0.2" in (out or ""):
             self.log("NIC IP is already 10.0.0.2/24; reusing existing config (skipped netsh set address).")
         else:
             self.log("Configuring IP...")
-            subprocess.run(
-                ["netsh", "interface", "ip", "set", "address", "name=LinkHelm",
-                 "static", "10.0.0.2", "255.255.255.0", "10.0.0.1"],
-                check=True, capture_output=True,
-            )
+            try:
+                # beta1.0.52: NO gateway argument. Passing 10.0.0.1 as the
+                # gateway made Windows install an automatic DEFAULT route
+                # (0.0.0.0/0 via 10.0.0.1, metric 1) on this adapter — it beats
+                # the WLAN default and black-holes the WHOLE PC whenever the
+                # engine stops. Traffic steering is owned exclusively by the
+                # tracked /1 catch-all routes (_add_owned_routes), which are
+                # rolled back on stop; the on-link 10.0.0.0/24 route keeps the
+                # adapter's own gateway address 10.0.0.1 reachable.
+                subprocess.run(
+                    ["netsh", "interface", "ip", "set", "address", f"name={name}",
+                     "static", "10.0.0.2", "255.255.255.0"],
+                    check=True, capture_output=True,
+                )
+            except subprocess.CalledProcessError as error:
+                # beta1.0.51: a drifted name lands here — do NOT abort startup
+                # (the follow-up probe decides), but say exactly what happened.
+                self.log(
+                    f"WARNING: could not set the tunnel IP on \"{name}\" "
+                    f"(rc={error.returncode}); the connection name may have drifted."
+                )
 
         _, out, _ = _run_decoded(
-            ["netsh", "interface", "ipv4", "show", "dnsservers", "name=LinkHelm"],
+            ["netsh", "interface", "ipv4", "show", "dnsservers", f"name={name}"],
             timeout=15,
         )
         dns_out = (out or "")
@@ -1169,16 +1586,60 @@ class TunManager:
             # needless detection footprint on managed networks). AliDNS +
             # DNSPod are fast and domestic; resolution still travels the
             # same tunnel path.
-            subprocess.run(
-                ["netsh", "interface", "ip", "set", "dns", "name=LinkHelm",
-                 "static", "223.5.5.5"],
-                check=True, capture_output=True,
-            )
-            subprocess.run(
-                ["netsh", "interface", "ip", "add", "dns", "name=LinkHelm",
-                 "119.29.29.29", "index=2"],
-                check=False, capture_output=True,
-            )
+            try:
+                subprocess.run(
+                    ["netsh", "interface", "ip", "set", "dns", f"name={name}",
+                     "static", "223.5.5.5"],
+                    check=True, capture_output=True,
+                )
+                subprocess.run(
+                    ["netsh", "interface", "ip", "add", "dns", f"name={name}",
+                     "119.29.29.29", "index=2"],
+                    check=False, capture_output=True,
+                )
+                # beta1.0.51: third domestic resolver — Windows walks the list
+                # on timeouts, so one slow/blocked resolver no longer fails
+                # every lookup (the "DNS配置异常" field symptom).
+                subprocess.run(
+                    ["netsh", "interface", "ip", "add", "dns", f"name={name}",
+                     "114.114.114.114", "index=3"],
+                    check=False, capture_output=True,
+                )
+            except subprocess.CalledProcessError as error:
+                self.log(
+                    f"WARNING: could not set the tunnel DNS on \"{name}\" "
+                    f"(rc={error.returncode}); pages may fail with ERR_NAME_NOT_RESOLVED."
+                )
+
+        # beta1.0.51: VERIFY the resolvers actually landed on the adapter.
+        # A drifted connection name turns every netsh call into a silent
+        # no-op — without this check the tunnel comes up resolver-less and
+        # the first symptom the user sees is "无法访问此页面".
+        _, out, _ = _run_decoded(
+            ["netsh", "interface", "ipv4", "show", "dnsservers", f"name={name}"],
+            timeout=15,
+        )
+        if any(s in (out or "") for s in ("223.5.5.5", "119.29.29.29", "114.114.114.114")):
+            return True
+        self.log(
+            f"WARNING: no DNS servers are active on the tunnel adapter \"{name}\" — "
+            "name resolution through the tunnel WILL fail (ERR_NAME_NOT_RESOLVED). "
+            "If the Windows network list shows a drifted name like \"LinkHelm 31\", "
+            "renaming the connection to \"LinkHelm-IwIP\" and restarting sharing fixes it."
+        )
+        return False
+
+    def _restore_ncsi_probing(self):
+        """beta1.0.55: put the Windows connectivity probe back the way we found it."""
+        previous = getattr(self, "_ncsi_restore", None)
+        global _ACTIVE_TUN_MANAGER
+        if _ACTIVE_TUN_MANAGER is self:
+            _ACTIVE_TUN_MANAGER = None
+        if previous is None:
+            return
+        self._ncsi_restore = None
+        if _set_ncsi_probing(bool(previous), self.log):
+            self.log("Restored the Windows connectivity-probe setting.")
 
     def _add_owned_routes(self):
         """Patch B / Round-2: add the return route to the phone plus the two /1
@@ -1189,6 +1650,20 @@ class TunManager:
         routes pointing at our own TUN gateway or the saved phone return-route gw.
         """
         self._owned_routes = []
+
+        # beta1.0.52: sweep the automatic DEFAULT route via our TUN gateway
+        # BEFORE adding anything. Two sources: (a) the old `netsh set address
+        # ... <gateway>` config installed 0.0.0.0/0 via 10.0.0.1 as a side
+        # effect, (b) a crashed previous run never cleaned it up. Either way it
+        # black-holes the whole PC once the engine stops (metric 1 beats the
+        # WLAN default) — the reported "检测时电脑断网". The /1 pair below is
+        # the complete, tracked, rollback-able replacement.
+        if OUR_TUN_GATEWAY in self._find_route_gateways("0.0.0.0", "0.0.0.0"):
+            self.log(f"Removing stale default route 0.0.0.0/0 via {OUR_TUN_GATEWAY} (leftover from a previous run)...")
+            subprocess.run(
+                ["route", "delete", "0.0.0.0", "mask", "0.0.0.0", OUR_TUN_GATEWAY],
+                capture_output=True,
+            )
 
         # Round-2 (P1-W2): pin a host route to the phone through the original default
         # gateway BEFORE the /1 routes take over, otherwise the proxy/health-check
@@ -1236,122 +1711,45 @@ class TunManager:
             self._owned_routes.append(dest)
 
     def _check_dependencies(self):
-        os.makedirs(BIN_DIR, exist_ok=True)
-        t2s_path = os.path.join(BIN_DIR, "tun2socks.exe")
-        wt_path  = os.path.join(BIN_DIR, "wintun.dll")
+        """beta1.0.5: verify the bundled lwIP engine (hev-socks5-tunnel) + Wintun.
 
-        # v1.5.4: sweep legacy per-version backups out of the runtime cache
-        # (e.g. a leftover tun2socks_v2.5.2_backup.exe from an old installer).
-        # The cache must only ever contain the two pinned files below.
-        try:
-            for stale in os.listdir(BIN_DIR):
-                if stale.startswith("tun2socks_") and stale.endswith(".exe"):
-                    try:
-                        os.remove(os.path.join(BIN_DIR, stale))
-                        self.log(f"Cleaned legacy cache component: {stale}")
-                    except OSError:
-                        pass
-        except OSError:
-            pass
+        tun2socks has been removed entirely; the native lwIP engine ships with
+        the package under engine/ (resolved via engine.engine_bin_dir() — the
+        same location LwipEngine launches from: <pkg>/engine/ from source,
+        <app>/_internal/engine/ in the frozen onedir package) and is the ONLY
+        user-space protocol stack. No runtime download is attempted — if the
+        bundle is incomplete the user must reinstall. Runs elevated, so we
+        re-verify SHA-256 before trusting. Returns the lwIP engine exe path
+        (used for logging); raises on failure.
+        """
+        from engine import (
+            LWIP_EXE_NAME, MSYS_DLL_NAME, WINTUN_DLL_NAME, engine_trio_paths,
+        )
+        exe_path, wt_path, msys_path = engine_trio_paths()
+        engine_dir = os.path.dirname(exe_path)
 
-        # v1.4.4: verify whatever is already installed before trusting it. This
-        # program runs elevated, so a replaced cached binary must never execute.
-        # v1.5.4: the message now states the ONLY recovery source (the bundled
-        # v2.7.0 build) — no 2.5.2 or any other fallback exists any more.
-        for path, name in ((t2s_path, "tun2socks.exe"), (wt_path, "wintun.dll")):
-            if os.path.exists(path) and _file_sha256(path) != EXPECTED_BIN_SHA256[name]:
-                self.log(
-                    f"Security warning: {name} does not match the pinned SHA-256 (may be replaced or an old cached copy), "
-                    "removed; reinstalling only from the pinned v2.7.0 build."
-                )
-                try:
-                    os.remove(path)
-                except OSError as error:
-                    self.log(f"Could not remove {name} (verification failed): {error}")
-
-        if os.path.exists(t2s_path) and os.path.exists(wt_path):
-            # v1.5.4 (P0-1): runtime version gate on the cached pair too.
-            if _tun2socks_version_ok(t2s_path):
-                return t2s_path
-            self.log("Cached tun2socks.exe version check failed (not the pinned v2.7.0 build); reinstalling the bundled version.")
-            try:
-                os.remove(t2s_path)
-            except OSError:
-                pass
-
-        # Patch B (preferred path): use the copies bundled with the onedir package.
-        # Re-verified at every launch (v1.4.4), not just at build time.
-        bundled = _bundled_bin_dir()
-        if bundled:
-            bundled_t2s = os.path.join(bundled, "tun2socks.exe")
-            bundled_wt = os.path.join(bundled, "wintun.dll")
-            ok, bad = _verify_bin_pair(bundled_t2s, bundled_wt)
-            if ok:
-                self.log("Using bundled network components (SHA-256 re-verified at startup)...")
-                self._install_bundled_file(bundled_t2s, t2s_path)
-                self._install_bundled_file(bundled_wt, wt_path)
-                installed_ok, installed_bad = _verify_bin_pair(t2s_path, wt_path)
-                # v1.5.4 (P0-1): hash + runtime version double gate.
-                if installed_ok and _tun2socks_version_ok(t2s_path):
-                    self.log(
-                        f"tun2socks version verified: v{TUN2SOCKS_VERSION} "
-                        f"pinned build {TUN2SOCKS_BUILD_MARK}."
-                    )
-                    return t2s_path
-                self.log(f"Error: {installed_bad or 'tun2socks.exe'} still failed verification after install; will try the official download.")
-            else:
-                self.log(f"Error: bundled {bad} failed hash verification; local copy not trusted, will try official download.")
-
-        # Determine architecture
-        arch = platform.machine().lower()
-        if 'arm' in arch or 'aarch' in arch:
-            t2s_url, t2s_sha, t2s_member = TUN2SOCKS_URLS["arm64"]
-            wt_arch = "arm64"
-        else:
-            t2s_url, t2s_sha, t2s_member = TUN2SOCKS_URLS["amd64"]
-            wt_arch = "amd64"
-        wt_member = f"wintun/bin/{wt_arch}/wintun.dll"
-
-        # Patch B: downloads must be explicitly confirmed by the user.
-        if self.confirm_download is None:
-            raise RuntimeError(
-                "Bundled network components are missing and downloads require explicit "
-                "user confirmation. Reinstall the package or approve the download."
+        # Re-verify the integrity-locked binaries (elevated process — guard
+        # against a swapped cached copy acting as a privilege-escalation vector).
+        ok, bad = _verify_bins([
+            (LWIP_EXE_NAME, exe_path),
+            (WINTUN_DLL_NAME, wt_path),
+            (MSYS_DLL_NAME, msys_path),
+        ])
+        if not ok:
+            msg = (
+                f"lwIP engine component '{bad}' is missing or fails SHA-256 "
+                f"verification in {engine_dir}. Please reinstall the LinkHelm "
+                "package (engine/ must contain hev-socks5-tunnel.exe, "
+                "wintun.dll and msys-2.0.dll)."
             )
-        if not self.confirm_download():
-            raise RuntimeError("Dependency download cancelled by user.")
+            self.log(msg)
+            raise RuntimeError(msg)
+        self.log(
+            f"lwIP engine verified: hev-socks5-tunnel (v{LWIP_ENGINE_VERSION}), "
+            f"Wintun v{WINTUN_VERSION}."
+        )
+        return exe_path
 
-        self.log("Downloading network components via the bridge...")
-        # Start a temporary bridge for downloading
-        temp_bridge = HttpSocksBridge(self.local_port, self.phone_ip, self.phone_port, self.log)
-        temp_bridge.start()
-        time.sleep(1.5)
-
-        proxy_handler = urllib.request.ProxyHandler({
-            'http': f'http://127.0.0.1:{self.local_port}',
-            'https': f'http://127.0.0.1:{self.local_port}'
-        })
-        # Patch B: local opener only — never change the global URL opener that other
-        # threads in this process rely on.
-        opener = urllib.request.build_opener(proxy_handler)
-
-        try:
-            if not os.path.exists(t2s_path):
-                self.log("Downloading tun2socks...")
-                self._download_and_extract(opener, t2s_url, t2s_sha, t2s_member, t2s_path)
-
-            if not os.path.exists(wt_path):
-                self.log("Downloading wintun.dll...")
-                self._download_and_extract(opener, WINTUN_URL, WINTUN_ZIP_SHA256, wt_member, wt_path)
-            self.log("Dependencies downloaded and verified.")
-        except Exception as e:
-            self.log(f"Download failed: {e}")
-            raise e
-        finally:
-            temp_bridge.stop()
-            time.sleep(0.5)
-
-        return t2s_path
 
     @staticmethod
     def _install_bundled_file(src, dest):
@@ -1388,16 +1786,16 @@ class TunManager:
         os.replace(tmp, dest_path)
 
     def start(self):
-        # v1.4.63: reconnect TAKES OVER. A leftover tun2socks process (from a
+        # v1.4.63: reconnect TAKES OVER. A leftover engine process (from a
         # crashed run, or started by an old pre-1.4.5 exe that has no mutex)
         # keeps the old VPN alive and its adapter name climbing. Kill it and
         # proceed — refusing (v1.4.62) read to the user as "reconnect does
         # nothing". Only if the kill itself fails do we stop.
-        _kill_tun2socks_all(log_fn=self.log)
-        if _find_foreign_tun2socks():
+        _kill_engine_procs_all(log_fn=self.log)
+        if _find_foreign_engine_procs():
             raise RuntimeError(
                 "Leftover connection processes could not be ended; a new connection cannot be started safely.\n"
-                "Open Task Manager, end tun2socks-windows-amd64.exe, then retry."
+                "Open Task Manager, end hev-socks5-tunnel.exe, then retry."
             )
         # Round-2 fix (P0-W1): verify the phone's SOCKS5 endpoint BEFORE touching
         # Wintun, IP configuration or routes. A phone-side failure now surfaces as a
@@ -1422,20 +1820,54 @@ class TunManager:
         # runs — otherwise Windows keeps piling up "LinkHelm 14/27/..."
         # dead entries in the network list. Best effort; the fresh adapter for
         # this run is created right after.
-        _cleanup_stale_tun_adapters(self.log)
+        # beta1.0.56: do NOT run _cleanup_stale_tun_adapters() here. Its
+        # `pnputil /remove-device` physically removes a kernel PnP device; if a
+        # prior crashed/failed run (1.0.53/1.0.54) left an orphaned Wintun
+        # adapter still held by the kernel or a zombie engine, forcing the
+        # removal at CONNECT time bluescreens the machine. Zombie engines are
+        # already reaped by the _kill_engine_procs_all() call above, and the live
+        # adapter is reused by its fixed GUID, so the only thing this sweep ever
+        # bought was cosmetic dead entries in the network list — not worth a
+        # BSOD. The helper is kept as a manual hygiene tool only.
+        # beta1.0.55: the WLAN-profile sweep that used to run here is GONE.
+        #
+        # beta1.0.52 added `_cleanup_stale_wlan_profiles()` to tidy the numbered
+        # duplicates ("LinkHelm 2" .. "LinkHelm 31") in the network list. It
+        # deletes saved profiles with `netsh wlan delete profile`, and on
+        # Windows deleting the profile of the network you are CURRENTLY
+        # associated with tears that association down — the PC drops off
+        # Wi-Fi. Because the Wi-Fi Direct group re-forms with a fresh BSSID
+        # every session, the live connection is very often one of the very
+        # numbered profiles being swept, so the symptom was:
+        #   "检测连通性 / 连接失败时电脑会断开 WiFi".
+        # The cosmetic gain (fewer dead entries) is not worth a dropped link,
+        # and the user-visible display problem is now handled by normalising
+        # the tunnel's own connection name instead (see
+        # _normalize_adapter_connection_name), which cannot touch Wi-Fi state.
+        # The helper is kept below but is deliberately no longer auto-invoked.
 
-        t2s_exe = self._check_dependencies()
+        # beta1.0.55: stop Windows from labelling the working link "No Internet".
+        # Set BEFORE the adapter exists so NLA evaluates the new network with
+        # the new setting (see _read_ncsi_probing). Restored in stop().
+        present, previous = _read_ncsi_probing()
+        # 1 is the Windows default when the value has never been written.
+        self._ncsi_restore = previous if present else 1
+        global _ACTIVE_TUN_MANAGER
+        _ACTIVE_TUN_MANAGER = self
+        if _set_ncsi_probing(False, self.log):
+            self.log(
+                "Windows connectivity probe paused for this session: the network "
+                "list will now report the tunnel as online (Microsoft's NCSI probe "
+                "endpoints are unreachable on most domestic networks, which is what "
+                "produced the bogus \"No Internet\" label)."
+            )
 
-        self.log("Starting the LinkHelm adapter...")
-        # v1.5.47: dual-lane router removed — tun2socks dials the phone directly
-        # (lightweight 8082 failover lives in the health monitor).
-        # beta1.0.4: route the launch through EngineManager. Default mode is
-        # "legacy" (identical tun2socks command); "lwip" swaps in the native
-        # C/C++ lwIP engine (hev-socks5-tunnel.exe) once it is built & present.
+        # beta1.0.5: tun2socks 已移除，内核完全由 lwIP (hev-socks5-tunnel) 承接。
+        # 启动时先校验内置原生引擎完整性，再通过 EngineManager 拉起 lwIP。
+        self._check_dependencies()
         from engine import ENGINE_MANAGER
-        ENGINE_MANAGER.set_legacy_binary(t2s_exe)
         (exe, args, cwd), engine_name, engine_note = ENGINE_MANAGER.build_launch(
-            self._tun2socks_proxy_url()
+            self._socks_proxy_url()
         )
         self.log(f"Engine selected: {engine_name}")
         if engine_note:
@@ -1445,25 +1877,35 @@ class TunManager:
         cflags = 0x08000000 if IS_WINDOWS else 0
         self.process = subprocess.Popen([exe, *args], cwd=cwd, creationflags=cflags,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self._read_tun2socks_output()
+        self._read_engine_output()
 
         self.log("Waiting for the adapter to be ready...")
         adapter_found = False
         for _ in range(15):
             if self.process.poll() is not None:
-                raise RuntimeError("tun2socks exited before its adapter was ready.")
+                raise RuntimeError("lwIP engine exited before its adapter was ready.")
             # v1.3.2: _run_decoded — text=True crashed on zh-CN GBK netsh output,
             # so the adapter was never detected and startup rolled back even
-            # though tun2socks had created it successfully.
+            # though the lwIP engine had created it successfully.
+            # beta1.0.51: match ANY LinkHelm* entry, not just the canonical
+            # name — a drifted connection name ("LinkHelm 31") must still be
+            # recognized here (and normalized right after), never treated as
+            # "adapter missing" (which aborted startup outright).
             _, out, _ = _run_decoded(["netsh", "interface", "ipv4", "show", "interfaces"], timeout=15)
-            if "LinkHelm" in out:
+            if "linkhelm" in (out or "").lower():
                 adapter_found = True
                 break
             time.sleep(1)
-            
+
         if not adapter_found:
             self.stop()
             raise Exception("Failed to create Virtual Adapter.")
+
+        # beta1.0.51: canonicalize the connection name BEFORE any netsh config.
+        # A drifted name made every name= call a silent no-op: the tunnel came
+        # up without IP/DNS, pages failed with ERR_NAME_NOT_RESOLVED, and the
+        # Windows network list showed a confusing duplicate ("LinkHelm 31").
+        self._tun_conn_name = self._normalize_adapter_connection_name()
 
         # v1.5.46: fixed-GUID adapter is usually reused — poll for its IP
         # instead of the old blind 2.0s+1.0s sleeps (faster reconnect).
@@ -1471,6 +1913,14 @@ class TunManager:
             self.log("Adapter IP not ready immediately; falling back to a fixed wait.")
             time.sleep(1.0)
         self._configure_adapter_if_needed()
+        # beta1.0.51: clear the negative DNS cache. Lookups that failed while
+        # the tunnel was flapping stay cached (ERR_NAME_NOT_RESOLVED) and keep
+        # breaking page loads long after the data plane is healthy again.
+        try:
+            subprocess.run(["ipconfig", "/flushdns"], capture_output=True, timeout=15)
+            self.log("Cleared the Windows DNS cache (stale lookup failures from the reconnect window).")
+        except Exception:
+            pass
         time.sleep(0.3)
 
         self.log("Applying global routes...")
@@ -1484,6 +1934,13 @@ class TunManager:
             self._clean_routes()
             raise
         self.log("Global connection is active.")
+
+        # beta1.0.51: one-shot data-plane self-test at every startup — the
+        # field reports ("UDP OK but games fail", ERR_NAME_NOT_RESOLVED,
+        # "TCP 连通性很差") all trace back to the tunnel data plane, so prove
+        # it (or disprove it) in the log right here instead of guessing later.
+        # Diagnostic only: a failure never tears the tunnel down.
+        self._log_data_plane_selftest()
 
         # Start health monitors
         self._monitoring_active = True
@@ -1503,7 +1960,7 @@ class TunManager:
         # so a genuine drop reconnects in seconds instead of tens of seconds.
         threading.Thread(target=self._link_keepalive_loop, daemon=True).start()
         # v1.4.93: hold the system awake for the whole share session — idle
-        # sleep / Modern Standby suspends tun2socks and the Wi-Fi Direct link
+        # sleep / Modern Standby suspends the lwIP engine and the Wi-Fi Direct link
         # ("a process mounted too long gets killed by the Windows power policy"). Scoped thread owns the
         # per-thread execution state and always clears it on stop.
         threading.Thread(target=self._keep_awake_loop, daemon=True).start()
@@ -1526,10 +1983,10 @@ class TunManager:
         - process alive + SOCKS5 greeting reachable → tunnel survived, return
           to the normal monitor loops untouched (no rebuild, no adapter churn).
         - process exited while asleep → log and hand over to the bounded
-          _restart_tun2socks sequence (the crash watchdog may race us; its
+          _restart_engine sequence (the crash watchdog may race us; its
           _restarting mutex makes the second call a no-op).
         - still unreachable after the full window → bounded rebuild; if the
-          phone itself is still away, the precheck fails and _restart_tun2socks
+          phone itself is still away, the precheck fails and _restart_engine
           retries with its own backoff — no repeated adapter deletion.
         """
         while self._monitoring_active:
@@ -1546,7 +2003,10 @@ class TunManager:
                     return
                 if self.process and self.process.poll() is not None:
                     break  # process died during sleep — go rebuild below
-                if self._probe_ok(timeout=4.0):
+                # beta1.0.51: 4s → 8s probe timeout — the documented wake
+                # latency is 3-8s, so a 4s probe could fail a link that was
+                # merely still waking and trigger a needless rebuild.
+                if self._probe_ok(timeout=8.0):
                     recovered = True
                     break
             if not self._monitoring_active or self._restarting:
@@ -1555,7 +2015,7 @@ class TunManager:
                 self.log("Link verified after wake; no rebuild needed.")
             else:
                 self.log("Link not recovered after wake; entering bounded rebuild.")
-                self._restart_tun2socks()
+                self._restart_engine()
 
     def _keep_awake_loop(self):
         """v1.4.93: ES_SYSTEM_REQUIRED for the life of the tunnel.
@@ -1684,7 +2144,7 @@ class TunManager:
         self._monitoring_active = False
         self._connection_healthy = False
         # v1.5.4 (P0): kill any pending resume handling and unregister the OS
-        # notification — a queued wake callback must never restart tun2socks
+        # notification — a queued wake callback must never restart the engine
         # after the user stopped sharing. getattr-guarded: tests may build
         # instances via object.__new__ without __init__ state.
         resume_event = getattr(self, "_resume_event", None)
@@ -1698,6 +2158,8 @@ class TunManager:
         self._lane_a_fail_strikes = 0
         self._lane_b_since = 0.0
         self._lane_a_recover_strikes = 0
+        # beta1.0.55: restore the Windows connectivity probe we paused on start.
+        self._restore_ncsi_probing()
         self.log("Restoring routes...")
         self._clean_routes()
 
@@ -1714,7 +2176,7 @@ class TunManager:
                 pass
             # v1.4.63: belt-and-suspenders — reap the whole process tree.
             # This is what guarantees "exit means exit": a graceful terminate
-            # that silently fails must never leave the tun2socks child (and
+            # that silently fails must never leave the engine child (and
             # with it the VPN tunnel) running in the background.
             try:
                 subprocess.run(
@@ -1725,13 +2187,13 @@ class TunManager:
                 pass
             self.process = None
             
-        subprocess.run(["netsh", "interface", "set", "interface", "LinkHelm", "disable"], capture_output=True)
+        subprocess.run(["netsh", "interface", "set", "interface", "LinkHelm-IwIP", "disable"], capture_output=True)
         # v1.4.91: disconnect = full reset. terminate/taskkill only handles child
-        # processes "we started ourselves"; a crash-restart loop can leave orphan tun2socks
+        # processes "we started ourselves"; a crash-restart loop can leave orphan engine
         # (occupying the TUN and routes for the next connection, showing as "occupied,
         # cannot connect"). Here we sweep unconditionally and confirm death, so the
         # SOCKS5 tunnel is fully cut when the disconnect button returns.
-        _kill_tun2socks_all(log_fn=self.log)
+        _kill_engine_procs_all(log_fn=self.log)
         # beta1.0.4: release engine-owned resources (e.g. lwIP pid file) so the
         # next session starts clean. Legacy engine teardown is a no-op.
         try:
@@ -1741,8 +2203,8 @@ class TunManager:
             pass
         self.log("Connection stopped.")
 
-    def _read_tun2socks_output(self):
-        """Read and log tun2socks stdout/stderr in background threads."""
+    def _read_engine_output(self):
+        """Read and log the lwIP engine (hev-socks5-tunnel) stdout/stderr in background threads."""
         def _annotate(msg):
             # beta1.0.3: attach the corresponding cause instead of letting
             # every failure read as a bare "rejected by the remote host".
@@ -1773,7 +2235,7 @@ class TunManager:
                         break
                     msg = line.decode('utf-8', errors='replace').strip()
                     if msg:
-                        self.log(f"[tun2socks:{label}] {_annotate(msg)}")
+                        self.log(f"[lwip:{label}] {_annotate(msg)}")
             except Exception:
                 pass
 
@@ -1786,7 +2248,7 @@ class TunManager:
         # v1.5.4 (P0): fast crash watchdog. Only OUR owned child process exit
         # triggers recovery (Popen.poll on self.process — never name-based
         # sweeps here); exit is noticed in ~1s instead of 5s. Rebuilds reuse
-        # the existing _restart_tun2socks bounded sequence (its _restarting
+        # the existing _restart_engine bounded sequence (its _restarting
         # flag is the single mutex), and repeated crashes trip FAILED_COOLDOWN
         # instead of looping forever.
         while self._monitoring_active:
@@ -1813,17 +2275,17 @@ class TunManager:
                 except Exception:
                     pass
                 self.log(
-                    f"Error: tun2socks (PID {pid}, exit code {exit_code}) crashed "
+                    f"Error: lwIP engine (PID {pid}, exit code {exit_code}) crashed "
                     f"within {CRASH_COOLDOWN_WINDOW_S // 60} minute(s) "
                     f"{CRASH_COOLDOWN_MAX} times; stopping auto-restart (FAILED_COOLDOWN),"
                     "check the log, then reconnect manually."
                 )
                 return
             self.log(
-                f"Watchdog: tun2socks process exited (PID {pid}, exit code {exit_code}),"
+                f"Watchdog: lwIP engine process exited (PID {pid}, exit code {exit_code}),"
                 "auto-restarting..."
             )
-            self._restart_tun2socks()
+            self._restart_engine()
             return
 
     def _probe_socks_port(self, port, timeout=2.0):
@@ -1891,8 +2353,8 @@ class TunManager:
         """
         return self._probe_socks_port(SECONDARY_LANE_PORT, timeout=timeout)
 
-    def _tun2socks_proxy_url(self):
-        """The -proxy URL tun2socks should dial for the current mode.
+    def _socks_proxy_url(self):
+        """The SOCKS5 URL the lwIP engine should dial for the current mode.
 
         v1.5.47: credentials embedded (RFC 1929 userpass). Alphanumeric-only
         credentials need no URL escaping; quote() is applied anyway for safety.
@@ -1904,10 +2366,40 @@ class TunManager:
             return f"socks5://{user}:{pwd}@{self.phone_ip}:{SECONDARY_LANE_PORT}"
         return f"socks5://{user}:{pwd}@{self.phone_ip}:{self.phone_port}"
 
-    def _probe_ok(self, timeout=6.0):
+    def _log_data_plane_selftest(self):
+        """beta1.0.51: prove (or disprove) the tunnel data plane in the log.
+
+        Runs the through-tunnel UDP (DNS) and TCP probes once at startup.
+        These walk the exact path user traffic takes (TUN -> lwIP engine ->
+        phone relay -> internet), source-bound to the TUN address so they can
+        never leak out the physical NIC — unlike the direct relay probe, which
+        used to report "UDP OK" while games and the Windows DNS client were
+        failing. Diagnostic only: nothing here changes tunnel state.
+        """
+        try:
+            ok, detail = tunnel_udp_dns_check()
+            self.log(("✓ " if ok else "✗ ") + f"UDP data plane: {detail}")
+            if not ok:
+                self.log(
+                    "  UDP through the tunnel is failing — games/voice will not work and DNS"
+                    " lookups can time out (ERR_NAME_NOT_RESOLVED). The phone relay itself may"
+                    " still answer a DIRECT probe; the break is inside the tunnel, not the phone."
+                )
+        except Exception as error:
+            self.log(f"UDP data-plane self-test error: {error}")
+        try:
+            ok, detail = tunnel_tcp_check()
+            self.log(("✓ " if ok else "✗ ") + f"TCP data plane: {detail}")
+        except Exception as error:
+            self.log(f"TCP data-plane self-test error: {error}")
+
+    def _probe_ok(self, timeout=8.0):
         """v1.4.2: single lightweight reachability probe (no state changes).
         v1.4.92: default timeout 4s → 6s — Wi-Fi Direct power-save wake takes
         3-8s, and a too-short timeout manufactured false strikes.
+        beta1.0.51: 6s → 8s — the documented wake latency tops out at 8s, so
+        even the old default could still count a normal wake as an outage
+        ("检测杀死好连接"); the probe now covers the full wake window.
         """
         # v1.5.36: probe whichever lane the tunnel is CURRENTLY dialling, at
         # greeting level (the server is genuinely alive — the original
@@ -1950,12 +2442,14 @@ class TunManager:
                 self._connection_healthy = False
                 self.log("Proxy health check failed (1/3); waiting for self-healing...")
             elif fail_count == 2:
+                # beta1.0.51: do NOT stop sharing at two consecutive timeouts.
+                # The field report was exactly this "kill": two probes time out
+                # during a Wi-Fi Direct power-save blip, sharing is torn down,
+                # and the link self-heals moments later ("检测杀死好连接").
+                # Sharing now stops ONLY on a CONFIRMED drop — the strike-3
+                # long-probe gate below; a flapping link keeps its session.
                 self._connection_healthy = False
-                self.log("Proxy health check failed (2/3); stopping sharing")
-                try:
-                    self._notify_tunnel_lost()
-                except Exception as error:
-                    self.log(f"Failed to stop sharing: {error}")
+                self.log("Proxy health check failed (2/3); sharing KEPT while the link may self-heal (no teardown on unconfirmed timeouts)")
             elif fail_count >= 3:
                 self._connection_healthy = False
                 # v1.5.36: log-only egress diagnostic before the long probe —
@@ -1979,7 +2473,7 @@ class TunManager:
                     self._connection_healthy = True
                     continue
                 self.log("Long probe still failed; tunnel confirmed down, restarting...")
-                self._restart_tun2socks()
+                self._restart_engine()
                 return
 
     def _monitor_lane_failover(self):
@@ -2023,13 +2517,15 @@ class TunManager:
                 # a busy phone (heavy pages, file transfer) can stall three
                 # 3s probes in a row and trigger a needless tunnel rebuild
                 # ("frequent disconnect/reconnect" reports). Now 5 strikes,
-                # and before any switch a 6s confirm probe must ALSO fail.
+                # and before any switch an 8s confirm probe must ALSO fail
+                # (beta1.0.51: 6s → 8s to cover the full Wi-Fi Direct wake
+                # window — a 6s confirm still false-fired on slow wakes).
                 if self._lane_a_fail_strikes < 5:
                     self.log(
                         f"Primary :8080 probe timed out ({self._lane_a_fail_strikes}/5); observing..."
                     )
                     continue
-                if self._probe_socks_port(self.phone_port, timeout=6.0):
+                if self._probe_socks_port(self.phone_port, timeout=8.0):
                     self.log(
                         "Primary :8080 confirm probe (6s) passed; the earlier timeouts were transient, no lane switch."
                     )
@@ -2051,7 +2547,7 @@ class TunManager:
                 self._use_lane_b = True
                 self._lane_b_since = time.time()
                 self._lane_a_recover_strikes = 0
-                self._restart_tun2socks()
+                self._restart_engine()
             else:
                 # v1.5.35 (R3): switch-back HYSTERESIS. A single probe
                 # success no longer yanks the tunnel back to A (the field
@@ -2067,7 +2563,7 @@ class TunManager:
                     self._use_lane_b = False
                     self._lane_a_fail_strikes = 0
                     self._lane_a_recover_strikes = 0
-                    self._restart_tun2socks()
+                    self._restart_engine()
                 elif a_ok:
                     self._lane_a_recover_strikes += 1
                     dwell = time.time() - self._lane_b_since
@@ -2080,13 +2576,13 @@ class TunManager:
                         self._use_lane_b = False
                         self._lane_a_fail_strikes = 0
                         self._lane_a_recover_strikes = 0
-                        self._restart_tun2socks()
+                        self._restart_engine()
                 else:
                     self._lane_a_recover_strikes = 0
                     if not b_ok:
                         self.log("Backup channel :8082 probe timed out; awaiting health-check decision.")
 
-    def _restart_tun2socks(self):
+    def _restart_engine(self):
         # v1.4.2: rebuild with up to 3 backoff attempts (3s/6s/10s) instead of
         # giving up after one failure — a transient outage now self-heals and
         # the VPN no longer dies waiting for the user to press Connect again.
@@ -2153,40 +2649,62 @@ class TunManager:
             self.process = None
 
         # v1.4.91: sweep orphans before relaunching. Repeated crash-restarts
-        # can accumulate tun2socks processes that are NOT our current child;
+        # can accumulate engine processes that are NOT our current child;
         # a new instance started while one of those holds the TUN adapter is
         # exactly the "reconnect fails (occupied)" symptom.
-        _kill_tun2socks_all(log_fn=self.log)
+        _kill_engine_procs_all(log_fn=self.log)
 
         self._clean_routes()
         if not self._monitoring_active:
             return
-        # v1.4.4: re-verify (and self-heal from bundled copies if needed) before
-        # every relaunch — "verify before each use", not just at first start.
-        t2s_exe = self._check_dependencies()
-        cmd = tun2socks_cmd(t2s_exe, self._tun2socks_proxy_url())
+        # beta1.0.56: skip _cleanup_stale_tun_adapters() here too — same BSOD
+        # risk as the initial start path (pnputil removes a kernel device that
+        # may still be referenced). Zombies are already killed by the call above
+        # and the adapter is reused by GUID, so never physically remove devices
+        # during a live rebuild.
+        # beta1.0.5: re-verify the lwIP engine and bring it up through the
+        # EngineManager (single Wintun owner).
+        self._check_dependencies()
+        from engine import ENGINE_MANAGER
+        (exe, args, cwd), engine_name, engine_note = ENGINE_MANAGER.build_launch(
+            self._socks_proxy_url()
+        )
+        self.log(f"Engine re-selected: {engine_name}")
+        if engine_note:
+            self.log(f"[engine] {engine_note}")
         cflags = 0x08000000 if IS_WINDOWS else 0
         self.process = subprocess.Popen(
-            cmd, cwd=BIN_DIR, creationflags=cflags,
+            [exe, *args], cwd=cwd, creationflags=cflags,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        self._read_tun2socks_output()
+        self._read_engine_output()
         self.log("Waiting for the adapter to be ready...")
         for _ in range(15):
             if self.process.poll() is not None:
-                raise RuntimeError("tun2socks exited while restarting.")
+                raise RuntimeError("lwIP engine exited while restarting.")
             # v1.3.2: _run_decoded — same GBK fix as the initial start path.
+            # beta1.0.51: match ANY LinkHelm* entry (a drifted connection name
+            # must not read as "adapter missing"), then normalize it below.
             _, out, _ = _run_decoded(
                 ["netsh", "interface", "ipv4", "show", "interfaces"], timeout=15
             )
-            if "LinkHelm" in out:
+            if "linkhelm" in (out or "").lower():
                 break
             time.sleep(1)
         else:
             raise RuntimeError("VPN adapter did not reappear.")
 
+        # beta1.0.51: canonicalize the connection name before config (see the
+        # start path) — otherwise a drifted name silently skips IP/DNS setup.
+        self._tun_conn_name = self._normalize_adapter_connection_name()
+
         # v1.5.41 (P0): idempotent config — reuse what is already correct.
         self._configure_adapter_if_needed()
+        # beta1.0.51: drop stale negative DNS entries from the outage window.
+        try:
+            subprocess.run(["ipconfig", "/flushdns"], capture_output=True, timeout=15)
+        except Exception:
+            pass
         self._add_owned_routes()
         if not self._probe_ok():
             raise RuntimeError("proxy unreachable after tunnel rebuild")
@@ -2327,13 +2845,39 @@ class App:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("LinkHelm Desktop beta1.0.4 | Windows")
+        self.root.title("LinkHelm Desktop beta1.0.56 | Windows")
         self.root.geometry(f"460x{min(770, max(620, root.winfo_screenheight() - 90))}")
         self.root.minsize(420, 590)
         self.root.configure(fg_color=self.BG)
 
         self.tun_mgr = None
+        # beta1.0.52: heal THIS PC first — a crashed/killed previous run (or
+        # any pre-beta1.0.52 build) can leave the automatic default route
+        # 0.0.0.0/0 via 10.0.0.1 behind, which black-holes the whole PC the
+        # moment the engine is not running ("检测时电脑断网"). The app is
+        # elevated, so the sweep can actually run; start() re-adds the tracked
+        # routes when the user connects. Best-effort, never blocks the UI.
+        threading.Thread(target=self._startup_route_sweep, daemon=True).start()
         self.ics_mgr = IcsManager(self.log)
+
+    def _startup_route_sweep(self):
+        """beta1.0.55: heal stale tunnel routes without racing a live session.
+
+        The sweep deletes 0.0.0.0/0, 0.0.0.0/1 and 128.0.0.0/1 when they point
+        at our TUN gateway. Those are exactly the routes start() installs, so if
+        the user connected while this thread was still pending it would delete
+        the tunnel it was meant to protect — one more way to end up with a
+        session that reports "TCP/UDP 不通". Bail out when an engine is up.
+        """
+        try:
+            mgr = self.tun_mgr
+            proc = getattr(mgr, "process", None) if mgr is not None else None
+            if proc is not None and proc.poll() is None:
+                self.log("Startup route sweep skipped: a tunnel is already running.")
+                return
+            _sweep_stale_tunnel_routes(self.log)
+        except Exception:
+            pass  # best effort — never break startup on hygiene
         self._bridge_lock = threading.RLock()
         self._bridge_busy = False
         self._ethernet_choices = {}
@@ -2767,25 +3311,52 @@ class App:
         # probe order; the adapter DNS stays exactly what start() configured.
         primary = getattr(self, "_udp_dns_primary", None)
         pool = ([primary] if primary else []) + [d for d in UDP_CHECK_DNS_POOL if d != primary]
+
+        # beta1.0.51 (P0): the VERDICT now comes from the THROUGH-TUNNEL probe —
+        # the exact path games and the Windows DNS client take (TUN -> lwIP
+        # engine -> phone relay). The direct relay probe below is demoted to a
+        # diagnostic: it used to be the SOLE judge, which is how "UDP OK"
+        # shipped while games failed with network errors and pages died with
+        # ERR_NAME_NOT_RESOLVED (the relay answered one single-port flow; the
+        # tunnel data plane was never exercised).
         failures = []
-        for idx, dns in enumerate(pool):
-            label = tr("last success", "上次成功") if (idx == 0 and primary) else tr("candidate {i}", "候选{i}").format(i=idx + 1)
-            self.log(f"UDP check ({label}): sending DNS query via phone SOCKS5 UDP relay to {dns}:53...")
+        for dns in pool:
+            self.log(f"UDP check (through the tunnel): DNS query to {dns}:53 via TUN → lwIP engine → phone relay...")
+            ok, detail = tunnel_udp_dns_check(dns_ip=dns)
+            if ok:
+                self._udp_dns_primary = dns
+                self.root.after(0, lambda d=dns: self._udp_check_done(True, f"UDP OK via tunnel ({d})"))
+                return
+            failures.append(f"tunnel:{dns} {detail}")
+            self.log(f"Through-tunnel probe via {dns} failed ({detail}); trying the next candidate...")
+
+        # Tunnel data plane failed — diagnose WHICH half is broken so the log
+        # says "phone relay dead" vs "tunnel broken" instead of one vague no.
+        relay_reachable = False
+        for dns in pool:
+            label = tr("last success", "上次成功") if (dns == primary and primary) else tr("candidate {i}", "候选{i}").format(i=pool.index(dns) + 1)
+            self.log(f"UDP relay diagnostic ({label}): direct DNS query via the phone SOCKS5 UDP relay to {dns}:53...")
             ok, detail = socks5_udp_dns_check(
                 ip, port, dns_ip=dns,
                 socks_user=getattr(self, "_socks_user", None) or DEFAULT_PHONE_USER,
                 socks_pass=getattr(self, "_socks_pass", None) or DEFAULT_PHONE_PASS,
             )
             if ok:
-                if not primary and idx > 0:
-                    self.log(f"{dns} probe succeeded; this session's check will prefer it (diagnostics only).")
-                self._udp_dns_primary = dns
-                self.root.after(0, lambda d=dns: self._udp_check_done(True, f"UDP OK ({d})"))
-                return
-            failures.append(f"{dns}: {detail}")
-            self.log(f"{dns} probe failed ({detail}); auto-switching to the next candidate...")
-        combined = "；".join(failures)
-        self.root.after(0, lambda: self._udp_check_done(False, combined))
+                relay_reachable = True
+                failures.append(f"relay:{dns} answers")
+                break
+            failures.append(f"relay:{dns} {detail}")
+            self.log(f"Relay probe via {dns} failed ({detail}); trying the next candidate...")
+
+        if relay_reachable:
+            message = (
+                "；".join(failures)
+                + "；the phone relay itself answers, so the break is INSIDE the tunnel "
+                  "(adapter/routes/engine), not the phone — UDP games will not work"
+            )
+        else:
+            message = "；".join(failures)
+        self.root.after(0, lambda m=message: self._udp_check_done(False, m))
 
     def _udp_check_done(self, ok, detail):
         self.udp_button.configure(state="normal", text=tr("Check UDP Connectivity", "检测 UDP 连通性"))
@@ -2865,26 +3436,35 @@ class App:
             self._gui_log_pending = getattr(self, "_gui_log_pending", 0) + 1
 
             def _log():
-                self._gui_log_pending = max(0, getattr(self, "_gui_log_pending", 1) - 1)
-                tag = None
-                if msg.startswith(("✗", "Error", "错误", "失败")):
-                    tag = "error"
-                elif msg.startswith("✓"):
-                    tag = "success"
+                # beta1.0.55: this body runs on the Tk main loop, so anything
+                # it raises escapes log()'s own try/except and surfaces as
+                # "Exception in Tkinter callback" — the classic teardown noise
+                # when a worker thread logs one last line after the window is
+                # already destroyed (log_text is gone → TclError). Degrade to
+                # the console instead of raising inside a Tk callback.
+                try:
+                    self._gui_log_pending = max(0, getattr(self, "_gui_log_pending", 1) - 1)
+                    tag = None
+                    if msg.startswith(("✗", "Error", "错误", "失败")):
+                        tag = "error"
+                    elif msg.startswith("✓"):
+                        tag = "success"
 
-                self.log_text.configure(state="normal")
-                self.log_text.insert("end", f"[{stamp}] {msg}\n", tag)
-                self.log_text.see("end")
-                # v1.5.0 (P0): bounded log widget; v1.5.4: tightened to a
-                # 200-line ring (prune at 220 down to 200). Long tray sessions
-                # no longer grow the Text past the ring — the old 1600/400
-                # batching let the widget reach 1600 lines, which scrolled
-                # noticeably on slow machines.
-                self._log_count = getattr(self, "_log_count", 0) + 1
-                if self._log_count >= 220:
-                    self.log_text.delete("1.0", "end-200lines")
-                    self._log_count -= 200
-                self.log_text.configure(state="disabled")
+                    self.log_text.configure(state="normal")
+                    self.log_text.insert("end", f"[{stamp}] {msg}\n", tag)
+                    self.log_text.see("end")
+                    # v1.5.0 (P0): bounded log widget; v1.5.4: tightened to a
+                    # 200-line ring (prune at 220 down to 200). Long tray sessions
+                    # no longer grow the Text past the ring — the old 1600/400
+                    # batching let the widget reach 1600 lines, which scrolled
+                    # noticeably on slow machines.
+                    self._log_count = getattr(self, "_log_count", 0) + 1
+                    if self._log_count >= 220:
+                        self.log_text.delete("1.0", "end-200lines")
+                        self._log_count -= 200
+                    self.log_text.configure(state="disabled")
+                except Exception:
+                    print(f"[{stamp}] {msg}")
 
             self.root.after(0, _log)
         except:
@@ -3526,7 +4106,7 @@ class App:
                     self.log("SOCKS5 account manually edited (8-13 alphanumeric); applied immediately.")
                 self.root.after(0, apply)
                 # Live apply: if a tunnel is up, swap the credentials it dials
-                # with and rebuild it (tun2socks reads the URL only at launch).
+                # with and rebuild it (the engine reads the URL only at launch).
                 if error is None and self.tun_mgr is not None:
                     self.tun_mgr.socks_user = u
                     self.tun_mgr.socks_pass = p
@@ -3537,7 +4117,7 @@ class App:
                             self.root.after(0, lambda: self.log(
                                 tr("Detected an active connection; rebuilding the tunnel with the new account...", "检测到连接运行中，正在用新账户重建隧道...")
                             ))
-                            self.tun_mgr._restart_tun2socks()
+                            self.tun_mgr._restart_engine()
                     except Exception as live_error:
                         self.log("Live apply failed (" + str(live_error) + "); the new account will be used at the next connection.")
             threading.Thread(target=worker, daemon=True).start()
@@ -3644,11 +4224,11 @@ class App:
             try:
                 result["approved"] = messagebox.askyesno(
                     tr("Download dependencies", "下载依赖"),
-                    tr("The built-in tun2socks/Wintun components were not found.\n\n",
-                       "未找到内置的 tun2socks/Wintun 组件。\n\n")
-                    + tr(f"A locked build of tun2socks/Wintun (tun2socks v{TUN2SOCKS_VERSION}, "
+                    tr("The built-in lwIP (hev-socks5-tunnel) / Wintun components were not found.\n\n",
+                       "未找到内置的 lwIP（hev-socks5-tunnel）/ Wintun 组件。\n\n")
+                    + tr(f"A locked build of lwIP (hev-socks5-tunnel v{LWIP_ENGINE_VERSION}, "
                          f"Wintun v{WINTUN_VERSION}) can be downloaded via the phone proxy. ",
-                         f"可通过手机代理下载锁定版本（tun2socks v{TUN2SOCKS_VERSION}，"
+                         f"可通过手机代理下载锁定版本（hev-socks5-tunnel v{LWIP_ENGINE_VERSION}，"
                          f"Wintun v{WINTUN_VERSION}），")
                     + tr("Every file is SHA-256 verified before use.\n\n",
                          "），每个文件使用前均经 SHA-256 校验。\n\n")
@@ -3772,6 +4352,22 @@ def main(startup_hidden=False):
     root = ctk.CTk()
     app = App(root)
 
+    # beta1.0.55: Tk prints a raw traceback to stderr when a callback raises —
+    # invisible in a --windowed build — and aborts whatever that callback still
+    # had to do (status colour, progress spinner, follow-up scheduling). Route
+    # it into the app log so a report is actionable and keep the UI alive.
+    def _tk_report_exception(exc, val, tb):
+        try:
+            app.log(f"UI: {exc.__name__}: {val}")
+        except Exception:
+            pass
+        try:
+            traceback.print_exception(exc, val, tb)
+        except Exception:
+            pass
+
+    root.report_callback_exception = _tk_report_exception
+
     # v1.4.93: tray residency. Design per the 1.4.92 report:
     # - the window is only a control surface; hiding it NEVER touches the
     #   tunnel ("minimizing is not disconnecting");
@@ -3865,7 +4461,7 @@ def main(startup_hidden=False):
         # v1.4.63/91: TRUE exit — the VPN must never outlive the window; the
         # client itself force-exits after destroy so no half-alive teardown
         # state lingers.
-        _kill_tun2socks_all()
+        _kill_engine_procs_all()
         root.destroy()
         os._exit(0)
 

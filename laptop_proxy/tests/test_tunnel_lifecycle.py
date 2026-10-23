@@ -11,7 +11,10 @@ main = importlib.import_module("main")
 
 
 def test_health_monitor_three_strikes_then_restart(monkeypatch):
-    """v1.4.2: strike 1 waits, strike 2 stops sharing, strike 3 rebuilds tunnel."""
+    """beta1.0.51: strike 1-2 keep sharing alive (unconfirmed timeouts only),
+    strike 3 must pass a final 10s long-probe gate before the tunnel rebuild.
+    on_tunnel_lost is NO LONGER fired by the monitor at strike 2 — the old
+    behaviour was the reported "检测杀死好连接" kill."""
     events = []
     tunnel = main.TunManager("192.168.49.1", 8080, 8081, lambda m: events.append(m),
                              on_tunnel_lost=lambda: events.append("lost"))
@@ -22,6 +25,9 @@ def test_health_monitor_three_strikes_then_restart(monkeypatch):
         return False
 
     monkeypatch.setattr(tunnel, "_probe_ok", disconnected)
+    # strike-3 egress diagnostic is log-only and must never touch the network
+    monkeypatch.setattr(tunnel, "_socks_relay_diag", lambda _port, **_k: "diag skipped",
+                        raising=True)
 
     restart_calls = []
 
@@ -29,14 +35,15 @@ def test_health_monitor_three_strikes_then_restart(monkeypatch):
         restart_calls.append(True)
         tunnel._monitoring_active = False
 
-    monkeypatch.setattr(tunnel, "_restart_tun2socks", fake_restart)
+    monkeypatch.setattr(tunnel, "_restart_engine", fake_restart)
     monkeypatch.setattr(main.time, "sleep", lambda _d: None)
     tunnel._monitor_health()
 
     joined = "\n".join(events)
     assert "1/3" in joined and "2/3" in joined
-    assert events.count("lost") == 1          # sharing stopped exactly once (strike 2)
-    assert restart_calls == [True]            # tunnel rebuilt only at strike 3
+    assert "sharing KEPT" in joined           # strike 2: sharing explicitly KEPT
+    assert "lost" not in events               # no teardown on unconfirmed strikes
+    assert restart_calls == [True]            # tunnel rebuilt only after strike-3 long-probe gate
     assert not tunnel._connection_healthy
 
 

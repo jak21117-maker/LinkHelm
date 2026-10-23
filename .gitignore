@@ -43,3 +43,7 @@ structure.txt
 laptop_proxy/dist*/
 laptop_proxy/build*/
 laptop_proxy/ft_paired.json
+
+# Local build/delivery artifacts (never published to GitHub)
+deliver_beta105/
+VERIFICATION_REPORT.md

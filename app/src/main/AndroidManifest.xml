@@ -2,6 +2,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- beta1.0.5: the hev-socks5-tunnel AAR declares minSdk 29 (conservative
+         upstream default). Its Java facade (hev.htproxy.TProxyService) is a
+         pure JNI wrapper with NO android.* API usage, so overriding is safe
+         and keeps this app's minSdk 24 (Android 7.0+) support. -->
+    <uses-sdk tools:overrideLibrary="hev.socks5.tunnel" />
+
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
@@ -44,7 +50,14 @@
             android:name=".HostWatchdogReceiver"
             android:exported="false" />
 
-        <!-- NEW: tun2socks VPN Service -->
+        <!-- beta1.0.54: keepalive stays deliberately small — the alarm
+             watchdog + START_STICKY only. A boot/package-replaced receiver was
+             tried in beta1.0.53 and had to be removed: it fired during APK
+             install, started the service before Wi-Fi P2P was ready and ran
+             removeGroup() without a following createGroup(), so the group was
+             deleted and never rebuilt ("连不上，删除后没创建出新的"). -->
+
+        <!-- lwIP (hev-socks5-tunnel) VPN Service -->
         <service
             android:name=".MyVpnServiceTun2Socks"
             android:permission="android.permission.BIND_VPN_SERVICE"
@@ -57,7 +70,7 @@
             </intent-filter>
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="VPN proxy using tun2socks" />
+                android:value="VPN proxy using lwIP (hev-socks5-tunnel)" />
         </service>
 
         <!-- v1.3.3 audit: removed the disabled "optional backup" MyVpnServiceOptimized

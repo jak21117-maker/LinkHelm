@@ -56,7 +56,7 @@ The result: a phone's connection becomes a normal Wi-Fi/Ethernet network that an
 
 ### Windows (LinkHelm Desktop)
 - Windows 10/11 (64-bit). Works without admin for normal use; it requests elevation only when it must configure sharing/routes.
-- The bundled `tun2socks` + `Wintun` components are included; nothing is downloaded at runtime.
+- The bundled lwIP engine (`hev-socks5-tunnel` + `Wintun`) is included; nothing is downloaded at runtime.
 - To share: either a Wi-Fi adapter that supports Mobile Hotspot, **or** a wired Ethernet adapter.
 
 ### Android (LinkHelm Host)
@@ -101,7 +101,7 @@ See [`docs/MANUAL.md`](docs/MANUAL.md) for a concise walkthrough.
 
 - **Local only.** The SOCKS5 endpoint is bound to the Wi-Fi Direct link between your phone and your PC. It is not reachable from the internet.
 - **Fixed but editable credentials.** The initial username/password are identical on both ends and never randomized. Change them in Settings if you share the network with others.
-- **Verified binaries.** The bundled `tun2socks`/`Wintun` are SHA-256 checked against pinned values before use.
+- **Verified binaries.** The bundled `hev-socks5-tunnel`/`Wintun` engine files are SHA-256 checked against pinned values before use.
 - **ICS diagnostics are read-only.** The Windows diagnostics never modify sharing configuration.
 
 ---
@@ -169,7 +169,7 @@ LinkHelm is a derivative work based on the open-source project **Hotspot-Bypass-
 
 LinkHelm keeps the original idea — sharing a phone's connection locally over Wi-Fi Direct through a SOCKS5 proxy — but has been substantially rewritten and extended. Compared with the original, the main improvements are:
 
-- **tun2socks upgraded to 2.7.0** — the bundled core proxy is a much newer, more stable release.
+- **Unified lwIP engine on both ends** — the legacy tun2socks core is fully replaced by the native lwIP stack engine (HevSocks5Tunnel 2.19.1): one kernel handles TCP/UDP/DNS on both Android and Windows, with pinned, SHA-256-verified binaries and no runtime download or fallback paths.
 - **Stronger TCP and UDP connection stability** — more robust connection lifecycle, idle keep-alive, and retransmission handling, especially under gaming / UDP-heavy workloads.
 - **Multiple DNS fallbacks** — several DNS servers are tried in sequence so name resolution survives when one is unreachable.
 - **SOCKS5 credential authentication (RFC 1929)** — the host enforces username/password auth, so there is no open, unauthenticated port.

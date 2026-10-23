@@ -27,9 +27,9 @@ a = Analysis(
     pathex=[],
     # Patch B: ship build-time-verified tun2socks/Wintun binaries with the onedir
     # package so a normal install never downloads anything at runtime.
+    # beta1.0.5: tun2socks 已彻底移除，仅打包 lwIP 原生引擎（engine/ 下的
+    # hev-socks5-tunnel.exe + wintun.dll + msys-2.0.dll）。
     binaries=[
-        ('bundled_bin/tun2socks.exe', 'bin'),
-        ('bundled_bin/wintun.dll', 'bin'),
         *_lwip_binaries,
     ],
     datas=datas,

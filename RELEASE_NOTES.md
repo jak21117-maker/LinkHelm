@@ -1,104 +1,60 @@
-## LinkHelm beta1.0.4
+# LinkHelm beta1.0.56
 
-底层与架构迁移（研发测试构建，非性能承诺版）。
+Windows 与 Android 双端统一版本号 beta1.0.56（Android versionCode 45）。
+本版完成双端数据面架构统一，连接体验、会话容量、速率与稳定性全面升级。
+研发测试构建。
 
-### Windows 端：换用原生 C/C++ 引擎（lwIP）
-- 数据面主体改为 **C/C++ 原生引擎**（基于 HevSocks5Tunnel，内含 lwIP + Wintun），
-  Python 仅做 GUI 与编排（拉起进程、生成配置、管理 Wintun 互斥、清理），
-  **不再用纯 Python 处理隧道**，从根上解决旧版纯 Python 核心不稳的问题。
-- 新增 `EngineManager`：同一时刻只允许一个引擎持有 Wintun，禁止新旧双内核抢包；
-  默认引擎 = **lwIP**，tun2socks v2.7.0 仅作为**备份二进制**保留在包内，
-  原生 lwIP 二进制缺失时自动回退（两者永不同时在线，不会打架）。
-- 通过 `ci/build-lwip.ps1`（MSYS2/MinGW）按固定提交编译 `hev-socks5-tunnel.exe`，
-  产物落到 `laptop_proxy/engine/`，依赖提交号与 SHA-256 记入 `DEPENDENCY_LOCK.md`。
-- 环境变量 `LINKHELM_ENGINE=legacy` 可强制走备份（仅排障）。
+## 架构更新：双端统一 lwIP 内核（HevSocks5Tunnel 2.19.1）
 
-### 安卓端：出站探测收敛
-- 新增 `UpstreamNetworkManager`：把原先分散的 **TCP 预检 + 每 10s SOCKS5 问候保活 +
-  UDP/DNS 中继自测** 三路各自开连接、互相抢链路的"三握手"收敛为**单次统一握手**，
-  深度探测改为**任一候选成功即过**（不再要求三链全过），显著降低活动连接与会话数，
-  缓解并发高负载下手机会话数触及上限、数台设备挤爆的问题。
-- 修复配对地址 `IP:端口` 被双重拼接为 `IP:端口:端口` 导致连接失败的 bug（现自动归一化）。
+- Windows 与 Android 的数据面统一为同一原生 lwIP 内核：TCP / UDP / DNS
+  全部由 lwIP 的 PCB 栈在单一内核内处理，消除旧架构多链路并存的额外开销。
+- 引擎三件套随包分发（`hev-socks5-tunnel.exe` + `wintun.dll` +
+  `msys-2.0.dll`），启动前按固化 SHA-256 校验，运行时零下载、零回退，
+  行为完全可复现。
+- Windows 侧保持轻量 Python GUI 与编排（PyInstaller 打包），数据面全部
+  下沉到原生引擎。
 
-### 说明
-- 本版为底层迁移验证构建；以相同 Android Host、同网络、同负载做新旧内核对照，
-  达标后再设为默认。原 tun2socks 备份不删除，必要时可回退。
+## 体验提升
 
-## LinkHelm beta1.0.3
+- 虚拟网卡 **LinkHelm-IwIP** 采用固定 GUID：Wintun 按 GUID 直接重开同一
+  适配器，再次连接秒级就绪，不再累积 "LinkHelm-IwIP 2/3/4" 冗余网卡。
+- 单实例互斥 + 托盘"退出并清理网络"；开机自启、静默启动后自动连接，
+  手机代理一出现即完成拨号。
+- 中英文双语界面即时切换；SOCKS5 账号修改即时生效，隧道在线重建。
 
-Three iterations of capacity engineering since beta1.0.0, capped by a  
-field-measured recalibration of the whole session architecture and a  
-security-hardened file-transfer channel.
+## 会话数量与并发
 
-### Connection architecture evolution
+- 安卓侧把原先分散的三路握手（TCP 预检 / SOCKS5 保活 / UDP 自测）收敛为
+  **单次统一握手**，深度探测改为任一候选成功即过，活动连接与会话数
+  大幅下降，多设备并发更从容。
+- 按客户端的会话配额与队列统一管理，多设备同时共享互不挤占。
 
-- **Adaptive session profiles** (introduced beta1.0.1, retuned through  
-  beta1.0.3): NORMAL / TURBO modes now govern TCP sessions, UDP associations,  
-  per-device quotas and queues as one coordinated set, switchable live with  
-  no share restart.
-- **Field-calibrated capacity** (beta1.0.3, measured TCP:UDP ≈ 3:1): NORMAL  
-  carries 320 global TCP sessions / 160 per device; TURBO carries 700 global  
-  sessions for multi-device hosts (e.g. 5 devices × ~140 ≈ 700).
-- **Dynamic per-device quota in TURBO**: 120-170 new-session allowance,  
-  stepped ±10 every 30 s from measured utilization — deliberately slow, never  
-  random jitter, so devices never see flapping ceilings.
-- **Fair sharing**: with 3+ devices the per-device quota becomes a fair share  
-  of the global budget, floored at 100 under crowding (6-7 devices settle  
-  around 100).
-- **Per-device UDP follows the 3:1 rule**: a device's UDP ceiling is 1/3 of  
-  its live TCP quota, tightening automatically under pressure (a PC game  
-  holds 30-50 UDP endpoints, a phone/tablet game 20-30).
-- **PROTECT / RECOVER**: sessions ≥95% of the cap for 15 s engage extreme-  
-  pressure protection (new admission 100; established sessions untouched);  
-  ≤80% for 120 s restores normal admission.
-- **UDP lifecycle management** (beta1.0.1): UDP associations carry their own  
-  admission budget, and idle associations are reclaimed (300 s standard /  
-  600 s turbo) instead of holding relay sockets forever.
-- **TCP idle reclaim** (beta1.0.3): established-but-idle sessions retire  
-  after 3 h (6 h in turbo); every real send/receive refreshes the timer.
-- **Compatibility micro-kernel** (beta1.0.3): third-party client support  
-  (Karing/Streisand) keeps only the relaxed UDP source-endpoint tracking it  
-  actually needs, with zero capacity trade-off.
-- **Link monitoring** (beta1.0.2): lane failover uses strike accumulation  
-  plus a 6-second confirm probe before switching, and the Android watchdog  
-  self-heals on a 5-minute cadence.
+## 速率与延时
 
-### File transfer with IP pairing (new since beta1.0.0)
+- lwIP 单栈处理显著减少内核态 / 用户态往返，转发路径更短，**延时更低**。
+- 链路参数按手机 Wi-Fi Direct 场景整体调优（连接窗口、保活周期、
+  重传节奏），弱信号下吞吐更平稳。
 
-- Peer-to-peer file transfer between the phone and the PC over the Wi-Fi  
-  Direct link — no internet, no cloud. Single files up to 1 GB, streamed  
-  with SHA-256 integrity verification on both ends; entries live on the home  
-  screen of both apps.
-- **Mutual IP pairing** (beta1.0.3): transfers are only possible between  
-  paired devices — both sides see the other's actual address, tap Pair, and  
-  the pairing persists on each end.
-- **Actual local IP display** (beta1.0.3): both UIs show the device's real  
-  Wi-Fi Direct address (dynamic — it changes when the group is rebuilt).
-- The desktop dialog gained a peer-IP field with a Pair button; sending is  
-  disabled until paired, and refusals state the specific reason (pairing,  
-  credentials, busy).
+## 稳定性
 
-### Diagnostics
+- 引擎以前台直接子进程运行，配合进程守护与自动重建，长时运行更稳。
+- 过期隧道路由自动清扫、NCSI 探测状态随断开自动还原，网络环境始终干净。
+- 手机端看门狗兜底，共享意外中断后自动拉起。
 
-- The desktop log annotates tunnel failures with the corresponding cause  
-  (host-side admission, credentials, link state) and translates SOCKS5 reply  
-  codes into their RFC 1928 meanings — no more bare "rejected" lines.
+## 打包
 
-### UI & platform polish
+- Windows zip 只含应用目录（`LinkHelm_Desktop/`）；Android APK 仅打包
+  arm64-v8a，体积更小。
+- 引擎二进制来源与 SHA-256 见 `DEPENDENCY_LOCK.md`（官方 GitHub release /
+  wintun.net，哈希固化）。
 
-- SOCKS5 password fields gained show/hide toggles on both platforms  
-  (beta1.0.1).
-- Home footers updated to MIT-consistent wording with a repository link  
-  (beta1.0.1).
-- Turbo mode copy simplified, with a recommendation hint once 3+ devices are  
-  connected; the iPhone entry became "iOS proxy-free networking (no app)"  
-  with an HTTP-usage note; settings panel hardened for customtkinter 5.2.2  
-  (beta1.0.2/1.0.3).
+## 验证
 
-### Packaging
+- Windows：pytest 单测 102 passed（引擎启动、隧道生命周期、UDP/DNS 池、
+  单实例、二进制完整性等）。
+- Android：单元 + 集成测试通过（客户端名册、代理服务器、UDP 探针）。
 
-- Windows build ships pinned tun2socks v2.7.0 and Wintun 0.14.1 binaries.
-- Source archive slimmed to ~36 MB by excluding build artifacts.
+---
 
-Binaries: signed Android APK (versionCode 37) + Windows win64 zip.  
-SHA256SUMS.txt included.
+Binaries: signed Android APK (versionCode 45) + Windows win64 zip, both built
+and published by GitHub Actions from this tag.

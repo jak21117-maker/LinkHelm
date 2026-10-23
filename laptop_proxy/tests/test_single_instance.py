@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""v1.4.63 — reconnect TAKES OVER + TRUE exit (VPN never outlives the app).
+"""beta1.0.5 — reconnect TAKES OVER + TRUE exit (VPN never outlives the app).
 
 Semantics under test:
-- _kill_tun2socks_all force-kills every tun2socks process (taskkill /T /F by
-  image name + Stop-Process fallback) and reports the names it saw;
+- _kill_engine_procs_all force-kills every hev-socks5-tunnel process
+  (taskkill /T /F by image name + Stop-Process fallback) and reports the
+  names it saw;
 - TunManager.start() kills leftover processes and proceeds (v1.4.62 refused —
   users read that as "reconnect does nothing"); it only raises when the kill
   itself fails;
@@ -15,6 +16,7 @@ Semantics under test:
 """
 import pytest
 
+import engine
 import main
 
 
@@ -39,7 +41,7 @@ def test_cleanup_sweeps_devices_netcfg_connections_and_profiles(monkeypatch):
     cmd, timeout = captured[0]
     assert cmd[:3] == ["powershell", "-NoProfile", "-Command"]
     ps = cmd[3]
-    # devices: pnputil removal for LinkHelm* Wintun adapters
+    # devices: pnputil removal for legacy LinkHelm* Wintun adapters
     assert "Get-PnpDevice -FriendlyName 'LinkHelm*'" in ps
     assert "pnputil /remove-device" in ps
     # v1.4.63: NetCfg connection hive — the actual numbering source
@@ -49,14 +51,14 @@ def test_cleanup_sweeps_devices_netcfg_connections_and_profiles(monkeypatch):
     assert "Network\\Profiles" in ps
     assert "Remove-Item" in ps
     assert timeout == 60
-    assert any("Cleaned up historical leftover virtual NICs" in m for m in logs)
-    # v1.5.42: the FIXED-GUID identity must survive the sweep — registry
-    # churn ("注册表在涨") came from deleting our own device/NetCfg key on
-    # every start and letting tun2socks recreate it.
-    ours = main.TUN_ADAPTER_GUID.strip("{}").upper()
-    assert ours in ps
-    assert "$_.InstanceId -notlike '*" + ours + "*'" in ps
-    assert "$_.PSChildName -ne '" + ours + "'" in ps
+    assert any("Cleaned up legacy leftover virtual NICs" in m for m in logs)
+    # beta1.0.5: the CURRENT adapter must survive the sweep — the distinct
+    # name (LinkHelm-IwIP, fixed GUID) is what makes "先清旧 → 建新 → 复用"
+    # possible: the sweep only ever matches the OLD LinkHelm*/LaptopProxyVPN*
+    # patterns and explicitly excludes the live adapter in all three layers.
+    assert engine.ADAPTER_NAME == "LinkHelm-IwIP"
+    assert ps.count("-ne 'LinkHelm-IwIP'") == 3   # PnP + NetCfg + NLA layers
+    assert "$_.FriendlyName -ne 'LinkHelm-IwIP'" in ps
 
 
 def test_cleanup_survives_tool_failure(monkeypatch):
@@ -66,62 +68,62 @@ def test_cleanup_survives_tool_failure(monkeypatch):
     main._cleanup_stale_tun_adapters(lambda _m: None)  # must not raise
 
 
-# ------------------------------------------------ foreign tun2socks probe
+# ------------------------------------------------ foreign engine probe
 
-def test_foreign_tun2socks_reports_running_processes(monkeypatch):
+def test_foreign_engine_reports_running_processes(monkeypatch):
     def fake_run_decoded(cmd, timeout=0):
-        return 0, "tun2socks-windows-amd64\n", ""
+        return 0, "hev-socks5-tunnel\n", ""
     monkeypatch.setattr(main, "_run_decoded", fake_run_decoded)
-    assert main._find_foreign_tun2socks() == ("tun2socks-windows-amd64",)
+    assert main._find_foreign_engine_procs() == ("hev-socks5-tunnel",)
 
 
-def test_foreign_tun2socks_empty_when_none(monkeypatch):
+def test_foreign_engine_empty_when_none(monkeypatch):
     def fake_run_decoded(cmd, timeout=0):
         return 0, "", ""
     monkeypatch.setattr(main, "_run_decoded", fake_run_decoded)
-    assert main._find_foreign_tun2socks() == ()
+    assert main._find_foreign_engine_procs() == ()
 
 
-def test_foreign_tun2socks_degrades_to_empty_on_error(monkeypatch):
+def test_foreign_engine_degrades_to_empty_on_error(monkeypatch):
     def boom(cmd, timeout=0):
         raise OSError("no powershell")
     monkeypatch.setattr(main, "_run_decoded", boom)
-    assert main._find_foreign_tun2socks() == ()
+    assert main._find_foreign_engine_procs() == ()
 
 
 # --------------------------------------------------- take-over kill path
 
-def test_kill_tun2socks_all_uses_taskkill_tree_and_reports(monkeypatch):
+def test_kill_engine_procs_all_uses_taskkill_tree_and_reports(monkeypatch):
     # first probe (pre-kill) sees a process, the post-kill verify sees none
     calls = {"n": 0}
 
     def probe():
         calls["n"] += 1
-        return ("tun2socks-windows-amd64",) if calls["n"] == 1 else ()
+        return ("hev-socks5-tunnel",) if calls["n"] == 1 else ()
 
-    monkeypatch.setattr(main, "_find_foreign_tun2socks", probe)
+    monkeypatch.setattr(main, "_find_foreign_engine_procs", probe)
     runs = []
     monkeypatch.setattr(
         main.subprocess, "run",
         lambda cmd, **k: runs.append(list(cmd)),
     )
     logs = []
-    killed = main._kill_tun2socks_all(log_fn=logs.append)
-    assert killed == ("tun2socks-windows-amd64",)
+    killed = main._kill_engine_procs_all(log_fn=logs.append)
+    assert killed == ("hev-socks5-tunnel",)
     # taskkill /T /F by image name (tree kill) must be attempted
     assert any(
         cmd[0] == "taskkill" and "/T" in cmd and "/IM" in cmd for cmd in runs
     )
-    assert any("All leftover connection processes have been ended" in m for m in logs)
+    assert any("All leftover engine processes have been ended" in m for m in logs)
 
 
-def test_kill_tun2socks_all_noop_when_none(monkeypatch):
-    monkeypatch.setattr(main, "_find_foreign_tun2socks", lambda: ())
+def test_kill_engine_procs_all_noop_when_none(monkeypatch):
+    monkeypatch.setattr(main, "_find_foreign_engine_procs", lambda: ())
     runs = []
     monkeypatch.setattr(
         main.subprocess, "run", lambda cmd, **k: runs.append(list(cmd)),
     )
-    assert main._kill_tun2socks_all() == ()
+    assert main._kill_engine_procs_all() == ()
     assert runs == []
 
 
@@ -137,10 +139,10 @@ def _make_mgr():
 
 def test_start_kills_stray_and_proceeds(monkeypatch):
     mgr = _make_mgr()
-    monkeypatch.setattr(main, "_find_foreign_tun2socks", lambda: ())
+    monkeypatch.setattr(main, "_find_foreign_engine_procs", lambda: ())
     killed = []
     monkeypatch.setattr(
-        main, "_kill_tun2socks_all", lambda log_fn=None: killed.append(1) or (),
+        main, "_kill_engine_procs_all", lambda log_fn=None: killed.append(1) or (),
     )
     monkeypatch.setattr(
         main, "check_socks5_with_retry", lambda *a, **k: "SOCKS5_OK",
@@ -157,15 +159,19 @@ def test_start_kills_stray_and_proceeds(monkeypatch):
     with pytest.raises(RuntimeError, match="STOP-HERE"):
         mgr.start()
     assert killed == [1]        # take-over kill always attempted
-    assert cleanup_done == [1]  # normal flow reached afterwards
+    # beta1.0.56: the tun-adapter cleanup is no longer auto-invoked from
+    # start() — its `pnputil /remove-device` physically removes a kernel PnP
+    # device and bluescreens when an orphaned adapter is still referenced. It is
+    # now a manual-only hygiene tool, so the normal flow must NOT call it.
+    assert cleanup_done == []  # tun-adapter cleanup is manual-only now
 
 
 def test_start_raises_only_when_kill_fails(monkeypatch):
     mgr = _make_mgr()
     monkeypatch.setattr(
-        main, "_find_foreign_tun2socks", lambda: ("tun2socks-windows-amd64",),
+        main, "_find_foreign_engine_procs", lambda: ("hev-socks5-tunnel",),
     )
-    monkeypatch.setattr(main, "_kill_tun2socks_all", lambda log_fn=None: ())
+    monkeypatch.setattr(main, "_kill_engine_procs_all", lambda log_fn=None: ())
     monkeypatch.setattr(
         main, "check_socks5_with_retry",
         lambda *a, **k: pytest.fail("precheck must not run after failed kill"),

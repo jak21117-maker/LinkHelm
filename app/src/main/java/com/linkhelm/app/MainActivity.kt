@@ -968,8 +968,8 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                                 }
                             }
                             // beta1.0.3: with 3+ downstream devices (host excluded),
-                            // nudge the user toward turbo mode — its 700-session
-                            // budget is what multi-device hosts need.
+                            // nudge the user toward turbo mode — its 1400-session
+                            // shared budget is what multi-device hosts need.
                             if (realDeviceCount >= 3 && !turboOn) {
                                 Spacer(modifier = Modifier.height(2.dp))
                                 Text(
@@ -981,47 +981,25 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
                                     color = Color(0xFFE65100)
                                 )
                             }
-                            // beta1.0.3: compatibility MICRO-KERNEL. The old
-                            // "compat mode" also shrank the session caps, which
-                            // made almost no difference in practice — now it only
-                            // keeps the core UDP endpoint relaxation that
-                            // Karing/Streisand need, with no capacity trade-off.
-                            val ctxForCompat = LocalContext.current
-                            var compatOn by remember {
-                                mutableStateOf(
-                                    ctxForCompat.getSharedPreferences("linkhelm_prefs", Context.MODE_PRIVATE)
-                                        .getBoolean("socks_compat_mode", false)
-                                )
-                            }
+                            // beta1.0.51: the old "compatibility micro-kernel"
+                            // toggle is RETIRED — multi-port UDP source tracking
+                            // and per-target precise replies are now ALWAYS ON.
+                            // They used to sit behind this switch, which nobody
+                            // ever enabled, so socket-rotating clients
+                            // (Karing/Streisand pools, power-saving rebuilds)
+                            // silently lost UDP ("check OK, game gets nothing").
                             Spacer(modifier = Modifier.height(6.dp))
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        L10n.tr("Compatibility micro-kernel (Karing/Streisand)", "兼容微内核（Karing/Streisand）"),
+                                        L10n.tr("UDP multi-port compatibility: always on", "UDP 多源端口兼容：默认开启"),
                                         fontWeight = FontWeight.Bold,
                                         color = MaterialTheme.colorScheme.onSurface
                                     )
                                     Text(
-                                        if (compatOn)
-                                            L10n.tr("On: UDP sessions from changing source ports are returned per target (core compatibility; no capacity cost)", "已开启：UDP 多源端口会话按目标精确回发（核心兼容功能，不影响会话容量）")
-                                        else
-                                            L10n.tr("Enable when clients such as Karing/Streisand have working TCP but UDP fails or drops packets; takes effect immediately", "Karing/Streisand 等客户端 TCP 正常但 UDP 不通/丢包时开启；立即生效"),
+                                        L10n.tr("Source-port rotation from clients such as Karing/Streisand is tracked per target and answered precisely — no switch needed", "Karing/Streisand 等客户端的多源端口轮换按目标精确跟踪回发，无需手动开关"),
                                         fontSize = 11.sp,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                                TextButton(onClick = {
-                                    val next = !compatOn
-                                    compatOn = next
-                                    ctxForCompat.getSharedPreferences("linkhelm_prefs", Context.MODE_PRIVATE)
-                                        .edit().putBoolean("socks_compat_mode", next).apply()
-                                    HostService.applySocksCompatLive(next)
-                                }) {
-                                    Text(
-                                        if (compatOn) L10n.tr("Off (immediate)", "关闭（立即生效）") else L10n.tr("Enable", "开启"),
-                                        fontSize = 12.sp,
-                                        color = if (compatOn) MaterialTheme.colorScheme.primary
-                                        else Color(0xFFE65100)
                                     )
                                 }
                             }
@@ -1644,6 +1622,29 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
             }
             isHostRunning.value = true
             logState.add(L10n.tr("Starting sharing service...", "正在启动分享服务..."))
+            // beta1.0.53: tell the user which keep-alive channels are armed and
+            // warn about the one thing we cannot fix from inside the app — an
+            // OEM that put us in the restricted standby bucket.
+            logState.add(
+                L10n.tr(
+                    "Keep-alive armed: 2-min watchdog + JobScheduler + boot restore",
+                    "保活已启用：2 分钟看门狗 + JobScheduler + 开机恢复"
+                )
+            )
+            if (isBackgroundRestricted()) {
+                logState.add(
+                    L10n.tr(
+                        "Warning: background activity is restricted for LinkHelm. Open App info -> Battery and choose Unrestricted, or the system may still kill sharing.",
+                        "警告：LinkHelm 的后台活动被限制。请在「应用信息 → 电池」中选择「无限制」，否则系统仍可能杀掉分享。"
+                    )
+                )
+            }
+            logState.add(
+                L10n.tr(
+                    "Tip: lock LinkHelm in the recent-apps screen so aggressive battery savers cannot reap it.",
+                    "提示：在最近任务列表里锁定 LinkHelm，避免被激进省电策略清理。"
+                )
+            )
             saveServiceState(hostRunning = true)
         }
     }
@@ -1764,6 +1765,19 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
             return false
         }
         return true
+    }
+
+    /**
+     * beta1.0.53: "background restricted" = the user (or the OEM) switched the
+     * app to the restricted standby bucket in App info -> Battery. Granting
+     * "allow background activity" is NOT the same setting, and it is the most
+     * common reason sharing still dies on Android 12+ even though every
+     * permission looks granted.
+     */
+    private fun isBackgroundRestricted(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false
+        val am = getSystemService(android.app.ActivityManager::class.java) ?: return false
+        return runCatching { am.isBackgroundRestricted }.getOrDefault(false)
     }
 
     private fun isIgnoringBatteryOptimizations(): Boolean {

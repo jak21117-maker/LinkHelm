@@ -119,11 +119,15 @@ class UdpProbeIntegrationTest {
 
     private fun startProxy(): ProxyServer {
             val proxy = ProxyServer(
-                ProxyServer.Config(
-                    port = 0,
-                    coreThreads = 2,
-                    maxThreads = 8,
-                    maxConnectionsPerClient = 8,
+            ProxyServer.Config(
+                port = 0,
+                coreThreads = 2,
+                maxThreads = 8,
+                maxConnectionsPerClient = 8,
+                // beta1.0.51: pin session caps to the tiny test server
+                // (production defaults 800/375 exceed maxThreads).
+                maxTcpSessions = 8,
+                maxTcpSessionsPerClient = 8,
                 workerKeepAliveMs = 500,
                 connectTimeoutMs = 2_000,
                 handshakeTimeoutMs = 2_000,

@@ -11,8 +11,9 @@ import android.net.VpnService
 import android.net.wifi.WifiManager
 import android.os.*
 import androidx.core.app.NotificationCompat
-import engine.Engine
+import hev.htproxy.TProxyService
 import kotlin.concurrent.thread
+import java.io.File
 
 class MyVpnServiceTun2Socks : VpnService() {
 
@@ -98,10 +99,10 @@ class MyVpnServiceTun2Socks : VpnService() {
         startForegroundNotification()
 
         thread(name = "ProxyTest") {
-            // beta1.0.4: single unified handshake (was a separate TCP pre-check
+            // beta1.0.5: single unified handshake (was a separate TCP pre-check
             // that opened its own connection on top of the per-tick keepalive).
             if (UpstreamNetworkManager.singleHandshake(proxyIp, proxyPort, proxyUser, proxyPass)) {
-                startVpnWithTun2Socks()
+                startVpnWithLwip()
             } else {
                 updateNotification("Error: Cannot reach proxy at $proxyIp:$proxyPort")
                 stopSelf()
@@ -113,7 +114,7 @@ class MyVpnServiceTun2Socks : VpnService() {
 
     private fun resetConnections() {
         try {
-            Engine.stop()
+            TProxyService.TProxyStopService()
             Thread.sleep(500)
             vpnInterface?.close()
             vpnInterface = null
@@ -131,28 +132,23 @@ class MyVpnServiceTun2Socks : VpnService() {
             vpnInterface?.close()
             vpnInterface = null
         } catch (e: Exception) {}
-
-        // 2. Stop the native engine
+        // 2. Stop the native lwIP engine (hev-socks5-tunnel)
         try {
-            Engine.stop()
+            TProxyService.TProxyStopService()
         } catch (e: Exception) {}
-
         // 3. Remove foreground status and stop
         stopForeground(true)
         stopSelf()
-
         DebugUtils.log("Service shutdown sequence complete")
     }
 
-    private fun startVpnWithTun2Socks() {
+    private fun startVpnWithLwip() {
         try {
             vpnInterface?.close()
             vpnInterface = null
             Thread.sleep(500)
 
             DebugUtils.log("Setting up fresh VPN interface...")
-
-            DebugUtils.log("Setting up VPN interface...")
 
             val builder = Builder()
                 .setMtu(1350) // LOWER MTU: 1350 is the "sweet spot" for gaming over proxies
@@ -181,35 +177,25 @@ class MyVpnServiceTun2Socks : VpnService() {
             DebugUtils.log("VPN interface established with fd: $fd")
 
             isRunning = true
-            updateNotification(L10n.tr("LinkHelm connecting - via tun2socks", "LinkHelm 连接中 - 经 tun2socks 转发"))
+            updateNotification(L10n.tr("LinkHelm connecting - via lwIP", "LinkHelm 连接中 - 经 lwIP 转发"))
 
-            // Start tun2socks in a separate thread
-            thread(name = "tun2socks-engine", isDaemon = false) {
-                runTun2Socks(fd)
+            // Start the lwIP engine (hev-socks5-tunnel) in a separate thread,
+            // handing it the VpnService-provided TUN fd. Hev handles TCP/UDP/DNS
+            // itself via its lwIP PCB stack — no separate concurrent DNS/UDP/TCP probes.
+            thread(name = "lwip-engine", isDaemon = false) {
+                runLwip(fd)
             }
 
             // v1.4.6: link warmer — a minimal SOCKS5 greeting keeps the Wi-Fi
-            // Direct link out of power-save, so tun2socks' on-demand dials no
+            // Direct link out of power-save, so the engine's on-demand dials no
             // longer hit a dozing radio (root cause of the i/o-timeout storms).
-            // This service's own traffic bypasses the VPN (addDisallowedApplication),
-            // so the probe reaches the host directly. Failures are silent unless
-            // sustained; the VPN engine itself is never torn down from here.
-            // v1.4.7: pacing reworked for multi-device hosts. 3s per device was
-            // far too chatty — with several downstreams greeting simultaneously
-            // the accept queue and radio wake-ups collided and links dropped
-            // ("handshake too frequent... disconnect on time conflict"). Now: 10s cadence + a 1-2s random
-            // jitter per round, so with many connected devices each client
-            // greets in its own window instead of in lockstep. Sustained-loss
-            // notification stays at ~30s (3 strikes × 10s).
             thread(name = "link-keepalive", isDaemon = true) {
                 val jitter = java.security.SecureRandom()
-                // Stagger the FIRST probe too, so N devices starting together do
-                // not all greet at t=0.
                 Thread.sleep(jitter.nextLong(1_000, 2_500))
                 var failures = 0
                 var degraded = false
                 while (isRunning) {
-                    // beta1.0.4: ONE negotiated handshake per tick (replaces the
+                    // beta1.0.5: ONE negotiated handshake per tick (replaces the
                     // inline greeting that opened a parallel connection and fought
                     // the host's UDP probe for the radio). Auth-aware so a wrong
                     // credential is not mistaken for a live link.
@@ -232,8 +218,6 @@ class MyVpnServiceTun2Socks : VpnService() {
                         updateNotification(L10n.tr("Link flapping; it will recover automatically...", "链路抖动中，恢复后自动好转…"))
                     }
                     try {
-                        // v1.4.7: 10s base + 1-2s jitter — per-device handshake
-                        // windows never coincide across multiple downstreams.
                         Thread.sleep(10_000 + jitter.nextLong(1_000, 2_000))
                     } catch (_: InterruptedException) {
                         break
@@ -248,33 +232,59 @@ class MyVpnServiceTun2Socks : VpnService() {
         }
     }
 
-    private fun runTun2Socks(fd: Int) {
+    private fun runLwip(fd: Int) {
         try {
-            // v1.5.43: host enforces SOCKS5 credentials — embedded in the URL (standard
-            // socks5://user:pass@host:port form). Credentials are alphanumeric only, no escaping needed.
-            val socksProxy = "socks5://$proxyUser:$proxyPass@$proxyIp:$proxyPort"
+            // beta1.0.5: lwIP engine (hev-socks5-tunnel) replaces tun2socks.
+            // Hev exposes hev_socks5_tunnel_main(config_path, tun_fd) — the JNI
+            // wrapper hev.htproxy.TProxyService hands it the VpnService fd, and
+            // lwIP internally runs TCP/UDP/DNS through its PCB stack.
+            val q = { s: String -> "'" + s.replace("'", "''") + "'" }
+            val cfg = buildString {
+                appendLine("tunnel:")
+                appendLine("  name: tun0")
+                appendLine("  mtu: 1350")
+                appendLine("  ipv4: 198.18.0.1")
+                appendLine("  ipv6: 'fc00::1'")
+                appendLine("  icmp: 'off'")
+                appendLine("socks5:")
+                appendLine("  address: ${q(proxyIp)}")
+                appendLine("  port: $proxyPort")
+                appendLine("  udp: 'udp'")
+                // beta1.0.52: pin the UDP relay endpoint to the host address —
+                // some hosts reply UDP ASSOCIATE with BND.ADDR=0.0.0.0 (legal per
+                // RFC) and connect()ing to 0.0.0.0 fails on Windows-style strict
+                // stacks; udp-address overrides only the host part of the relay
+                // endpoint and keeps the relay port from the reply.
+                appendLine("  udp-address: ${q(proxyIp)}")
+                if (proxyUser.isNotBlank()) appendLine("  username: ${q(proxyUser)}")
+                if (proxyPass.isNotBlank()) appendLine("  password: ${q(proxyPass)}")
+                appendLine("misc:")
+                // NB: hev's parser only recognises these keys under `misc:`
+                // (hev-config.c hev_config_parse_misc); under `socks5:` they
+                // would be SILENTLY IGNORED and the 10s default connect-timeout
+                // would stay — too short for the host's Wi-Fi Direct dial.
+                appendLine("  connect-timeout: 25000")
+                appendLine("  tcp-read-write-timeout: 300000")
+                appendLine("  udp-read-write-timeout: 60000")
+                appendLine("  max-session-count: 0")
+                appendLine("  log-level: info")
+                appendLine("  log-file: ${q(File(filesDir, "lwip.log").absolutePath)}")
+                // NO pid-file: hev-main.c forks into a daemon when one is set,
+                // which would break the VpnService lifecycle.
+            }
+            val cfgFile = File(filesDir, "linkhelm_lwip.yml")
+            cfgFile.writeText(cfg)
+            DebugUtils.log("Configuring lwIP (hev-socks5-tunnel) engine...")
 
-            DebugUtils.log("Configuring tun2socks engine...")
+            val ok = TProxyService.TProxyStartService(cfgFile.absolutePath, fd)
+            if (!ok) {
+                DebugUtils.error("lwIP engine failed to start", RuntimeException("TProxyStartService returned false"))
+                updateNotification(L10n.tr("Error: lwIP engine failed to start", "错误：lwIP 引擎启动失败"))
+                stopSelf()
+                return
+            }
 
-            // 1. Create a Key object for configuration
-            val key = engine.Key()
-
-            // 2. Set the parameters using the Key object
-            // Note: The device must be "fd://<number>" for Android
-            key.setDevice("fd://$fd")
-            key.setProxy(socksProxy)
-            key.setMTU(1420L)
-            key.setLogLevel("info")
-
-            // Optional: Some versions allow setting DNS here,
-            // but often it's handled by the VPN Builder routes
-            // key.setDNS("8.8.8.8,8.8.4.4")
-
-            // 3. Register the configuration and start the engine
-            Engine.insert(key)
-            Engine.start()
-
-            DebugUtils.log("✓ tun2socks started successfully!")
+            DebugUtils.log("✓ lwIP engine started successfully!")
             updateNotification(L10n.tr("LinkHelm connected $proxyIp:$proxyPort", "✓ LinkHelm 已连接 $proxyIp:$proxyPort"))
 
             // Keep the thread alive while VPN is running
@@ -283,10 +293,10 @@ class MyVpnServiceTun2Socks : VpnService() {
             }
 
         } catch (e: Exception) {
-            DebugUtils.error("tun2socks error", e)
+            DebugUtils.error("lwIP engine error", e)
             updateNotification("Error: ${e.message}")
         } finally {
-            DebugUtils.log("tun2socks engine stopped")
+            DebugUtils.log("lwIP engine stopped")
         }
     }
 
@@ -302,7 +312,7 @@ class MyVpnServiceTun2Socks : VpnService() {
 
         val notification = NotificationCompat.Builder(this, "vpn_channel")
             .setContentTitle("LinkHelm")
-            .setContentText("Initializing tun2socks...")
+            .setContentText("Initializing lwIP...")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
@@ -417,8 +427,8 @@ class MyVpnServiceTun2Socks : VpnService() {
         }
 
         try {
-            Engine.stop()
-            DebugUtils.log("✓ tun2socks engine stopped")
+            TProxyService.TProxyStopService()
+            DebugUtils.log("✓ lwIP engine stopped")
         } catch (e: Exception) {
             DebugUtils.error("Error stopping engine", e)
         }

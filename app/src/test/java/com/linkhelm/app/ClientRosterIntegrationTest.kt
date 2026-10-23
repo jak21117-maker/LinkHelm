@@ -95,6 +95,11 @@ class ClientRosterIntegrationTest {
                 coreThreads = 2,
                 maxThreads = 8,
                 maxConnectionsPerClient = 8,
+                // beta1.0.51: Config requires maxTcpSessions <= maxThreads —
+                // the new production defaults (800/375) no longer fit a tiny
+                // test server, so pin them to the test capacity.
+                maxTcpSessions = 8,
+                maxTcpSessionsPerClient = 8,
                 allowedClientRanges = listOf("127.0.0.0/8")
             )
         )

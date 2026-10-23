@@ -39,7 +39,7 @@ def netsh_interfaces_gbk(with_adapter=True):
         "已连接    WLAN        WLAN",
     ]
     if with_adapter:
-        rows.append("已连接    未识别      LinkHelm")
+        rows.append("已连接    未识别      LinkHelm-IwIP")
     return gbk("\n".join(rows) + "\n")
 
 
@@ -195,7 +195,7 @@ def test_adapter_detected_even_with_gbk_only_output(monkeypatch, socks_upstream)
     tun = _make_tun(monkeypatch, console, socks_upstream)
     rc, out, _ = main._run_decoded(["netsh", "interface", "ipv4", "show", "interfaces"])
     # Reproduce the detection expression from start() against decoded output.
-    assert "LinkHelm" in out
+    assert "LinkHelm-IwIP" in out
     tun.start()
     tun.stop()
 
