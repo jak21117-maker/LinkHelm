@@ -128,13 +128,15 @@ The jump from beta1.0.0 to beta1.0.56 came from replacing the legacy tun2socks c
 
 ### Legacy vs lwIP engine (beta1.0.56 era)
 
-| Metric (single client) | Legacy engine (tun2socks) | lwIP engine (beta1.0.56) |
+The throughput figures line up with the version table above: the legacy engine spans beta1.0.0–1.0.3 (30–50%), the lwIP engine spans beta1.0.56–1.1.0 (60–70%+).
+
+| Metric (single client) | Legacy engine (tun2socks, beta1.0.0–1.0.3) | lwIP engine (beta1.0.56–1.1.0) |
 |---|---|---|
 | In-game round-trip, typical | 60–70 ms | **20–30 ms** |
 | In-game round-trip, worst observed | often >100 ms | occasional 50–60 ms |
 | p95 round-trip | ~110 ms | ~45 ms |
 | Jitter (1-minute window) | 15–30 ms | 3–8 ms |
-| Download through the hotspot | ~80% of the phone's direct speed | ~95% of the phone's direct speed |
+| Download through the hotspot | 30–50% of the phone's direct speed | 60–70% of the phone's direct speed |
 | Engine CPU on the PC (1-client mixed load) | 8–12% of one core | 3–5% of one core |
 
 Reproduce it: on the same link in the same hour, record in-game ping, a long `ping -t` from a hotspot client, and a large-file download — three rounds per engine. Session capacity is a design target: per-client quotas support hundreds of concurrent sessions on one device, with many devices sharing at once.
