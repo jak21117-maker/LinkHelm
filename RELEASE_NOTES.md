@@ -1,76 +1,57 @@
-# LinkHelm beta1.0.56
+# LinkHelm 1.1.0
 
-Windows and Android now share one version number: **beta1.0.56** (Android
-versionCode 45). This release unifies the data-plane architecture on both
-ends and upgrades connection experience, session capacity, throughput and
-stability across the board. Development/test build.
+First stable release. Both ends ship the same version number: **1.1.0**
+(Android versionCode 62). The Windows desktop app is now the **native C++
+edition** — same UI, same behavior, one ~0.9 MB executable instead of the
+Python runtime bundle. The legacy Python edition remains in the repository
+under `laptop_proxy/` for study and comparison.
 
-## Architecture: unified lwIP engine on both ends (HevSocks5Tunnel 2.19.1)
+## Desktop: native C++ edition
 
-- The data plane on Windows and Android now runs the **same native lwIP
-  kernel**: TCP / UDP / DNS are all handled by lwIP's PCB stack in a single
-  kernel, removing the overhead of the old multi-link design.
-- The engine trio ships inside the package (`hev-socks5-tunnel.exe` +
-  `wintun.dll` + `msys-2.0.dll`); SHA-256 is verified at startup against
-  pinned values. No downloads and no fallback paths at runtime — behavior
-  is fully reproducible.
-- Windows keeps a lightweight Python GUI/orchestration layer (PyInstaller
-  packaged); the data plane lives entirely in the native engine.
+- The whole desktop app was rewritten in C++17 (Win32 API directly, no UI
+  framework). Functionality is unchanged; startup is instant and the
+  package shrinks from ~200 MB to ~40 MB.
+- The lwIP engine (hev-socks5-tunnel + Wintun), the mihomo kernel and all
+  helper modules are the same pinned, SHA-256-verified binaries as before.
 
-## Experience
+## Store accelerator (both ends)
 
-- The **LinkHelm-IwIP** virtual adapter uses a fixed GUID: Wintun reopens
-  the same adapter directly, so reconnects are ready in seconds and the
-  old "LinkHelm-IwIP 2/3/4" adapter accumulation is gone.
-- Single-instance guard plus a tray "Quit & Clean Up Network"; start at
-  logon with silent auto-connect — dialing completes as soon as the phone
-  proxy appears.
-- Instant English/Chinese UI switching; SOCKS5 credential changes apply
-  live and the tunnel rebuilds on the fly.
+- Subscription download chain rebuilt: system proxy → user proxy → local
+  port probe (11 common ports, 300 ms) → direct, plus automatic sibling
+  domain failover for multi-frontend panels. No more blind port guessing.
+- Latency test fixed: node names are now correctly UTF-8 percent-encoded
+  (Chinese/emoji names previously broke the kernel API with 404s).
+- Share-link subscriptions (vless/ss/vmess/trojan/hysteria2) are converted
+  in-process; the bundled mihomo kernel parses them directly.
+- Full bilingual UI: every status message is translated; node names are
+  shown in English when the interface language is English.
 
-## Sessions & concurrency
+## Measured performance across versions
 
-- On Android, the previously separate three-way probing (TCP pre-check /
-  SOCKS5 keep-alive / UDP self-test) is consolidated into a **single
-  unified handshake** — active connections and session count drop sharply,
-  so many devices can share comfortably at once.
-- Per-client session quotas and unified queue management keep concurrent
-  devices from starving each other.
+Same phone, same PC, same Wi-Fi Direct link, same game server, one client,
+same time window. Throughput is expressed as a percentage of the host
+machine's direct line speed.
 
-## Speed & latency
+| Metric | beta1.0.0 | beta1.0.3 | beta1.0.56 | 1.1.0 |
+|---|---|---|---|---|
+| Throughput vs host line speed | ~30% | ~50% | ~60% | **70–80%** |
+| Typical latency | 100–200 ms | ~100 ms | 30–80 ms | **20–70 ms** |
 
-- Single-stack lwIP processing cuts kernel/user-mode round-trips and
-  shortens the forwarding path for **lower latency**.
-- Link parameters are tuned for phone Wi-Fi Direct (connection window,
-  keep-alive cadence, retransmission pacing) to keep throughput smooth
-  under weak signal.
+The long climb from beta1.0.0 to 1.1.0 came from replacing the legacy
+tun2socks core with the native lwIP engine (beta1.0.56) and then tuning
+buffers, connection lifecycle and DNS handling in the C++ edition.
 
-## Stability
+## File transfer & store boost evolution
 
-- The engine runs as a foreground child process with a supervisor and
-  automatic rebuild, for steady long-running sessions.
-- Stale tunnel routes are swept automatically and NCSI probing state is
-  restored on disconnect, keeping the network environment clean.
-- A phone-side watchdog re-arms sharing automatically after an
-  interruption.
-
-## Packaging
-
-- The Windows zip contains only the app folder (`LinkHelm_Desktop/`); the
-  Android APK ships arm64-v8a only, for a smaller download.
-- Engine binary sources and SHA-256 values are pinned in
-  `DEPENDENCY_LOCK.md`.
+| Capability | beta1.0.0 | beta1.0.3 | beta1.0.56 | 1.1.0 |
+|---|---|---|---|---|
+| File transfer | manual, no resume | real file names kept | resumable, SHA-256 verified | **resumable + real names + 10 GB + live sync status** |
+| Store boost | — | — | mihomo kernel, Clash YAML only | **any subscription format, auto proxy detection, latency test, bilingual** |
 
 ## Verification
 
-- Windows: 102 pytest tests passed (engine launch, tunnel lifecycle,
-  UDP/DNS pool, single instance, binary integrity, and more).
-- Android: unit + integration tests passed (client roster, proxy server,
-  UDP probe).
-
----
-
-Binaries: signed Android APK (versionCode 45) + Windows win64 zip, both
-built and published by GitHub Actions from this tag. `SHA256SUMS.txt` lists
-the asset checksums; the Source code archives are generated automatically
-by GitHub.
+- Desktop: end-to-end test on a live subscription URL — download →
+  base64/vless conversion → kernel parse → 20 nodes listed → stable
+  90-second run. Smoke test: fresh 1.1.0 EXE starts and stays alive.
+- Android: debug APK builds clean (versionCode 62); file-transfer
+  sync wrapped in runCatching; no crash-level findings in review.

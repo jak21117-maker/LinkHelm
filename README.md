@@ -25,7 +25,7 @@ Windows PC  -- LinkHelm Desktop -->  virtual adapter (10.0.0.1)
 
 ---
 
-**What's new in beta1.0.56** — both ends now run the **same native lwIP kernel** (HevSocks5Tunnel 2.19.1): one kernel handles TCP/UDP/DNS, the Wintun adapter is reused via a fixed GUID (reconnects ready in seconds), and every engine binary is SHA-256 verified at startup. The legacy tun2socks core is fully retired.
+**What's new in 1.1.0 (first stable release)** — the Windows desktop app is now the **native C++ edition**: same UI and behavior in a ~0.9 MB executable, instant startup, package shrunk from ~200 MB to ~40 MB. The store booster's subscription chain was rebuilt (system proxy → user proxy → live local-port probe → direct, with automatic sibling-domain failover), the latency test was fixed (UTF-8 percent-encoding of node names), share-link subscriptions (`vless://` `ss://` `vmess://` `trojan://` `hysteria2://`) are converted in-process, and the UI is now fully bilingual including node names. Measured throughput reached **70–80% of the host line speed** with **20–70 ms** typical latency. Both ends run **1.1.0**. The legacy Python edition remains under `laptop_proxy/` for study.
 
 **Download** — get the signed APK and the Windows zip from the [Releases page](https://github.com/jak21117-maker/LinkHelm/releases/latest). Every release is built by GitHub Actions from its tag, ships a `SHA256SUMS.txt` checksum manifest, and pins all third-party binary sources in [`DEPENDENCY_LOCK.md`](DEPENDENCY_LOCK.md).
 
@@ -53,7 +53,7 @@ Modern phones can share their mobile/Wi-Fi connection over **Wi-Fi Direct**. Lin
 
 - **LinkHelm Host (Android)** publishes a local **SOCKS5** proxy on the phone side, bound to the Wi-Fi Direct network, using a fixed, editable username/password (8-13 alphanumeric characters). It never opens anything to the public internet.
 - **LinkHelm Desktop (Windows)** dials that SOCKS5 endpoint, brings up a local virtual network adapter (Wintun), installs the routes needed to reach the internet through it, and then re-shares that uplink to other devices - either as a **Windows Mobile Hotspot** or over a **wired Ethernet** adapter. Client devices need **no proxy configuration at all**; they just see a normal network.
-- **Local file transfer** — move files between the phone and the Windows PC over the same link (Turbo mode), with no cloud involved.
+- **Local file transfer** — move files between the phone and the Windows PC over the same link (Turbo mode), with no cloud involved. Single files up to **10 GB**, SHA-256 verified, and **resumable**: an interrupted transfer keeps its staged bytes and continues from the receiver's checkpoint when you re-send the same file.
 
 The result: a phone's connection becomes a normal Wi-Fi/Ethernet network that any device can join.
 
@@ -117,6 +117,17 @@ See [`docs/MANUAL.md`](docs/MANUAL.md) for a concise walkthrough.
 
 Measured on the developer's own setup: the same phone, the same laptop client joining the PC's hotspot, the same game server/region and time window, one client active. This is a LinkHelm **scenario test** — numbers vary with radio conditions, carrier and device, and are not a guarantee for every device.
 
+### Version-over-version progress
+
+| Metric (single client) | beta1.0.0 | beta1.0.3 | beta1.0.56 | 1.1.0 |
+|---|---|---|---|---|
+| Throughput vs host line speed | ~30% | ~50% | ~60% | **70–80%** |
+| Typical latency | 100–200 ms | ~100 ms | 30–80 ms (occasionally 100) | **20–70 ms** |
+
+The jump from beta1.0.0 to beta1.0.56 came from replacing the legacy tun2socks core with the native lwIP engine; 1.1.0 adds the tuned C++ edition on top.
+
+### Legacy vs lwIP engine (beta1.0.56 era)
+
 | Metric (single client) | Legacy engine (tun2socks) | lwIP engine (beta1.0.56) |
 |---|---|---|
 | In-game round-trip, typical | 60–70 ms | **20–30 ms** |
@@ -127,6 +138,13 @@ Measured on the developer's own setup: the same phone, the same laptop client jo
 | Engine CPU on the PC (1-client mixed load) | 8–12% of one core | 3–5% of one core |
 
 Reproduce it: on the same link in the same hour, record in-game ping, a long `ping -t` from a hotspot client, and a large-file download — three rounds per engine. Session capacity is a design target: per-client quotas support hundreds of concurrent sessions on one device, with many devices sharing at once.
+
+## File transfer & store boost evolution
+
+| Capability | beta1.0.0 | beta1.0.3 | beta1.0.56 | 1.1.0 |
+|---|---|---|---|---|
+| File transfer | manual, no resume | real file names kept | resumable, SHA-256 verified | **resumable + real names + 10 GB + live sync status** |
+| Store boost | — | — | mihomo kernel, Clash YAML only | **any subscription format, auto proxy detection, latency test, bilingual UI** |
 
 ---
 
@@ -154,14 +172,14 @@ Windows: it restarts automatically; if it did not, reopen Settings. Android: it 
 
 ## Building from source
 
-Both apps build from this repository. The Windows EXE is packaged with PyInstaller; the Android APK with Gradle.
+Both apps build from this repository. The Windows EXE is the native C++ edition (`cpp/`, MinGW-w64 + CMake); the Android APK with Gradle. The legacy Python edition (`laptop_proxy/`) is kept for study and comparison.
 
 ```bash
 # Android
 cd app && ../gradlew assembleDebug        # or assembleRelease
 
-# Windows (in a virtualenv with the requirements installed)
-cd laptop_proxy && pyinstaller LaptopProxy.spec
+# Windows (native C++ edition, MinGW-w64 toolchain)
+cmake -S cpp -B cpp/build -G "MinGW Makefiles" && cmake --build cpp/build --parallel
 ```
 
 Pinned dependency sources and their SHA-256 values are documented in the source tree. Only the latest version ships in the release archives.

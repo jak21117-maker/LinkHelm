@@ -217,9 +217,10 @@ ENABLE_ICS = ICS_COMMON + r"""
 $outputGuid = Normalize-Guid $env:CONSOLE_OUTPUT_GUID
 # v1.5.46: match the TUN by connection name AND device description. The
 # NetCfg connection name can drift to 'LinkHelm 31' after historic
-# name-collisions, but the device description ('tun2socks Tunnel') is stable.
+# name-collisions; beta1.0.5+ the adapter is LinkHelm-IwIP (wintun device);
+# pre-1.0.5 was name 'LinkHelm' with a 'tun2socks' device. Match them all.
 $source = @($entries | Where-Object {
-    $_.Name -eq 'LinkHelm' -or $_.DeviceName -like '*tun2socks*'
+    $_.Name -eq 'LinkHelm-IwIP' -or $_.DeviceName -like '*wintun*'
 })
 $output = @($entries | Where-Object { $_.Guid -eq $outputGuid })
 if ($source.Count -ne 1) {
@@ -394,6 +395,21 @@ class IcsManager:
             raise BridgeError("Windows sharing returned an invalid response.") from error
 
     def list_ethernet(self):
+        # beta1.0.84: prefer the C++ module (native IP Helper enumeration,
+        # live-verified against Get-NetAdapter -Physical); PowerShell is the
+        # fallback for old packages without the exe.
+        try:
+            import cpp_bridge
+            if cpp_bridge.ics_available():
+                entries = cpp_bridge.list_ethernet()
+                if entries is not None:
+                    if not isinstance(entries, list):
+                        raise BridgeError("Could not list Ethernet adapters.")
+                    return [EthernetAdapter(normalize_guid(item["guid"]),
+                                            item["name"])
+                            for item in entries]
+        except Exception:
+            pass
         entries = self._run(LIST_ETHERNET)
         if not isinstance(entries, list):
             raise BridgeError("Could not list Ethernet adapters.")
@@ -422,7 +438,16 @@ class IcsManager:
                 if wifi.get("error"):
                     raise BridgeError(wifi["error"])
                 output_guid = normalize_guid(wifi["guid"])
-            sharing = self._run(ENABLE_ICS, {"CONSOLE_OUTPUT_GUID": output_guid})
+            # beta1.0.84: ICS binding via the C++ module when present.
+            sharing = None
+            try:
+                import cpp_bridge
+                if cpp_bridge.ics_available():
+                    sharing = cpp_bridge.ics_enable(output_guid)
+            except Exception:
+                sharing = None
+            if sharing is None:
+                sharing = self._run(ENABLE_ICS, {"CONSOLE_OUTPUT_GUID": output_guid})
         except Exception as error:
             if wifi and wifi.get("started"):
                 try:
@@ -486,9 +511,25 @@ class IcsManager:
         if self._state is None:
             return
         if not self._state["ics_restored"]:
-            self._run(DISABLE_ICS, {
-                "CONSOLE_BRIDGE_STATE": json.dumps(self._state, separators=(",", ":"))
-            })
+            # beta1.0.84: C++ module first, PowerShell fallback.
+            done = False
+            try:
+                import cpp_bridge
+                if cpp_bridge.ics_available():
+                    result = cpp_bridge.ics_disable(self._state)
+                    done = not result.get("error")
+                    if not done:
+                        raise BridgeError(result.get(
+                            "error", "Windows sharing restore failed."))
+            except BridgeError:
+                raise
+            except Exception:
+                done = False
+            if not done:
+                self._run(DISABLE_ICS, {
+                    "CONSOLE_BRIDGE_STATE": json.dumps(
+                        self._state, separators=(",", ":"))
+                })
             self._state["ics_restored"] = True
         if self._state["hotspot_started"]:
             self._run(STOP_HOTSPOT)

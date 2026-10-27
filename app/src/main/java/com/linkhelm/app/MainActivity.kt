@@ -168,6 +168,11 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
         // Load saved band preference
         selectedBand.intValue = getSharedPreferences("linkhelm_prefs", Context.MODE_PRIVATE).getInt("selected_band", 1)
 
+        // beta1.0.93: ensure the FT receiver from app start — the receiver is
+        // independent of sharing now, so a client-mode phone (sharing off,
+        // connected to the peer's hotspot) is still able to RECEIVE files.
+        runCatching { FileTransferLive.sync(this) }
+
         checkPermissions()
 
         setContent {
@@ -1902,9 +1907,10 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ConnectionInfoListener 
 }
 
 /**
- * v1.5.45 (beta1.0.1): file-transfer trial card — single file <= 1 GB over the
- * Wi-Fi Direct link only (never the phone's internet exit), independent of the
- * sharing service. See FileTransfer.kt for the wire protocol.
+ * v1.5.45 (beta1.0.1): file-transfer card — single file <= 30 GB (beta1.0.62,
+ * was 1 GB), resumable across a dropped link, over the Wi-Fi Direct link only
+ * (never the phone's internet exit), independent of the sharing service.
+ * See FileTransfer.kt for the wire protocol.
  */
 @Composable
 fun FileTransferCard() {
@@ -1914,6 +1920,8 @@ fun FileTransferCard() {
     var dirSet by remember {
         mutableStateOf(prefs.getString(FileTransferProtocol.PREFS_KEY_DIR, null) != null)
     }
+    // beta1.0.93: save-directory probe result (null = OK / not probed yet)
+    var dirProbeMsg by remember { mutableStateOf<String?>(null) }
     val state = FileTransferBus.state
     // beta1.0.3: show the ACTUAL local IP (dynamic — the Wi-Fi Direct group
     // re-assigns addresses) and the paired-peer set. A transfer is only
@@ -1937,9 +1945,25 @@ fun FileTransferCard() {
                     Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                 )
             }
-            prefs.edit().putString(FileTransferProtocol.PREFS_KEY_DIR, uri.toString()).apply()
-            dirSet = true
-            HostService.restartFileTransferLive()
+            // beta1.0.93: PROBE the single-folder grant before trusting it —
+            // some OEM pickers hand back a URI the app cannot actually write
+            // to; that used to surface only mid-transfer as "FAIL storage".
+            // (create+delete a marker doc: fast, same-thread.)
+            val probeErr = probeSaveDir(context.contentResolver, uri)
+            if (probeErr != null) {
+                dirSet = false
+                dirProbeMsg = probeErr
+                prefs.edit().remove(FileTransferProtocol.PREFS_KEY_DIR).apply()
+            } else {
+                prefs.edit().putString(FileTransferProtocol.PREFS_KEY_DIR, uri.toString()).apply()
+                dirSet = true
+                dirProbeMsg = null
+                // beta1.0.94: sync the singleton DIRECTLY — the 1.0.93 path
+                // went through HostService.restartFileTransferLive(), which is
+                // a NO-OP when sharing is off (liveInstance == null), so the
+                // receiver only started after an app restart.
+                runCatching { FileTransferLive.sync(context) }
+            }
         }
     }
     val fileLauncher = rememberLauncherForActivityResult(
@@ -1962,15 +1986,15 @@ fun FileTransferCard() {
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text(
-                L10n.tr("File Transfer (trial)", "文件传输（试用版）"),
+                L10n.tr("File Transfer", "文件传输"),
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onSurface
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
                 L10n.tr(
-                    "Single file up to 1 GB, over the Wi-Fi Direct link only — never the phone's internet exit. Independent of sharing; SHA-256 verified.",
-                    "单文件最大 1 GB，仅走 Wi-Fi Direct 本地通道，不经手机外网出口；与网络分享互不影响，传输后校验 SHA-256。"
+                    "Single file up to 30 GB over the Wi-Fi Direct link only — never the phone's internet exit. Independent of sharing; SHA-256 verified.",
+                    "单文件最大 30 GB，仅走 Wi-Fi Direct 本地通道，不经手机外网出口；与网络分享互不影响，传输后校验 SHA-256。"
                 ),
                 fontSize = 11.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1989,6 +2013,45 @@ fun FileTransferCard() {
                     else L10n.tr("Set the save directory", "设置接收保存目录")
                 )
             }
+            // beta1.0.93: live receiver status — makes it visible that the
+            // phone is receivable even when sharing is OFF (client mode).
+            // beta1.0.95: also surface receiver startup failures (port busy,
+            // bad dir) instead of a silent dead receiver.
+            FileTransferLive.lastSyncError?.let { err ->
+                Text(
+                    L10n.tr("Receiver error: $err — re-pick the save directory", "接收器错误：$err——请重新选择保存目录"),
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+            Text(
+                if (FileTransferLive.isRunning())
+                    L10n.tr("Receiver listening on :8765 (works even with sharing off)", "接收器监听中（:8765，分享关闭时也可收）")
+                else
+                    L10n.tr("Receiver off — set the save directory to enable", "接收器未运行——设置保存目录后自动开启"),
+                fontSize = 11.sp,
+                color = if (FileTransferLive.isRunning()) Color(0xFF4CAF50)
+                        else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (!dirSet) {
+                Text(
+                    L10n.tr(
+                        "Set the save directory BEFORE pairing — without it incoming files cannot be stored.",
+                        "请先设置接收保存目录再配对：未设置时将无法保存收到的文件。"
+                    ),
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+            // beta1.0.93: directory-grant probe failure — show WHY the pick
+            // was rejected so the user can re-pick or grant properly.
+            dirProbeMsg?.let { msg ->
+                Text(
+                    L10n.tr("Save directory rejected: $msg", "保存目录不可用：$msg"),
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
 
             Spacer(modifier = Modifier.height(8.dp))
 
@@ -1996,14 +2059,29 @@ fun FileTransferCard() {
             // Wi-Fi Direct link (host is usually 192.168.49.1, clients get
             // their own lease); it changes when the group is rebuilt, so it
             // is re-read on every recomposition of this card.
-            Text(
-                L10n.tr(
-                    "This device address (shown on the other device): ${localIp.ifEmpty { "detecting..." }}",
-                    "本机地址（填到另一台设备）：${localIp.ifEmpty { "检测中…" }}"
-                ),
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurface
-            )
+            // beta1.0.58: a refresh button re-reads it on demand — after the
+            // group is rebuilt the old lease is gone and the peer needs the
+            // new address (e.g. 192.168.49.4).
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    L10n.tr(
+                        "This device address (shown on the other device): ${localIp.ifEmpty { "detecting..." }}",
+                        "本机地址（填到另一台设备）：${localIp.ifEmpty { "检测中…" }}"
+                    ),
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f)
+                )
+                IconButton(onClick = { localIp = FileTransferPairs.localLanIp() }) {
+                    Icon(
+                        Icons.Default.Refresh,
+                        contentDescription = L10n.tr(
+                            "Refresh the local address",
+                            "刷新本机地址"
+                        )
+                    )
+                }
+            }
             Text(
                 L10n.tr(
                     "The IP changes when the Wi-Fi Direct group is rebuilt — always follow the currently displayed value.",
@@ -2035,6 +2113,12 @@ fun FileTransferCard() {
                         pairMsg = "请先填写对方地址"
                         return@TextButton
                     }
+                    // beta1.0.58: the save directory must exist before pairing —
+                    // a transfer without it cannot be stored on this device.
+                    if (!dirSet) {
+                        pairMsg = "请先设置接收保存目录（点击上方按钮），再与对方配对"
+                        return@TextButton
+                    }
                     pairing = true
                     pairMsg = null
                     val user = prefs.getString("socks_user", ProxyServer.DEFAULT_SOCKS_USER)
@@ -2043,7 +2127,16 @@ fun FileTransferCard() {
                         ?: ProxyServer.DEFAULT_SOCKS_PASS
                     thread(name = "FT-Pair", isDaemon = true) {
                         val err = FileTransferClient.pair(ip, user, pass)
-                        pairMsg = err ?: "已与 $peerHost 完成配对"
+                        // beta1.0.96 DISPLAY FIX: the PC acts as a client only —
+                        // it pairs INTO this phone (the incoming PAIR stores the
+                        // PC's IP here), so PC→phone transfers already work while
+                        // this phone's own reverse pair to the PC's :8765 is
+                        // refused (the PC runs no listener). That refusal is NOT
+                        // a pairing failure: if the peer is already in our paired
+                        // set, mutual pairing is complete — show success.
+                        pairMsg = if (err != null && FileTransferPairs.isPaired(peerHost))
+                            "已与 $peerHost 完成配对（对方已主动配对本机，可直接传输）"
+                        else err ?: "已与 $peerHost 完成配对"
                         pairing = false
                         localIp = FileTransferPairs.localLanIp()
                         paired = FileTransferPairs.pairedSet()

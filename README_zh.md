@@ -25,7 +25,7 @@ Windows 电脑  -- LinkHelm Desktop -->  虚拟网卡（10.0.0.1）
 
 ---
 
-**beta1.0.56 更新** —— 双端统一为**同一原生 lwIP 内核**（HevSocks5Tunnel 2.19.1）：TCP/UDP/DNS 单内核处理，虚拟网卡固定 GUID 复用（秒级重连），全部引擎二进制启动前按固化 SHA-256 校验。旧 tun2socks 内核已彻底退役。
+**1.1.0 更新（首个正式版）** —— Windows 电脑端升级为**原生 C++ 版**：界面与功能不变，单个 ~0.9 MB 可执行文件、启动瞬时、安装包从约 200 MB 缩小到约 40 MB。商店加速的订阅链路全面重构（系统代理 → 用户代理 → 本地端口实时探测 → 直连，多前置域名面板自动切换），延迟测试修复（节点名 UTF-8 百分号编码），分享链接订阅（`vless://` `ss://` `vmess://` `trojan://` `hysteria2://`）进程内直接转换，界面全双语化（含节点名显示）。实测吞吐达到主机网速的 **70–80%**，典型延迟 **20–70 ms**。双端统一 **1.1.0**。旧 Python 版保留在 `laptop_proxy/` 供学习对照。
 
 **下载** —— 签名 APK 与 Windows zip 请从 [Releases 页面](https://github.com/jak21117-maker/LinkHelm/releases/latest) 获取。每个版本均由 GitHub Actions 从对应 tag 构建，附带 `SHA256SUMS.txt` 校验清单，第三方二进制来源固化在 [`DEPENDENCY_LOCK.md`](DEPENDENCY_LOCK.md)。
 
@@ -53,7 +53,7 @@ Windows 电脑  -- LinkHelm Desktop -->  虚拟网卡（10.0.0.1）
 
 - **LinkHelm Host（安卓）** 在手机侧发布一个本地 **SOCKS5** 代理，绑定在 Wi-Fi Direct 网络上，使用一组固定、可改的用户名 / 密码（8–13 位字母数字）。它从不向公网开放任何端口。
 - **LinkHelm Desktop（Windows）** 拨号连接该 SOCKS5 端点，拉起本地虚拟网卡（Wintun），安装通往互联网所需路由，再把这条上行共享给其他设备——可以是 **Windows 移动热点**，也可以是**有线以太网**适配器。客户端设备**完全无需任何代理配置**，它们只看到一个普通网络。
-- **本地文件传输** —— 手机与 Windows 之间经同一链路直接传文件（Turbo 模式），不经过云端。
+- **本地文件传输** —— 手机与 Windows 之间经同一链路直接传文件（Turbo 模式），不经过云端。单文件最大 **10 GB**，传输后校验 SHA-256，并支持**断点续传**：中断后保留已传部分，重发同一文件即从接收端检查点继续。
 
 结果：手机的网络变成了一个任何设备都能加入的普通 Wi-Fi / 以太网网络。
 
@@ -117,6 +117,24 @@ Windows 电脑  -- LinkHelm Desktop -->  虚拟网卡（10.0.0.1）
 
 测自开发者自己的环境：同一部手机、同一台笔记本客户端经电脑热点接入，同一游戏服务器 / 区服与时间段，单客户端在线。这是 LinkHelm 的**场景测试**——数值随信号、运营商与设备而异，不构成对所有设备的保证。
 
+### 版本间进步
+
+| 指标（单客户端） | beta1.0.0 | beta1.0.3 | beta1.0.56 | 1.1.0 |
+|---|---|---|---|---|
+| 吞吐（占主机网速上限） | 约 30% | 约 50% | 约 60% | **70–80%** |
+| 典型延迟 | 100–200 ms | 100 ms 附近 | 30–80 ms（偶尔 100） | **20–70 ms** |
+
+beta1.0.0 到 beta1.0.56 的跨越来自以原生 lwIP 内核替换旧 tun2socks；1.1.0 再叠加调优后的 C++ 版。
+
+### 文件传输与商店加速演进
+
+| 能力 | beta1.0.0 | beta1.0.3 | beta1.0.56 | 1.1.0 |
+|---|---|---|---|---|
+| 文件传输 | 手动、不可续传 | 保留真实文件名 | 可续传、SHA-256 校验 | **续传 + 真实名 + 10 GB + 实时同步状态** |
+| 商店加速 | — | — | mihomo 内核、仅 Clash YAML | **任意订阅格式、代理自动探测、延迟测试、双语界面** |
+
+### 旧内核 vs lwIP 内核（beta1.0.56 时期）
+
 | 指标（单客户端） | 旧内核（tun2socks） | lwIP 内核（beta1.0.56） |
 |---|---|---|
 | 游戏往返延迟（典型） | 60–70 ms | **20–30 ms** |
@@ -154,14 +172,14 @@ Windows：会自动重启；若没有，重新打开设置。安卓：即时生�
 
 ## 从源码构建
 
-两个应用均从本仓库构建。Windows EXE 用 PyInstaller 打包；安卓 APK 用 Gradle 构建。
+两个应用均从本仓库构建。Windows EXE 为**原生 C++ 版**（`cpp/`，MinGW-w64 + CMake）；安卓 APK 用 Gradle 构建。旧 Python 版（`laptop_proxy/`）保留供学习对照。
 
 ```bash
 # 安卓
 cd app && ../gradlew assembleDebug        # 或 assembleRelease
 
-# Windows（在已安装依赖的虚拟环境中）
-cd laptop_proxy && pyinstaller LaptopProxy.spec
+# Windows（原生 C++ 版，MinGW-w64 工具链）
+cmake -S cpp -B cpp/build -G "MinGW Makefiles" && cmake --build cpp/build --parallel
 ```
 
 固化的依赖来源及其 SHA-256 值记录在源码树中。发布包内仅附最新版本。

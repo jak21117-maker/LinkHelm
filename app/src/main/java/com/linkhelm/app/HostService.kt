@@ -90,7 +90,8 @@ class HostService : Service() {
     private var pendingServer: ProxyServer? = null
     // v1.5.45 (beta1.0.1): file-transfer receiver (trial) — lives and dies with
     // the sharing session, reuses the SOCKS5 credentials.
-    private var fileTransferServer: FileTransferServer? = null
+    // beta1.0.93: file-transfer receiver moved to the FileTransferLive
+    // process-wide singleton (see FileTransfer.kt) — no longer a service field.
     // v1.4.0: independent HTTP proxy module for iPhone / no-VPN clients (port 8081).
     // Failure here is non-fatal — the SOCKS5 path stays fully independent.
     @Volatile
@@ -142,9 +143,13 @@ class HostService : Service() {
          * current save directory + SOCKS5 credentials, so picking a directory
          * in the UI takes effect without restarting sharing. No-op (besides
          * stopping) when no directory is set.
+         * beta1.0.93: delegates to the process-wide FileTransferLive singleton
+         * — the receiver no longer lives and dies with the sharing service
+         * (a client-mode phone must still be able to RECEIVE).
          */
         fun restartFileTransferLive() {
-            liveInstance?.restartFileTransfer()
+            liveInstance?.applicationContext?.let { FileTransferLive.sync(it) }
+                ?: run { /* no service running: MainActivity also syncs on create */ }
         }
 
         /**
@@ -344,17 +349,11 @@ class HostService : Service() {
         proxyServer?.applyTurboMode(enabled)
     }
 
-    /** v1.5.45 (beta1.0.1): rebuild the file-transfer receiver from current prefs. */
+    /** v1.5.45 (beta1.0.1): rebuild the file-transfer receiver from current prefs.
+     *  beta1.0.93: delegates to the shared singleton (kept for the share-start
+     *  path — syncs dir/creds but never tears the receiver down on share stop). */
     private fun restartFileTransfer() {
-        val prefs = getSharedPreferences("linkhelm_prefs", MODE_PRIVATE)
-        val dir = prefs.getString(FileTransferProtocol.PREFS_KEY_DIR, null)
-        fileTransferServer?.stop()
-        fileTransferServer = null
-        if (dir == null) return
-        val user = prefs.getString("socks_user", ProxyServer.DEFAULT_SOCKS_USER) ?: ProxyServer.DEFAULT_SOCKS_USER
-        val pass = prefs.getString("socks_pass", ProxyServer.DEFAULT_SOCKS_PASS) ?: ProxyServer.DEFAULT_SOCKS_PASS
-        fileTransferServer = FileTransferServer(user, pass, contentResolver, Uri.parse(dir)).also { it.start() }
-        Log.i("HostService", "File-transfer receiver (re)started on :${FileTransferProtocol.PORT}")
+        FileTransferLive.sync(this)
     }
 
     /** v1.5.41: live SOCKS5 compatibility-mode toggle on the running proxy (no share restart). */
@@ -748,18 +747,10 @@ class HostService : Service() {
             val socksCompat = getSharedPreferences("linkhelm_prefs", MODE_PRIVATE)
                 .getBoolean("socks_compat_mode", false)
             if (socksCompat) server.applyCompatMode(true)
-            // v1.5.45 (beta1.0.1): file-transfer receiver (trial). Only starts
-            // when the user has picked a save directory; port 8765, same
-            // credentials as SOCKS5, Wi-Fi Direct sources only.
-            fileTransferServer?.stop()
-            val ftDir = getSharedPreferences("linkhelm_prefs", MODE_PRIVATE)
-                .getString(FileTransferProtocol.PREFS_KEY_DIR, null)
-            fileTransferServer = if (ftDir != null) {
-                FileTransferServer(socksUser, socksPass, contentResolver, Uri.parse(ftDir))
-                    .also { it.start() }
-            } else {
-                null
-            }
+            // v1.5.45 (beta1.0.1): file-transfer receiver. beta1.0.93: sync
+            // the process-wide singleton (dir + current creds) — the receiver
+            // itself is independent of the sharing session now.
+            FileTransferLive.sync(this)
             // v1.4.0: independent HTTP proxy module (iPhone proxy-free / no-VPN clients).
             // Non-fatal: its failure never downgrades the SOCKS5 session.
             val httpPort = startHttpProxyLocked(epoch, displayIp, server)
@@ -1115,9 +1106,9 @@ class HostService : Service() {
         stateEpoch.incrementAndGet()
         stateHandler.removeCallbacksAndMessages(null)
         stopProxyLocked()
-        // v1.5.45 (beta1.0.1): the file-transfer receiver dies with sharing.
-        fileTransferServer?.stop()
-        fileTransferServer = null
+        // beta1.0.93: the file-transfer receiver is a process-wide singleton
+        // and deliberately SURVIVES the sharing service — a client-mode phone
+        // (connected to the peer's hotspot, sharing off) must stay receivable.
         resetEndpoint()
         unregisterP2pRecoveryReceiver()
         wakeLock?.let { if (it.isHeld) it.release() }

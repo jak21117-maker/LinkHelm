@@ -11,19 +11,22 @@ datas += collect_data_files('customtkinter')
 # official exe is linked against — must ride along or the exe won't start).
 # Optional on purpose: absent until dropped into laptop_proxy/engine/, then
 # packed automatically so this very spec produces the lwIP-default package.
-# engine.py resolves LWIP_EXE next to itself (BIN_DIR/engine/...), hence
-# the 'engine' target dir (= _MEIPASS/engine in the frozen onedir layout),
-# and msys-2.0.dll / wintun.dll sit beside it so the .exe can load.
+# beta1.0.83: linkhelm_supervisor.exe — the C++ engine lifecycle supervisor
+# (Job Object cleanup, named-pipe control). See cpp/src/supervisor.cpp.
 _lwip_binaries = [
     ('engine/' + name, 'engine')
-    for name in ('hev-socks5-tunnel.exe', 'wintun.dll', 'msys-2.0.dll')
+    for name in ('hev-socks5-tunnel.exe', 'wintun.dll', 'msys-2.0.dll',
+                 'linkhelm_supervisor.exe', 'linkhelm_netops.exe',
+                 'linkhelm_ics.exe')
     if os.path.isfile('engine/' + name)
 ]
 
-# beta1.0.57: store accelerator kernel — UNMODIFIED official mihomo binary
-# (MetaCubeX/mihomo v1.19.33, GPL-3.0) shipped as a SEPARATE process file
-# (GPL does not extend to LinkHelm; see THIRD_PARTY_NOTICES.md for the
-# required source link). Optional like engine/: packed when present.
+# beta1.0.81: store accelerator kernel — the OFFICIAL mihomo (Clash Meta)
+# core, downloaded straight from the upstream MetaCubeX/mihomo GitHub
+# release v1.19.33 (the same open-source core the Clash Verge client ships;
+# SHA256 pinned in store_accel.MIHOMO_SHA256). Shipped as a SEPARATE
+# process file (GPL does not extend to LinkHelm; see THIRD_PARTY_NOTICES.md
+# for the required source link). Optional like engine/: packed when present.
 _mihomo_datas = (
     [('mihomo/mihomo.exe', 'mihomo')]
     if os.path.isfile('mihomo/mihomo.exe') else []

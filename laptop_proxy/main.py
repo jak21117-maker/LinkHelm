@@ -5,6 +5,7 @@ import atexit
 import traceback
 import file_transfer
 import store_accel
+import relay
 import queue
 import random
 import re
@@ -23,6 +24,11 @@ import zipfile
 import io
 import hashlib
 import platform
+
+# the user's personal panel token — shipping it (or leaving it in the source)
+# leaks their account, so the box starts empty and the user pastes their own
+# link. A previously used link is still restored at runtime from accel.json.
+DEFAULT_STORE_SUB_URL = ""
 import webbrowser
 from console_bridge import BridgeError, IcsManager
 # import symbols
@@ -33,7 +39,6 @@ if IS_WINDOWS:
     import winreg
     import ctypes
 
-# v1.4.93: keep the system awake while the tunnel runs. Long sessions were
 # dying after Windows entered Modern Standby / idle sleep (the user reports
 # "a process mounted too long gets killed by the Windows power policy" — the OS suspends the process tree
 # and the Wi-Fi Direct link, the engine freezes, the tunnel looks dead).
@@ -67,13 +72,11 @@ if IS_WINDOWS:
     subprocess.run = _silent_run
     subprocess.Popen = _silent_popen
 
-
 # --- Runtime UI language (i18n) --------------------------------------------
 # The external UI defaults to English. The user can switch to Chinese from
 # Settings; the app relaunches so every surface (main window + tray) updates
 # immediately. Internal comments and logs stay in English.
 LANG = "en"  # "en" (default) | "zh"
-
 
 def tr(en_text, zh_text):
     """Return the UI string for the active language.
@@ -81,7 +84,6 @@ def tr(en_text, zh_text):
     en_text is shown when LANG == "en" (default); zh_text when LANG == "zh".
     """
     return zh_text if LANG == "zh" else en_text
-
 
 def _set_system_awake(keep_awake: bool) -> bool:
     """v1.4.93: best-effort SetThreadExecutionState wrapper. True on success."""
@@ -94,7 +96,6 @@ def _set_system_awake(keep_awake: bool) -> bool:
     except Exception:
         return False
 
-
 # --- v1.5.4 (P0): Windows suspend/resume notification ---------------------------
 # The callback runs on a Win32 system thread and ONLY sets an Event — every
 # recovery decision stays inside the single TunManager state machine, never
@@ -102,7 +103,6 @@ def _set_system_awake(keep_awake: bool) -> bool:
 _PBT_APMRESUMEAUTOMATIC = 0x12
 _PBT_APMRESUMESUSPEND = 0x13
 _DEVICE_NOTIFY_CALLBACK = 2
-
 
 def _register_resume_notification(set_event):
     """PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK).
@@ -149,7 +149,6 @@ def _register_resume_notification(set_event):
     except Exception:
         return None
 
-
 def _unregister_resume_notification(reg):
     """Best-effort unregister — must not leave hidden callbacks behind."""
     if not reg:
@@ -158,7 +157,6 @@ def _unregister_resume_notification(reg):
         reg["unregister"](reg["handle"])
     except Exception:
         pass
-
 
 # Constants for binary management
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", "."), "LaptopProxy")
@@ -196,7 +194,6 @@ LANE_A_RECOVER_STRIKES = 6
 # --- Minimal hardening (Patch B, see CHANGES.md / DEPENDENCY_LOCK.md) -----------
 # Pinned dependency sources. SHA-256 values are of the exact ZIP files from the
 # official distribution points and were verified at build time.
-# beta1.0.5: tun2socks 已彻底移除，Windows 内核完全由 lwIP (hev-socks5-tunnel)
 # 承接。以下仅保留版本说明；原生二进制随安装包 engine/ 目录提供，不再运行时下载。
 WINTUN_VERSION = "0.14.1"
 LWIP_ENGINE_VERSION = "2.19.1"  # hev-socks5-tunnel，见 DEPENDENCY_LOCK.md
@@ -204,17 +201,13 @@ MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 # The virtual adapter created by this program always uses this gateway, so route
 # cleanup can target only routes that belong to LaptopProxy.
 OUR_TUN_GATEWAY = "10.0.0.1"
-# beta1.0.51: canonical Windows CONNECTION name of the tunnel adapter. The
-# network flyout and ncpa.cpl show the connection name, and every netsh
+TUN_LOCAL_IP = "10.0.0.2"# network flyout and ncpa.cpl show the connection name, and every netsh
 # config call addresses the adapter by it — a drifted name ("LinkHelm 31"
 # in the field) made those calls silent no-ops: no IP/DNS on the tunnel,
 # ERR_NAME_NOT_RESOLVED pages, and a confusing duplicate network entry.
 # _normalize_adapter_connection_name renames it back at every start.
 TUN_ADAPTER_NAME = "LinkHelm-IwIP"
 
-# v1.4.6: silent-elevation scheduled task + stale adapter cleanup.
-
-# v1.5.44: user-gated autostart. The legacy task above used to be re-created
 # with an onlogon trigger on EVERY elevated run — boot autostart was not the
 # user's choice. Split into two tasks under \LinkHelm\:
 #   ElevatedLauncher — NO trigger, only ever started via `schtasks /run`
@@ -228,7 +221,6 @@ LOGIN_STARTUP_ARG = "--login-startup"
 
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
 
-
 def load_app_settings():
     """v1.5.44: persisted user preferences (atomic-safe reader).
 
@@ -240,9 +232,10 @@ def load_app_settings():
         "schemaVersion": 1, "startAtLogon": False, "connectOnLaunch": False,
         # UI language: "en" (default) or "zh". Applied at startup.
         "language": "en",
-        # v1.5.47: fixed initial credentials (identical on both ends, never
         # randomized). Persisted only after the user edits them in Settings.
         "socksUser": DEFAULT_PHONE_USER, "socksPass": DEFAULT_PHONE_PASS,
+        # dialog opens and remembered across runs ("" = not set yet).
+        "recvDir": "",
     }
     try:
         import json
@@ -254,7 +247,6 @@ def load_app_settings():
                     defaults[key] = data[key]
     except Exception:
         pass
-    # v1.5.47: a persisted credential that no longer passes the 8-13 alnum
     # rule (corrupt edit / older schema) must not break the handshake —
     # fall back to the built-in defaults instead.
     if not (isinstance(defaults["socksUser"], str)
@@ -264,7 +256,6 @@ def load_app_settings():
             and SOCKS_CREDENTIAL_REGEX.match(defaults["socksPass"])):
         defaults["socksPass"] = DEFAULT_PHONE_PASS
     return defaults
-
 
 def save_app_settings(settings):
     """v1.5.44: atomic JSON write (temp file → fsync → replace)."""
@@ -276,7 +267,6 @@ def save_app_settings(settings):
         fout.flush()
         os.fsync(fout.fileno())
     os.replace(tmp_path, SETTINGS_PATH)
-
 
 def _resolve_tun_connection_name(timeout=15):
     """beta1.0.51: resolve the ACTUAL connection name of our tunnel adapter.
@@ -310,7 +300,6 @@ def _resolve_tun_connection_name(timeout=15):
         if current and ("10.0.0.1" in line or "10.0.0.2" in line):
             return current
     return None
-
 
 def _cleanup_stale_tun_adapters(log_fn):
     """beta1.0.5: remove LEGACY LinkHelm*/LaptopProxyVPN* Wintun adapters,
@@ -384,20 +373,22 @@ def _cleanup_stale_tun_adapters(log_fn):
     except Exception:
         pass  # best effort — never block startup on hygiene
 
-
 def _cleanup_stale_wlan_profiles(log_fn):
     """beta1.0.52: drop numbered duplicate WLAN profiles ("LinkHelm 2".."LinkHelm 31").
 
-    beta1.0.55: NO LONGER CALLED AUTOMATICALLY. Deleting the profile of the
-    network Windows is currently associated with drops the association, which
-    is the reported "检测连通性 / 连接失败时电脑会断开 WiFi". Kept for manual
-    hygiene only, and hardened so that even if it is ever re-enabled it skips
-    the profile of any currently connected interface (see the guard below).
+    beta1.0.64: CALLED AGAIN at startup, with a second guard. Every Wi-Fi
+    Direct / hotspot session makes Windows save ANOTHER numbered profile
+    ("LinkHelm 2" ... "LinkHelm 31"), and each stale one keeps showing up in
+    the network flyout as "无法访问 Internet" forever (see the reported
+    screenshot). It was disabled in beta1.0.55 because deleting the profile
+    of the network Windows is currently associated with drops the link; the
+    guard below now skips BOTH the exact active profile/SSID and its base
+    name, so an in-use "LinkHelm 31" can never be deleted even when the
+    interface only reports the SSID "LinkHelm".
     """
     if not IS_WINDOWS:
         return
     try:
-        # beta1.0.55: safety guard. Windows drops the association when you
         # delete the profile of the network it is currently using, so collect
         # every profile/SSID that is live on any WLAN interface and never
         # touch those. (zh-CN output uses "配置文件", en-US uses "Profile".)
@@ -414,14 +405,42 @@ def _cleanup_stale_wlan_profiles(log_fn):
                 if v:
                     active.add(v)
 
+        # being auto-connected — the sweep must never race the association it
+        # is supposed to protect.
+        # "LinkHelm-5", "linkhelm 12" ... every hotspot/Wi-Fi-Direct session
+        # can mint another numbered clone).
+        if any(a.lower().strip().startswith(("linkhelm", "direct-linkhelm"))
+               for a in active):
+            return
+
         _, out, _ = _run_decoded(["netsh", "wlan", "show", "profiles"], timeout=15)
         stale = set()
         for line in (out or "").splitlines():
             name = line.split(":", 1)[1].strip() if ":" in line else ""
-            # Keep "LinkHelm", "DIRECT-LinkHelm"; sweep "LinkHelm 2".."LinkHelm N".
-            if re.fullmatch(r"(DIRECT-)?LinkHelm \d+", name):
+            # beta1.0.7 NAME-DRIFT sweep: delete every drifted clone —
+            # "(DIRECT-)LinkHelm" followed by ANY suffix ("LinkHelm 31",
+            # "LinkHelm-7", case-insensitive). The bare base names
+            # ("LinkHelm", "DIRECT-LinkHelm") are KEPT: auto-reconnect to
+            # the phone uses them, deleting those is what broke 1.0.55.
+            low = name.lower().strip()
+            if low in ("linkhelm", "direct-linkhelm") or not low:
+                continue
+            if low.startswith(("linkhelm", "direct-linkhelm")):
                 stale.add(name)
-        stale -= active
+        # live ("LinkHelm 31" while the interface reports SSID "LinkHelm")
+        # must survive, otherwise the association drops — the beta1.0.55
+        # "电脑会断开 WiFi" report. beta1.0.7: base-normalise the drift too
+        # (any "…linkhelm…" name collapses to its family root).
+        def _base(n):
+            low = n.lower().strip()
+            if low.startswith("direct-linkhelm"):
+                return "direct-linkhelm"
+            if low.startswith("linkhelm"):
+                return "linkhelm"
+            return low
+
+        live_bases = {_base(a) for a in active}
+        stale = {n for n in stale if n not in active and _base(n) not in live_bases}
         for name in sorted(stale):
             _run_decoded(
                 ["netsh", "wlan", "delete", "profile", f"name={name}"], timeout=15
@@ -433,9 +452,7 @@ def _cleanup_stale_wlan_profiles(log_fn):
     except Exception:
         pass  # best effort — never block startup on hygiene
 
-
 # ---------------------------------------------------------------------------
-# beta1.0.55: Windows connectivity indicator ("No Internet" / "无法访问 Internet")
 #
 # The network flyout and the Network & Internet settings page show EVERY
 # LinkHelm network — the Wi-Fi Direct group and the tunnel adapter — as
@@ -459,6 +476,446 @@ def _cleanup_stale_wlan_profiles(log_fn):
 NCSI_REG_KEY = r"HKLM\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet"
 NCSI_PROBE_VALUE = "EnableActiveProbing"
 
+# beta1.0.82+ (settled): NCSI stays at the MICROSOFT DEFAULTS. The old
+# 1.0.71..1.0.81 "probe Baidu instead" idea was disproven live — with the
+# tunnel up, Microsoft's endpoints are reachable through the phone upstream,
+# and the flyout showed "Internet" the moment the defaults were restored.
+# _set_domestic_ncsi_probe() therefore only HEALS leftovers back to defaults.
+NCSI_PROBE_VALUES = ("ActiveWebProbeHost", "ActiveWebProbePath",
+                     "ActiveWebProbeContent",
+                     "ActiveWebProbeContentMatch",
+                     "ActiveWebProbeHostV6", "ActiveWebProbePathV6",
+                     "ActiveWebProbeContentV6")
+NCSI_MICROSOFT_DEFAULT = {
+    "ActiveWebProbeHost": "www.msftconnecttest.com",
+    "ActiveWebProbePath": "/connecttest.txt",
+    "ActiveWebProbeContent": "Microsoft Connect Test",
+    "ActiveWebProbeContentMatch": "Microsoft Connect Test",
+    "ActiveWebProbeHostV6": "ipv6.msftconnecttest.com",
+    "ActiveWebProbePathV6": "/connecttest.txt",
+    "ActiveWebProbeContentV6": "Microsoft Connect Test",
+}
+
+def _reg_key_writable(root, path):
+    try:
+        key = winreg.OpenKey(root, path, 0, winreg.KEY_SET_VALUE)
+        winreg.CloseKey(key)
+        return True
+    except OSError:
+        return False
+
+def _set_domestic_ncsi_probe(log_fn=lambda _m: None):
+    """beta1.0.82 (semantics changed): heal NCSI back to Microsoft defaults.
+
+    Older builds (1.0.71..1.0.81) pointed the probe at Baidu; the redirect is
+    now known to be wrong (see the history block above). This overwrites
+    every probe value with the Microsoft default — leftover Baidu values from
+    a crashed older session get cleaned up too. No backup is taken because we
+    never write anything but the Microsoft defaults; there is nothing
+    session-specific to restore.
+    Returns True when the key was writable (elevated session).
+    """
+    if not IS_WINDOWS:
+        return False
+    global _ncsi_probe_backup
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet",
+            0, winreg.KEY_READ | winreg.KEY_SET_VALUE)
+    except OSError:
+        log_fn("NOTE: NCSI probe values left untouched (needs administrator "
+               "rights).")
+        return False
+    changed = False
+    try:
+        for name in NCSI_PROBE_VALUES:
+            target = NCSI_MICROSOFT_DEFAULT[name]
+            try:
+                current, _ = winreg.QueryValueEx(key, name)
+            except OSError:
+                current = None
+            if current != target:
+                winreg.SetValueEx(key, name, 0, winreg.REG_SZ, target)
+                changed = True
+    finally:
+        winreg.CloseKey(key)
+    _ncsi_probe_backup = None  # nothing session-specific to restore
+    if changed:
+        log_fn("[ncsi] probe values healed to Microsoft defaults (cleaned "
+               "any leftover Baidu redirect from 1.0.71..1.0.81).")
+        # Restart NlaSvc so the cached verdict is dropped and the next probe
+        # runs immediately with the healed values (beta1.0.82).
+        _restart_nlasvc(log_fn)
+    else:
+        log_fn("[ncsi] probe values already at Microsoft defaults.")
+    return True
+
+def _restart_nlasvc(log_fn=lambda _m: None):
+    """beta1.0.81: force NCSI to re-probe with the freshly written values.
+
+    Only called after a successful elevated registry write. Without the
+    restart Windows may keep serving the cached captive-portal verdict for
+    the LinkHelm-IwIP network until an arbitrary future re-probe.
+    """
+    if not IS_WINDOWS:
+        return
+    import subprocess
+    try:
+        stop = subprocess.run(["net", "stop", "nlasvc", "/y"],
+                              capture_output=True, timeout=30)
+        log_fn("[ncsi] net stop nlasvc -> rc=%d %s" % (
+            stop.returncode,
+            (stop.stderr or stop.stdout or b"").decode("utf-8", "replace").strip()))
+    except Exception as exc:
+        log_fn("[ncsi] net stop nlasvc failed: %s" % exc)
+    try:
+        start = subprocess.run(["net", "start", "nlasvc"],
+                               capture_output=True, timeout=30)
+        log_fn("[ncsi] net start nlasvc -> rc=%d %s" % (
+            start.returncode,
+            (start.stderr or start.stdout or b"").decode("utf-8", "replace").strip()))
+    except Exception as exc:
+        log_fn("[ncsi] net start nlasvc failed: %s" % exc)
+
+def _restore_ncsi_probe(log_fn=lambda _m: None):
+    """beta1.0.82: nothing to restore — probe values stay at Microsoft
+    defaults for the whole session (kept as a no-op for the exit paths that
+    still call it, so old call sites don't need rewriting)."""
+    return False
+
+_ncsi_probe_backup = None
+
+# Crashed beta1.0.55/1.0.71 sessions left EnableActiveProbing=0 behind; the
+# network flyout then showed "无法访问 Internet" for every network even before
+# the user ever connected (re-confirmed live on 1.0.72). The original value
+# is restored at process exit.
+_startup_ncsi_heal = None
+
+def _atexit_restore_startup_heal():
+    global _startup_ncsi_heal
+    if _startup_ncsi_heal is None:
+        return
+    val, _startup_ncsi_heal = _startup_ncsi_heal, None
+    try:
+        _set_ncsi_probing(bool(val))
+    except Exception:
+        pass
+    try:
+        _restore_ncsi_probe()
+    except Exception:
+        pass
+
+def _heal_ncsi_at_startup(log_fn=lambda _m: None):
+    global _startup_ncsi_heal
+    if not IS_WINDOWS:
+        return
+    present, previous = _read_ncsi_probing()
+    _startup_ncsi_heal = previous if present else 1
+    if _startup_ncsi_heal != 1:
+        if _set_ncsi_probing(True, log_fn):
+            log_fn("[ncsi] healed a stale disabled probe state at launch "
+                   "(left by an older build); restored at exit.")
+    _set_domestic_ncsi_probe(log_fn)
+    atexit.register(_atexit_restore_startup_heal)
+
+# ---------------------------------------------------------------------------
+#
+# Get-NetConnectionProfile shows it plainly: the app's own lwIP tunnel
+# adapter ("LinkHelm-IwIP") gets a NEW net-connection-profile NAME on every
+# session ("LinkHelm 2", "LinkHelm 3", ... "LinkHelm 31"). Windows lists each
+# profile in the network flyout, NCSI can't probe it, so every ghost shows
+# "无法访问 Internet" forever. Cleaning WLAN profiles (1.0.63..1.0.7) treated
+# the wrong layer — the fix lives in the NetworkList (INetworkListManager):
+# delete every DISCONNECTED "LinkHelm*" network, and rename the connected one
+# to the fixed name "LinkHelm" so the drift can never start again.
+# ---------------------------------------------------------------------------
+_NLM_CLSID = "{DCB00C01-570F-4A9B-8D69-199FDBA5723B}"
+_NLM_IID = "{DCB00000-570F-4A9B-8D69-199FDBA5723B}"
+_ENUM_IID = "{DCB00002-570F-4A9B-8D69-199FDBA5723B}"
+_NET_IID = "{DCB00001-570F-4A9B-8D69-199FDBA5723B}"
+
+def _nlm_collect():
+    """(release_fn, [(name, connected, net_ptr)]) via raw COM vtables."""
+    import ctypes
+    from ctypes import c_void_p, c_ulong, c_int16, POINTER, byref, cast
+
+    ole32 = ctypes.OleDLL("ole32")
+    ole32.CoInitializeEx(None, 0)
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("d1", ctypes.c_ulong), ("d2", ctypes.c_ushort),
+                    ("d3", ctypes.c_ushort), ("d4", ctypes.c_ubyte * 8)]
+
+    def mk(s):
+        import uuid
+        u = uuid.UUID(s)
+        b = u.bytes_le
+        g = GUID()
+        g.d1 = int.from_bytes(b[0:4], "little")
+        g.d2 = int.from_bytes(b[4:6], "little")
+        g.d3 = int.from_bytes(b[6:8], "little")
+        g.d4 = (ctypes.c_ubyte * 8)(*b[8:16])
+        return g
+
+    clsid = mk(_NLM_CLSID)
+    iid = mk(_NLM_IID)
+    enum_iid = mk(_ENUM_IID)
+    net_iid = mk(_NET_IID)
+
+    p = c_void_p()
+    hr = ole32.CoCreateInstance(byref(clsid), None, 1,  # CLSCTX_INPROC_SERVER
+                                byref(iid), byref(p))
+    if hr != 0 or not p:
+        raise OSError("CoCreateInstance(NetworkListManager) 0x%08X" % hr)
+
+    vtbl = cast(p, POINTER(c_void_p)).contents.value
+    table = ctypes.cast(vtbl, POINTER(c_void_p))
+
+    # slot 7: GetNetworks(flags, &enum)
+    get_nets = ctypes.WINFUNCTYPE(ctypes.HRESULT, c_void_p, c_ulong,
+                                  POINTER(c_void_p))(table[7])
+    enum_p = c_void_p()
+    hr = get_nets(p, 3, byref(enum_p))  # CONNECTED|DISCONNECTED
+    if hr != 0 or not enum_p:
+        raise OSError("GetNetworks 0x%08X" % hr)
+
+    e_vtbl = cast(enum_p, POINTER(c_void_p)).contents.value
+    e_table = ctypes.cast(e_vtbl, POINTER(c_void_p))
+    # slot 8: Next(celt, rgelt, &fetched) — IEnumNetworks : IDispatch,
+    # get__NewEnum sits at 7, Next at 8 (verified against netlistmgr.h).
+    next_fn = ctypes.WINFUNCTYPE(ctypes.HRESULT, c_void_p, c_ulong,
+                                 POINTER(c_void_p), POINTER(c_ulong))(e_table[8])
+
+    out = []
+    while True:
+        one = c_void_p()
+        fetched = c_ulong(0)
+        hr = next_fn(enum_p, 1, byref(one), byref(fetched))
+        if hr != 0 or fetched.value == 0 or not one:
+            break
+        n_vtbl = cast(one, POINTER(c_void_p)).contents.value
+        n_table = ctypes.cast(n_vtbl, POINTER(c_void_p))
+        # slot 7 GetName(BSTR*) ; slot 15 IsConnected(VARIANT_BOOL*)
+        get_name = ctypes.WINFUNCTYPE(ctypes.HRESULT, c_void_p,
+                                      POINTER(c_void_p))(n_table[7])
+        is_conn = ctypes.WINFUNCTYPE(ctypes.HRESULT, c_void_p,
+                                     POINTER(c_int16))(n_table[16])
+        bstr = c_void_p()
+        conn = c_int16(0)
+        name = ""
+        if get_name(one, byref(bstr)) == 0 and bstr.value:
+            s = ctypes.windll.oleaut32.SysStringLen(bstr)
+            name = ctypes.wstring_at(bstr.value, s)
+            ctypes.windll.oleaut32.SysFreeString(bstr)
+        is_conn(one, byref(conn))
+        out.append((name, bool(conn), one))
+
+    def _slot(vtbl_addr, idx):
+        tbl = ctypes.cast(vtbl_addr, POINTER(c_void_p))
+        return tbl[idx]
+
+    def _release_if(p):
+        if not p:
+            return
+        release_fn = ctypes.WINFUNCTYPE(c_ulong, c_void_p)(_slot(
+            ctypes.cast(p, POINTER(c_void_p)).contents.value, 2))
+        release_fn(p)
+
+    def _release():
+        for _n, _c, ptr in out:
+            _release_if(ptr)
+        _release_if(enum_p)
+        _release_if(p)
+        ole32.CoUninitialize()
+
+    return _release, out
+
+def sweep_ghost_linkhelm_networks(log_fn=lambda _m: None):
+    """Delete drifted "LinkHelm 2..N" ghost network-list entries.
+
+    beta1.0.71, verified live: the flyout ghosts are net-connection-profiles
+    of the app's own lwIP adapter ("LinkHelm-IwIP") — one new drifted name
+    ("LinkHelm 2" .. "LinkHelm 37") per session, each showing
+    "无法访问 Internet" forever. Two fixes, both needed:
+
+    1. the CONNECTED session's profile is RENAMED to the fixed "LinkHelm"
+       (INetwork::SetName via IDispatch) so the drift can never start again;
+    2. DISCONNECTED ghosts are deleted from the NetworkList store
+       (HKLM/.../NetworkList "Profiles" + "Signatures") — the real INetwork
+       interface has no Delete method (verified live: DISP_E_UNKNOWNNAME),
+       so the registry store is the only way. Needs administrator rights,
+       which the app already has for its routes.
+
+    "DIRECT-LinkHelm" (the phone's Wi-Fi Direct network) is NEVER touched.
+    Returns the count of deleted ghosts; errors are logged, never raised.
+    """
+    if not IS_WINDOWS:
+        return 0
+    # ---- pass 1: COM enumeration — who is connected? -------------------
+    try:
+        release, nets = _nlm_collect()
+    except Exception as exc:
+        log_fn("[netlist] unavailable (%s) — ghost entries untouched" % exc)
+        return 0
+    ghosts, live_drift = set(), None
+    try:
+        for name, connected, _ptr in nets:
+            low = (name or "").strip().lower()
+            if low == "direct-linkhelm":
+                continue  # the phone's Wi-Fi Direct network — untouchable
+            if not (low == "linkhelm" or low.startswith("linkhelm ")):
+                continue
+            if connected:
+                if low != "linkhelm":
+                    live_drift = name
+            else:
+                ghosts.add(name)
+    finally:
+        try:
+            release()
+        except Exception:
+            pass
+
+    # ---- pass 2: rename the live drift so no NEW numbers appear ---------
+    renamed = 0
+    if live_drift:
+        try:
+            release2, nets2 = _nlm_collect()
+            try:
+                import ctypes
+                from ctypes import c_void_p, c_long, c_uint, c_ushort, \
+                    c_ulong, POINTER
+                GUID_NULL = ctypes.create_string_buffer(16)
+                SysAllocString = ctypes.windll.oleaut32.SysAllocString
+                SysAllocString.restype = c_void_p
+
+                def vtbl(p, idx):
+                    return ctypes.cast(ctypes.cast(p, POINTER(c_void_p)).contents,
+                                       POINTER(c_void_p))[idx]
+
+                for name, connected, ptr in nets2:
+                    if name != live_drift or not connected:
+                        continue
+                    # IDispatch::GetIDsOfNames("SetName") -> dispid
+                    names = (c_void_p * 1)(SysAllocString("SetName"))
+                    disp = (c_long * 1)()
+                    get_ids = ctypes.WINFUNCTYPE(
+                        ctypes.HRESULT, c_void_p, c_void_p, c_void_p,
+                        c_uint, c_ulong, POINTER(c_long))(vtbl(ptr, 5))
+                    hr = get_ids(ptr, ctypes.byref(GUID_NULL), names,
+                                 1, 0x0409, disp)
+                    if hr != 0:
+                        break
+                    # VARIANT {vt=VT_BSTR, bstrVal="LinkHelm"}
+                    var = (c_ushort * 4)()
+                    ctypes.cast(var, POINTER(c_ushort))[0] = 8  # VT_BSTR
+                    ctypes.cast(var, POINTER(c_void_p))[1] = \
+                        SysAllocString("LinkHelm")
+                    # DISPPARAMS{rgvarg=&var, rgdispidNamedArgs=None,
+                    #            cArgs=1, cNamedArgs=0}
+                    args_buf = (c_void_p * 4)()
+                    args_buf[0] = ctypes.addressof(var)
+                    args_buf[2] = 1  # cArgs
+                    inv = ctypes.WINFUNCTYPE(
+                        ctypes.HRESULT, c_void_p, c_long, c_void_p,
+                        c_ulong, c_ushort, c_void_p, c_void_p,
+                        c_void_p, c_void_p)(vtbl(ptr, 6))
+                    try:
+                        hr = inv(ptr, disp[0], ctypes.byref(GUID_NULL),
+                                 0x0409, 1, ctypes.addressof(args_buf),
+                                 None, None, None)
+                    except OSError as exc:
+                        # DISP_E_EXCEPTION (0x80020009) from NLM = the caller
+                        # lacks the rights to rename the connection profile.
+                        if getattr(exc, "winerror", None) == -2147352567:
+                            log_fn("[netlist] rename of \"%s\" rejected by "
+                                   "Windows — needs administrator rights"
+                                   % live_drift)
+                            break
+                        raise
+                    if hr == 0:
+                        renamed = 1
+                        log_fn("[netlist] renamed \"%s\" -> "
+                               "\"LinkHelm\" (fixed name, no more "
+                               "drift)" % live_drift)
+                    else:
+                        log_fn("[netlist] rename failed 0x%08X "
+                               "(needs administrator rights)" % hr)
+                    break
+            finally:
+                release2()
+        except Exception as exc:
+            log_fn("[netlist] rename of \"%s\" failed: %s" % (live_drift, exc))
+
+    # ---- pass 3: delete disconnected ghosts from the NetworkList store --
+    deleted = 0
+    if not ghosts:
+        return renamed
+    try:
+        import winreg
+        base = (r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+                r"\NetworkList")
+        targets = {g.lower() for g in ghosts}
+
+        def _match(name_val):
+            return (name_val or "").strip().lower() in targets
+
+        def _purge(root_key, path):
+            n = 0
+            try:
+                key = winreg.OpenKey(root_key, path, 0,
+                                     winreg.KEY_READ | winreg.KEY_SET_VALUE)
+            except OSError:
+                return 0
+            try:
+                subs = []
+                i = 0
+                while True:
+                    try:
+                        subs.append(winreg.EnumKey(key, i)); i += 1
+                    except OSError:
+                        break
+                for sub in subs:
+                    sub_path = path + "\\" + sub
+                    try:
+                        sk = winreg.OpenKey(key, sub)
+                    except OSError:
+                        continue
+                    name_val = None
+                    for vn in ("ProfileName", "Name"):
+                        try:
+                            name_val, _ = winreg.QueryValueEx(sk, vn)
+                            break
+                        except OSError:
+                            continue
+                    winreg.CloseKey(sk)
+                    if _match(name_val):
+                        try:
+                            winreg.DeleteKey(key, sub)
+                            n += 1
+                            continue
+                        except OSError:
+                            pass
+                    n += _purge(root_key, sub_path)
+            finally:
+                winreg.CloseKey(key)
+            return n
+
+        deleted += _purge(winreg.HKEY_LOCAL_MACHINE, base + r"\Profiles")
+        deleted += _purge(winreg.HKEY_LOCAL_MACHINE, base + r"\Signatures")
+    except Exception as exc:
+        log_fn("[netlist] registry cleanup failed (%s) — needs "
+               "administrator rights" % exc)
+        return renamed
+    if deleted:
+        log_fn("[netlist] removed %d ghost network(s): %s"
+               % (deleted, ", ".join(sorted(ghosts))))
+    elif ghosts:
+        log_fn("[netlist] %d ghost(s) found (%s) but none removable — "
+               "needs administrator rights" % (len(ghosts),
+                                               ", ".join(sorted(ghosts))))
+    return deleted
 
 def _read_ncsi_probing():
     """beta1.0.55: current EnableActiveProbing state as (present, value)."""
@@ -482,7 +939,6 @@ def _read_ncsi_probing():
         # must never influence startup. "Not present" → caller uses the default.
         return (False, None)
 
-
 def _set_ncsi_probing(enabled, log_fn=lambda _m: None):
     """beta1.0.55: enable/disable NCSI active probing. Returns True on success."""
     if not IS_WINDOWS:
@@ -504,12 +960,9 @@ def _set_ncsi_probing(enabled, log_fn=lambda _m: None):
         return False
     return True
 
-
-# beta1.0.55: safety net. Every normal exit path goes through TunManager.stop(),
 # but a hard kill (Task Manager, power loss) would leave NCSI probing disabled
 # for good. atexit covers the ordinary "close the window / Ctrl-C" cases.
 _ACTIVE_TUN_MANAGER = None
-
 
 def _atexit_restore_ncsi():
     manager = _ACTIVE_TUN_MANAGER
@@ -520,9 +973,7 @@ def _atexit_restore_ncsi():
     except Exception:
         pass
 
-
 atexit.register(_atexit_restore_ncsi)
-
 
 def _thread_excepthook(args):
     """beta1.0.55: never let a worker-thread exception vanish silently.
@@ -545,19 +996,21 @@ def _thread_excepthook(args):
     except Exception:
         pass
 
-
 threading.excepthook = _thread_excepthook
 
-
 def _route_gateways(dest, mask):
-    """beta1.0.52: module-level route lookup — list of gateways serving dest/mask.
+    """Route lookup — list of gateways serving dest/mask.
 
-    Extracted from TunManager so the App-launch route sweep can use it without
-    instantiating a full TunManager.
+    beta1.0.84: routed through the C++ netops module; the legacy Python
+    `route print` parser below is the fallback for old packages.
     """
     try:
-        # v1.3.2: _run_decoded — text=True lost GBK "route print" output on
-        # zh-CN Windows, silently disabling route ownership detection.
+        import cpp_bridge
+        if cpp_bridge.netops_available():
+            return cpp_bridge.route_gateways(dest, mask)
+    except Exception:
+        pass
+    try:
         _, out, _ = _run_decoded(["route", "print", "-4"], timeout=15)
     except Exception:
         return []
@@ -570,6 +1023,65 @@ def _route_gateways(dest, mask):
             gateways.append(parts[2])
     return gateways
 
+def _route_bindings(dest, mask):
+    """beta1.0.72: (gateway, interface_ip) pairs serving dest/mask.
+
+    `route print -4` prints the INTERFACE column as the interface's own IP
+    address (not the ifIndex). The TUN interface is the one holding 10.0.0.2,
+    so a /1 route bound to e.g. 192.168.49.74 (the WLAN) is visibly mis-bound.
+    Live evidence (beta1.0.71 machine): `route add 0.0.0.0 mask 128.0.0.0
+    10.0.0.1` bound the /1 route to the WLAN interface instead of the TUN —
+    Windows resolved the gateway against whatever interface had a path to
+    10.0.0.1 at that moment. Half the IP space then rides a route whose
+    gateway is only properly reachable through the other adapter:
+    intermittent, destination-dependent timeouts ("连通性很差").
+    """
+    try:
+        _, out, _ = _run_decoded(["route", "print", "-4"], timeout=15)
+    except Exception:
+        return []
+    if not out:
+        return []
+    pairs = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0] == dest and parts[1] == mask:
+            # interface column is an IPv4 dotted quad; skip anything else
+            if parts[3].count(".") == 3:
+                pairs.append((parts[2], parts[3]))
+    return pairs
+
+def _tun_interface_index(name=None):
+    """Interface index of the LinkHelm-IwIP adapter (0 if unknown).
+
+    beta1.0.84: resolved via the C++ netops module (GBK-safe); the Python
+    netsh parser below is the fallback for old packages. The TUN adapter is
+    persistent (fixed GUID), so its index survives across sessions.
+    """
+    try:
+        import cpp_bridge
+        if cpp_bridge.netops_available():
+            idx = cpp_bridge.if_index(name or TUN_ADAPTER_NAME)
+            if idx:
+                return idx
+    except Exception:
+        pass
+    try:
+        _, out, _ = _run_decoded(
+            ["netsh", "interface", "ipv4", "show", "interfaces"], timeout=15
+        )
+    except Exception:
+        return 0
+    want = (name or TUN_ADAPTER_NAME).strip().lower()
+    for line in (out or "").splitlines():
+        parts = line.split()
+        # columns: Idx Met MTU State Name
+        if len(parts) >= 5 and parts[-1].lower() == want:
+            try:
+                return int(parts[0])
+            except ValueError:
+                continue
+    return 0
 
 def _sweep_stale_tunnel_routes(log_fn):
     """beta1.0.52: delete stale routes pointing at our TUN gateway (10.0.0.1).
@@ -604,7 +1116,6 @@ def _sweep_stale_tunnel_routes(log_fn):
     except Exception:
         pass  # best effort — never block startup on hygiene
 
-
 def _find_foreign_engine_procs():
     """beta1.0.5: image names of any hev-socks5-tunnel process already running.
 
@@ -633,7 +1144,6 @@ def _find_foreign_engine_procs():
         )
     except Exception:
         return ()
-
 
 def _kill_engine_procs_all(log_fn=None):
     """beta1.0.5: force-kill EVERY hev-socks5-tunnel process and its children.
@@ -675,7 +1185,6 @@ def _kill_engine_procs_all(log_fn=None):
         )
     except Exception:
         pass
-    # beta1.0.5: VERIFY death instead of a fixed 0.8s nap. Windows can take a
     # few seconds to actually reap a force-killed process; a reconnect issued
     # in that window saw the old tunnel still holding the TUN adapter ("always
     # occupied, cannot connect"). Poll until the image names are gone (max ~6s).
@@ -704,7 +1213,6 @@ def _kill_engine_procs_all(log_fn=None):
             log_fn("All leftover engine processes have been ended.")
     return names
 
-
 def _launch_via_scheduled_task():
     """Start the elevated instance through the registered scheduled task.
 
@@ -722,14 +1230,12 @@ def _launch_via_scheduled_task():
         pass
     return False
 
-
 def _schtasks_task_exists(name):
     try:
         rc, _, _ = _run_decoded(["schtasks", "/query", "/tn", name], timeout=15)
         return rc == 0
     except Exception:
         return False
-
 
 def _ensure_elevation_task(log_fn=None):
     """(elevated context) Create/refresh the trigger-less elevation task.
@@ -760,7 +1266,6 @@ def _ensure_elevation_task(log_fn=None):
         if log_fn:
             log_fn(f"Warning: silent-elevation task creation failed; the next manual launch will show a UAC prompt. {error}")
     return False
-
 
 def _sync_login_startup(enabled, log_fn=None):
     """v1.5.44: make \\LinkHelm\\LoginStartup match the user's choice.
@@ -800,8 +1305,6 @@ def _sync_login_startup(enabled, log_fn=None):
             log_fn(f"Autostart setting change failed: {error}")
         return False
 
-
-# v1.4.61: link-warmer pacing (see TunManager._link_keepalive_loop).
 # Adaptive cadence per user request: 30s while healthy, 15s once degraded;
 # 3 consecutive misses at 15s (~45s of continuous unreachability) trigger an
 # early rebuild check — the rebuild re-runs the retrying precheck first, so
@@ -825,13 +1328,11 @@ CRASH_COOLDOWN_MAX = 3
 # when the tunnel is genuinely broken after the whole window.
 RESUME_GRACE_DELAYS_S = (2, 5, 10)
 
-# v1.4.4: runtime integrity lock. These are the SHA-256 digests of the official
 # binaries bundled with this package (verified against upstream at build time,
 # see DEPENDENCY_LOCK.md). Because this program runs with administrator rights,
 # an swapped cached binary would be a real privilege-escalation vector, so both
 # the installed copies and the bundled copies are re-verified before every use.
 EXPECTED_BIN_SHA256 = {
-    # beta1.0.5: tun2socks 已移除，内核完全由 lwIP (hev-socks5-tunnel) 承接。
     # 以下为随安装包 engine/ 目录提供的原生二进制，构建时 SHA-256 锁定，
     # 运行时再次校验（程序以管理员权限运行，防止被替换的缓存二进制提权）。
     "hev-socks5-tunnel.exe": "242557dc4ada5a45bcc02d98a558e86dd29025efdf7960b8e302bfc2ad1901c5",
@@ -839,12 +1340,10 @@ EXPECTED_BIN_SHA256 = {
     "msys-2.0.dll": "1410599ee2efcede0869abec8910398d688755952e59cf7983b15cac6de78201",
 }
 
-# beta1.0.5: lwIP (hev-socks5-tunnel) 以固定 GUID 复用同一个 Wintun 适配器
 # （engine.ADAPTER_GUID → YAML tunnel.guid，WintunCreateAdapter 按 GUID 重开），
 # 适配器名为 LinkHelm-IwIP；启动时 _cleanup_stale_tun_adapters 只清除旧模式
 # （LinkHelm/LinkHelm N/LaptopProxyVPN*，含 tun2socks 遗留）而保留本适配器，
 # 实现"先清旧 → 建新 → 后续复用"，不再出现 "LinkHelm-IwIP 2/3/4"。
-
 
 def _file_sha256(path):
     h = hashlib.sha256()
@@ -852,7 +1351,6 @@ def _file_sha256(path):
         for chunk in iter(lambda: fin.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
-
 
 def _verify_bins(pairs):
     """Verify a list of (name, path) against the integrity lock.
@@ -868,7 +1366,6 @@ def _verify_bins(pairs):
             return False, name
     return True, None
 
-
 def _bundled_bin_dir():
     """Directory holding the build-time-verified binaries shipped with the package."""
     base = getattr(sys, "_MEIPASS", None)
@@ -878,7 +1375,6 @@ def _bundled_bin_dir():
     if os.path.isdir(local):
         return local
     return None
-
 
 def socks5_greet(conn, socks_user=None, socks_pass=None, timeout=3.0):
     """v1.5.47: shared SOCKS5 greeting + optional RFC 1929 userpass auth.
@@ -930,7 +1426,6 @@ def socks5_greet(conn, socks_user=None, socks_pass=None, timeout=3.0):
     except OSError as exc:
         return f"SOCKS5_IO_FAILED({type(exc).__name__})"
 
-
 def check_socks5(host, port, timeout=3.0, socks_user=None, socks_pass=None):
     """v1.3 preflight before Wintun/route changes, with separate TCP/SOCKS errors.
 
@@ -961,7 +1456,6 @@ def check_socks5(host, port, timeout=3.0, socks_user=None, socks_pass=None):
         except OSError as exc:
             return f"SOCKS5_IO_FAILED({type(exc).__name__})"
 
-
 # v1.4.2 stability: Wi-Fi Direct power-save can swallow a single connect attempt
 # (field log: tun2socks "i/o timeout" blips to 192.168.49.1:8080). One blip must
 # never fail a whole VPN start or trigger a tunnel rebuild, so the precheck and
@@ -969,12 +1463,10 @@ def check_socks5(host, port, timeout=3.0, socks_user=None, socks_pass=None):
 TRANSIENT_PRECHECK_PREFIXES = ("TCP_CONNECT_FAILED", "SOCKS5_IO_FAILED")
 TRANSIENT_PRECHECK_RESULTS = {"TCP_CONNECT_TIMEOUT", "SOCKS5_HANDSHAKE_TIMEOUT"}
 
-
 def is_transient_precheck(result):
     return result in TRANSIENT_PRECHECK_RESULTS or result.startswith(
         TRANSIENT_PRECHECK_PREFIXES
     )
-
 
 def check_socks5_with_retry(host, port, attempts=4, delay=2.0, timeout=6.0,
                             log_fn=None, sleep_fn=time.sleep,
@@ -1008,7 +1500,6 @@ def check_socks5_with_retry(host, port, attempts=4, delay=2.0, timeout=6.0,
             return result
     return result
 
-
 def _build_dns_query(qid, name="example.com"):
     """v1.4.3: minimal DNS A query for the UDP reachability check."""
     out = bytearray()
@@ -1023,8 +1514,6 @@ def _build_dns_query(qid, name="example.com"):
     out += b"\x00\x01\x00\x01"  # QTYPE=A QCLASS=IN
     return bytes(out)
 
-
-# v1.4.93: UDP/DNS probe pool. The phone's upstream decides which resolvers
 # actually answer over its cellular/wi-fi UDP path — a fixed dual-DNS list
 # still missed carriers that close one of them (real device: UDP handshake to
 # 223.5.5.5 "forcibly closed by remote host"). Order matters: 119.29.29.29
@@ -1032,7 +1521,6 @@ def _build_dns_query(qid, name="example.com"):
 # carrier-friendly fallback. The first probe that succeeds becomes the
 # sticky primary for the rest of the session (see _do_udp_check).
 UDP_CHECK_DNS_POOL = ("119.29.29.29", "223.5.5.5", "114.114.114.114")
-
 
 def socks5_rep_meaning(rep):
     """beta1.0.3: human-readable meaning of a SOCKS5 CONNECT reply code (RFC 1928 §6),
@@ -1049,7 +1537,6 @@ def socks5_rep_meaning(rep):
         0x07: tr("command not supported", "命令不支持"),
         0x08: tr("address type not supported", "地址类型不支持"),
     }.get(rep, tr("unknown reply", "未知应答"))
-
 
 def socks5_udp_dns_check(host, port, dns_ip="223.5.5.5", dns_port=53, timeout=5.0,
                          socks_user=None, socks_pass=None):
@@ -1073,7 +1560,6 @@ def socks5_udp_dns_check(host, port, dns_ip="223.5.5.5", dns_port=53, timeout=5.
     relay = None
     try:
         ctrl.settimeout(timeout)
-        # v1.5.47: greeting + optional RFC 1929 auth (same policy as TCP precheck).
         greet = socks5_greet(ctrl, socks_user, socks_pass, timeout=timeout)
         if greet != "SOCKS5_OK":
             reason = {
@@ -1155,7 +1641,6 @@ def socks5_udp_dns_check(host, port, dns_ip="223.5.5.5", dns_port=53, timeout=5.
         except Exception:
             pass
 
-
 def tunnel_udp_dns_check(dns_ip="223.5.5.5", dns_port=53, timeout=5.0):
     """beta1.0.51: through-tunnel UDP probe — the REAL data plane games use.
 
@@ -1214,7 +1699,6 @@ def tunnel_udp_dns_check(dns_ip="223.5.5.5", dns_port=53, timeout=5.0):
         except Exception:
             pass
 
-
 def tunnel_tcp_check(host="www.baidu.com", port=80, timeout=8.0):
     """beta1.0.51: through-tunnel TCP probe — end-to-end validation of the TCP
     data plane (TUN -> lwIP engine -> phone relay -> internet), source-bound
@@ -1256,7 +1740,6 @@ def tunnel_tcp_check(host="www.baidu.com", port=80, timeout=8.0):
         except Exception:
             pass
 
-
 def _run_decoded(cmd, timeout=None):
     """v1.3.2: run a command and decode its output regardless of console code page.
 
@@ -1281,7 +1764,6 @@ def _run_decoded(cmd, timeout=None):
 
     return res.returncode, _dec(res.stdout), _dec(res.stderr)
 
-
 def ping_host(host, timeout_ms=1500):
     """v1.3.1: best-effort single ICMP echo. True only on a real reply.
 
@@ -1304,7 +1786,6 @@ def ping_host(host, timeout_ms=1500):
     # zh-CN and en-US replies both carry "TTL=<n>"; timeout/loss output does not.
     return b"TTL=" in (res.stdout or b"").upper()
 
-
 def diagnose_tcp_failure(host, precheck):
     """v1.3.1: explain TCP-layer precheck failures with an ICMP cross-check.
 
@@ -1326,7 +1807,6 @@ class TunManager:
     Manages the native lwIP engine (hev-socks5-tunnel).
     Creates a Virtual Network Adapter to capture 100% of Windows traffic.
     """
-    # v1.5.47: class-level credential defaults so tests / subclasses that
     # bypass __init__ still see defined values (mirrors the old _dual_lane
     # class-default pattern).
     socks_user = DEFAULT_PHONE_USER
@@ -1338,11 +1818,11 @@ class TunManager:
         self.phone_ip = phone_ip
         self.phone_port = phone_port
         self.local_port = local_port
-        # v1.5.47: SOCKS5 credentials dialled by every probe + the lwIP engine.
         self.socks_user = socks_user or DEFAULT_PHONE_USER
         self.socks_pass = socks_pass or DEFAULT_PHONE_PASS
         self.log = log_fn
         self.process = None
+        self.supervisor = None
         self._monitoring_active = False
         self._connection_healthy = False
         self._restarting = False
@@ -1352,14 +1832,12 @@ class TunManager:
         # Round-2 fix (P1-W2): gateway of the host route back to the phone, so cleanup
         # can remove exactly what we added.
         self._phone_route_gw = None
-        # v1.5.34: lightweight lane FAILOVER (no router, no 19:1 spreading).
         # the lwIP engine dials the primary lane (8080) directly — the proven 1.4.93
         # data plane. Only when the primary times out on several consecutive
         # short probes does the tunnel move to the standby 8082 lane, and it
         # moves back the moment the primary answers again.
         self._use_lane_b = False
         self._lane_a_fail_strikes = 0
-        # beta1.0.51: the tunnel adapter's RESOLVED Windows connection name.
         # Windows never renames a reopened adapter, so a drifted name
         # ("LinkHelm 31") makes every netsh name= call a silent no-op — no
         # IP/DNS on the tunnel → ERR_NAME_NOT_RESOLVED + "DNS配置异常" scans.
@@ -1387,7 +1865,6 @@ class TunManager:
                     ["route", "delete", dest, "mask", "128.0.0.0", OUR_TUN_GATEWAY],
                     capture_output=True,
                 )
-        # beta1.0.52: the automatic DEFAULT route via our TUN gateway (installed
         # as a side effect of the old `netsh set address ... <gateway>` config)
         # is ours too — a 0.0.0.0/0 pointing at 10.0.0.1 black-holes the WHOLE
         # PC the moment the engine stops (the reported "检测时电脑断网"). The /1
@@ -1409,7 +1886,6 @@ class TunManager:
             )
         self._phone_route_gw = None
         self._owned_routes = []
-        # beta1.0.55: do NOT clear _ncsi_restore here.
         #
         # beta1.0.53/1.0.54 zeroed it in this method, but _clean_routes() runs
         # on every rollback path — including the one right before
@@ -1552,7 +2028,6 @@ class TunManager:
         else:
             self.log("Configuring IP...")
             try:
-                # beta1.0.52: NO gateway argument. Passing 10.0.0.1 as the
                 # gateway made Windows install an automatic DEFAULT route
                 # (0.0.0.0/0 via 10.0.0.1, metric 1) on this adapter — it beats
                 # the WLAN default and black-holes the WHOLE PC whenever the
@@ -1566,7 +2041,6 @@ class TunManager:
                     check=True, capture_output=True,
                 )
             except subprocess.CalledProcessError as error:
-                # beta1.0.51: a drifted name lands here — do NOT abort startup
                 # (the follow-up probe decides), but say exactly what happened.
                 self.log(
                     f"WARNING: could not set the tunnel IP on \"{name}\" "
@@ -1582,7 +2056,6 @@ class TunManager:
             self.log("NIC DNS is already AliDNS/DNSPod; reusing existing config (skipped netsh set dns).")
         else:
             self.log("Configuring DNS...")
-            # v1.4.61: in-country resolvers only — 8.8.8.8 sent EVERY domain
             # lookup abroad (the single biggest recurring cross-border traffic source, a
             # needless detection footprint on managed networks). AliDNS +
             # DNSPod are fast and domestic; resolution still travels the
@@ -1598,7 +2071,6 @@ class TunManager:
                      "119.29.29.29", "index=2"],
                     check=False, capture_output=True,
                 )
-                # beta1.0.51: third domestic resolver — Windows walks the list
                 # on timeouts, so one slow/blocked resolver no longer fails
                 # every lookup (the "DNS配置异常" field symptom).
                 subprocess.run(
@@ -1612,7 +2084,6 @@ class TunManager:
                     f"(rc={error.returncode}); pages may fail with ERR_NAME_NOT_RESOLVED."
                 )
 
-        # beta1.0.51: VERIFY the resolvers actually landed on the adapter.
         # A drifted connection name turns every netsh call into a silent
         # no-op — without this check the tunnel comes up resolver-less and
         # the first symptom the user sees is "无法访问此页面".
@@ -1632,6 +2103,11 @@ class TunManager:
 
     def _restore_ncsi_probing(self):
         """beta1.0.55: put the Windows connectivity probe back the way we found it."""
+        # session may have pointed them at the domestic endpoint).
+        try:
+            _restore_ncsi_probe(self.log)
+        except Exception:
+            pass
         previous = getattr(self, "_ncsi_restore", None)
         global _ACTIVE_TUN_MANAGER
         if _ACTIVE_TUN_MANAGER is self:
@@ -1652,7 +2128,6 @@ class TunManager:
         """
         self._owned_routes = []
 
-        # beta1.0.52: sweep the automatic DEFAULT route via our TUN gateway
         # BEFORE adding anything. Two sources: (a) the old `netsh set address
         # ... <gateway>` config installed 0.0.0.0/0 via 10.0.0.1 as a side
         # effect, (b) a crashed previous run never cleaned it up. Either way it
@@ -1701,15 +2176,67 @@ class TunManager:
                     "(another VPN?); it will not be modified."
                 )
                 continue
-            rc, out, err = _run_decoded(
-                ["route", "add", dest, "mask", "128.0.0.0", OUR_TUN_GATEWAY, "metric", "1"],
-                timeout=15,
-            )
+            # Without `IF`, Windows resolves the gateway 10.0.0.1 against
+            # whichever interface currently has a path to it — live evidence:
+            # 0.0.0.0/1 came up bound to the WLAN adapter, and every
+            # destination in the lower half of the IP space then depended on
+            # that accidental binding (intermittent timeouts = "连通性很差").
+            # beta1.0.84: the C++ netops module does add-with-IF + readback
+            # verification in one call (VERIFIED). Python fallback keeps the
+            # legacy add/rebind dance for old packages.
+            tun_idx = _tun_interface_index(self._tun_conn_name or TUN_ADAPTER_NAME)
+            used_cpp = False
+            if tun_idx:
+                try:
+                    import cpp_bridge
+                    if cpp_bridge.netops_available():
+                        used_cpp = cpp_bridge.add_route_verified(
+                            dest, "128.0.0.0", OUR_TUN_GATEWAY, tun_idx)
+                        if used_cpp:
+                            self._owned_routes.append(dest)
+                            continue
+                except Exception:
+                    used_cpp = False
+            cmd = ["route", "add", dest, "mask", "128.0.0.0",
+                   OUR_TUN_GATEWAY, "metric", "1"]
+            if tun_idx:
+                cmd += ["IF", str(tun_idx)]
+            rc, out, err = _run_decoded(cmd, timeout=15)
+            if rc != 0 and tun_idx:
+                # A wrong/unknown IF index makes route add fail outright —
+                # fall back to the unbound form, then verify below.
+                rc, out, err = _run_decoded(
+                    ["route", "add", dest, "mask", "128.0.0.0",
+                     OUR_TUN_GATEWAY, "metric", "1"], timeout=15)
             if rc != 0:
                 self._clean_routes()
                 detail = (err or out or "").strip()
                 raise RuntimeError(f"route add {dest}/1 failed: {detail}")
             self._owned_routes.append(dest)
+            # (route print reports the interface as its own IP).
+            if tun_idx:
+                bindings = [i for g, i in _route_bindings(dest, "128.0.0.0")
+                            if g == OUR_TUN_GATEWAY]
+                if bindings and TUN_LOCAL_IP not in bindings:
+                    self.log(
+                        f"Route {dest}/1 bound to interface(s) {bindings}, "
+                        f"expected the TUN ({TUN_LOCAL_IP}) — re-binding."
+                    )
+                    subprocess.run(
+                        ["route", "delete", dest, "mask", "128.0.0.0",
+                         OUR_TUN_GATEWAY], capture_output=True)
+                    _run_decoded(cmd, timeout=15)
+                    bindings = [i for g, i in
+                                _route_bindings(dest, "128.0.0.0")
+                                if g == OUR_TUN_GATEWAY]
+                    if TUN_LOCAL_IP in bindings:
+                        self.log(f"Route {dest}/1 re-bound to the TUN interface.")
+                    else:
+                        self.log(
+                            f"Warning: route {dest}/1 still not on the TUN "
+                            f"interface (now {bindings}) — connectivity for "
+                            "part of the address space may be unstable."
+                        )
 
     def _check_dependencies(self):
         """beta1.0.5: verify the bundled lwIP engine (hev-socks5-tunnel) + Wintun.
@@ -1751,7 +2278,6 @@ class TunManager:
         )
         return exe_path
 
-
     @staticmethod
     def _install_bundled_file(src, dest):
         tmp = dest + ".tmp"
@@ -1787,7 +2313,6 @@ class TunManager:
         os.replace(tmp, dest_path)
 
     def start(self):
-        # v1.4.63: reconnect TAKES OVER. A leftover engine process (from a
         # crashed run, or started by an old pre-1.4.5 exe that has no mutex)
         # keeps the old VPN alive and its adapter name climbing. Kill it and
         # proceed — refusing (v1.4.62) read to the user as "reconnect does
@@ -1801,7 +2326,6 @@ class TunManager:
         # Round-2 fix (P0-W1): verify the phone's SOCKS5 endpoint BEFORE touching
         # Wintun, IP configuration or routes. A phone-side failure now surfaces as a
         # precise error instead of a mysterious TUN/routing fault later.
-        # v1.4.2: retry transient timeouts — one power-save blip must not abort startup.
         precheck = check_socks5_with_retry(
             self.phone_ip, self.phone_port, log_fn=self.log,
             socks_user=self.socks_user, socks_pass=self.socks_pass
@@ -1817,11 +2341,9 @@ class TunManager:
             )
         self.log(f"SOCKS5 pre-check passed ({self.phone_ip}:{self.phone_port}).")
 
-        # v1.4.6: remove orphaned LinkHelm* adapters left by crashed/killed
         # runs — otherwise Windows keeps piling up "LinkHelm 14/27/..."
         # dead entries in the network list. Best effort; the fresh adapter for
         # this run is created right after.
-        # beta1.0.56: do NOT run _cleanup_stale_tun_adapters() here. Its
         # `pnputil /remove-device` physically removes a kernel PnP device; if a
         # prior crashed/failed run (1.0.53/1.0.54) left an orphaned Wintun
         # adapter still held by the kernel or a zombie engine, forcing the
@@ -1830,7 +2352,6 @@ class TunManager:
         # adapter is reused by its fixed GUID, so the only thing this sweep ever
         # bought was cosmetic dead entries in the network list — not worth a
         # BSOD. The helper is kept as a manual hygiene tool only.
-        # beta1.0.55: the WLAN-profile sweep that used to run here is GONE.
         #
         # beta1.0.52 added `_cleanup_stale_wlan_profiles()` to tidy the numbered
         # duplicates ("LinkHelm 2" .. "LinkHelm 31") in the network list. It
@@ -1847,23 +2368,27 @@ class TunManager:
         # _normalize_adapter_connection_name), which cannot touch Wi-Fi state.
         # The helper is kept below but is deliberately no longer auto-invoked.
 
-        # beta1.0.55: stop Windows from labelling the working link "No Internet".
-        # Set BEFORE the adapter exists so NLA evaluates the new network with
-        # the new setting (see _read_ncsi_probing). Restored in stop().
+        # beta1.0.72 "respect a 0" guard was wrong in practice: the 0 it
+        # respected was itself the stale leftover of the beta1.0.55 pause —
+        # it never healed, and the flyout kept saying "无法访问 Internet"
+        # forever (re-confirmed live on 1.0.72). The pre-session value is
+        # still remembered in _ncsi_restore and restored on every exit path;
+        # during a session the probe now points at a domestic endpoint and
+        # actually validates the link.
         present, previous = _read_ncsi_probing()
         # 1 is the Windows default when the value has never been written.
         self._ncsi_restore = previous if present else 1
         global _ACTIVE_TUN_MANAGER
         _ACTIVE_TUN_MANAGER = self
-        if _set_ncsi_probing(False, self.log):
+        if _set_ncsi_probing(True, self.log):
             self.log(
-                "Windows connectivity probe paused for this session: the network "
-                "list will now report the tunnel as online (Microsoft's NCSI probe "
-                "endpoints are unreachable on most domestic networks, which is what "
-                "produced the bogus \"No Internet\" label)."
+                "Windows connectivity probe stays ON at Microsoft defaults: "
+                "with the tunnel up the probe endpoints are reachable through "
+                "the phone's upstream, which is what keeps the network list "
+                "showing \"Internet\" (verified live 1.0.82)."
             )
+        _set_domestic_ncsi_probe(self.log)
 
-        # beta1.0.5: tun2socks 已移除，内核完全由 lwIP (hev-socks5-tunnel) 承接。
         # 启动时先校验内置原生引擎完整性，再通过 EngineManager 拉起 lwIP。
         self._check_dependencies()
         from engine import ENGINE_MANAGER
@@ -1875,20 +2400,51 @@ class TunManager:
             self.log(f"[engine] {engine_note}")
 
         # Hide window on Windows, capture output
-        cflags = 0x08000000 if IS_WINDOWS else 0
-        self.process = subprocess.Popen([exe, *args], cwd=cwd, creationflags=cflags,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self._read_engine_output()
+        # Job Object (kernel-guaranteed cleanup: supervisor dies -> engines
+        # die; python dies -> pipe EOF -> engines die). Python keeps a shim
+        # "process" object only for poll()/pid compat with the monitor code.
+        self.supervisor = None
+        pid = 0
+        try:
+            from engine_supervisor import EngineSupervisor
+            sup = EngineSupervisor(log_fn=self.log)
+            if sup.ensure_running():
+                pid = sup.start_engine(exe, args)
+                if pid:
+                    self.supervisor = sup
+                    self.log(f"[supervisor] engine pid {pid} inside C++ job object")
+        except Exception as sup_err:
+            self.log(f"[supervisor] unavailable ({sup_err}); using legacy spawn")
+        if self.supervisor is not None:
+            class _SupervisorProcShim:
+                """Popen-compatible view over the supervisor-owned engine."""
+                def __init__(self, pid, sup):
+                    self.pid = pid
+                    self._sup = sup
+                    self.stdout = None
+                    self.stderr = None
+                def poll(self):
+                    return None if self._sup.engine_running() else 0
+                def terminate(self):
+                    self._sup.stop_engine()
+                def kill(self):
+                    self._sup.stop_engine()
+                def wait(self, timeout=None):
+                    return 0
+            self.process = _SupervisorProcShim(pid, self.supervisor)
+        else:
+            cflags = 0x08000000 if IS_WINDOWS else 0
+            self.process = subprocess.Popen([exe, *args], cwd=cwd, creationflags=cflags,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self._read_engine_output()
 
         self.log("Waiting for the adapter to be ready...")
         adapter_found = False
         for _ in range(15):
             if self.process.poll() is not None:
                 raise RuntimeError("lwIP engine exited before its adapter was ready.")
-            # v1.3.2: _run_decoded — text=True crashed on zh-CN GBK netsh output,
             # so the adapter was never detected and startup rolled back even
             # though the lwIP engine had created it successfully.
-            # beta1.0.51: match ANY LinkHelm* entry, not just the canonical
             # name — a drifted connection name ("LinkHelm 31") must still be
             # recognized here (and normalized right after), never treated as
             # "adapter missing" (which aborted startup outright).
@@ -1902,19 +2458,16 @@ class TunManager:
             self.stop()
             raise Exception("Failed to create Virtual Adapter.")
 
-        # beta1.0.51: canonicalize the connection name BEFORE any netsh config.
         # A drifted name made every name= call a silent no-op: the tunnel came
         # up without IP/DNS, pages failed with ERR_NAME_NOT_RESOLVED, and the
         # Windows network list showed a confusing duplicate ("LinkHelm 31").
         self._tun_conn_name = self._normalize_adapter_connection_name()
 
-        # v1.5.46: fixed-GUID adapter is usually reused — poll for its IP
         # instead of the old blind 2.0s+1.0s sleeps (faster reconnect).
         if not self._wait_adapter_ip_ready(5.0):
             self.log("Adapter IP not ready immediately; falling back to a fixed wait.")
             time.sleep(1.0)
         self._configure_adapter_if_needed()
-        # beta1.0.51: clear the negative DNS cache. Lookups that failed while
         # the tunnel was flapping stay cached (ERR_NAME_NOT_RESOLVED) and keep
         # breaking page loads long after the data plane is healthy again.
         try:
@@ -1936,7 +2489,6 @@ class TunManager:
             raise
         self.log("Global connection is active.")
 
-        # beta1.0.51: one-shot data-plane self-test at every startup — the
         # field reports ("UDP OK but games fail", ERR_NAME_NOT_RESOLVED,
         # "TCP 连通性很差") all trace back to the tunnel data plane, so prove
         # it (or disprove it) in the log right here instead of guessing later.
@@ -1946,7 +2498,6 @@ class TunManager:
         # Start health monitors
         self._monitoring_active = True
         self._connection_healthy = True
-        # v1.5.34: failover state resets on every fresh share session.
         self._use_lane_b = False
         self._lane_a_fail_strikes = 0
         self._lane_b_since = 0.0
@@ -1954,13 +2505,11 @@ class TunManager:
         threading.Thread(target=self._monitor_process, daemon=True).start()
         threading.Thread(target=self._monitor_health, daemon=True).start()
         threading.Thread(target=self._monitor_lane_failover, daemon=True).start()
-        # v1.4.6: link warmer (re-added standalone from the reverted v1.5.0).
         # Regular light traffic keeps the Wi-Fi Direct link out of power-save,
         # which is the root cause of the "dial 192.168.49.1:8080 i/o timeout"
         # storms; and sustained warmer failures trigger an EARLY rebuild check
         # so a genuine drop reconnects in seconds instead of tens of seconds.
         threading.Thread(target=self._link_keepalive_loop, daemon=True).start()
-        # v1.4.93: hold the system awake for the whole share session — idle
         # sleep / Modern Standby suspends the lwIP engine and the Wi-Fi Direct link
         # ("a process mounted too long gets killed by the Windows power policy"). Scoped thread owns the
         # per-thread execution state and always clears it on stop.
@@ -2004,7 +2553,6 @@ class TunManager:
                     return
                 if self.process and self.process.poll() is not None:
                     break  # process died during sleep — go rebuild below
-                # beta1.0.51: 4s → 8s probe timeout — the documented wake
                 # latency is 3-8s, so a 4s probe could fail a link that was
                 # merely still waking and trigger a needless rebuild.
                 if self._probe_ok(timeout=8.0):
@@ -2056,7 +2604,6 @@ class TunManager:
         failures = 0
         probes = 0
         domestic_idx = 0
-        # v1.4.8: monotonic pacing — each probe fires at (previous due + interval)
         # on time.monotonic(), so the effective 30s/15s cadence never drifts by
         # the probe's own runtime and is immune to system clock jumps. If a
         # probe overruns its slot the next one fires immediately to catch up
@@ -2074,7 +2621,6 @@ class TunManager:
 
             ok = False
             try:
-                # v1.4.92: probe timeout 3s → 5s. Wi-Fi Direct power-save wake
                 # routinely takes 3-8s; a 3s timeout counted normal link wake
                 # latency as strikes and fed the (now removed) rebuild trigger.
                 with socket.create_connection(
@@ -2101,7 +2647,6 @@ class TunManager:
                 continue
 
             failures += 1
-            # v1.4.92: the warmer NO LONGER rebuilds the tunnel. Wi-Fi Direct
             # power-save storms self-heal within seconds ("Proxy connection recovered");
             # a full rebuild here tore down a working tunnel ("do not auto-restart
             # a working connection") just because the air link dozed off for ~45s. Log
@@ -2154,52 +2699,68 @@ class TunManager:
         _unregister_resume_notification(getattr(self, "_resume_reg", None))
         self._resume_reg = None
         self._crash_times = []
-        # v1.5.34: reset failover state — the next session starts on lane A.
         self._use_lane_b = False
         self._lane_a_fail_strikes = 0
         self._lane_b_since = 0.0
         self._lane_a_recover_strikes = 0
-        # beta1.0.55: restore the Windows connectivity probe we paused on start.
         self._restore_ncsi_probing()
         self.log("Restoring routes...")
         self._clean_routes()
 
         if self.process:
             self.log("Stopping connection processes...")
-            try:
-                self.process.terminate()
+            # side closes the job (kernel kills the tree). No taskkill sweep.
+            if self.supervisor is not None:
                 try:
-                    self.process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=3)
-            except Exception:
-                pass
-            # v1.4.63: belt-and-suspenders — reap the whole process tree.
-            # This is what guarantees "exit means exit": a graceful terminate
-            # that silently fails must never leave the engine child (and
-            # with it the VPN tunnel) running in the background.
-            try:
-                subprocess.run(
-                    ["taskkill", "/T", "/F", "/PID", str(self.process.pid)],
-                    capture_output=True, timeout=10,
-                )
-            except Exception:
-                pass
-            self.process = None
+                    self.supervisor.stop_engine()
+                    self.log("[supervisor] engine terminated via job close.")
+                except Exception as sup_err:
+                    self.log(f"[supervisor] stop failed ({sup_err}); falling back.")
+                self.process = None
+            else:
+                try:
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+                        self.process.wait(timeout=3)
+                except Exception:
+                    pass
+                # This is what guarantees "exit means exit": a graceful terminate
+                # that silently fails must never leave the engine child (and
+                # with it the VPN tunnel) running in the background.
+                try:
+                    subprocess.run(
+                        ["taskkill", "/T", "/F", "/PID", str(self.process.pid)],
+                        capture_output=True, timeout=10,
+                    )
+                except Exception:
+                    pass
+                self.process = None
             
         subprocess.run(["netsh", "interface", "set", "interface", "LinkHelm-IwIP", "disable"], capture_output=True)
-        # v1.4.91: disconnect = full reset. terminate/taskkill only handles child
-        # processes "we started ourselves"; a crash-restart loop can leave orphan engine
-        # (occupying the TUN and routes for the next connection, showing as "occupied,
-        # cannot connect"). Here we sweep unconditionally and confirm death, so the
-        # SOCKS5 tunnel is fully cut when the disconnect button returns.
+        # v1.4.91/beta1.0.83: with the supervisor path the engine died via the
+        # job close above; the name-based sweep now only reaps FOREIGN orphans
+        # left by crashed old builds (cheap when nothing matches).
         _kill_engine_procs_all(log_fn=self.log)
-        # beta1.0.4: release engine-owned resources (e.g. lwIP pid file) so the
+        # relaunch on the next start; holding it adds no value while idle).
+        if self.supervisor is not None:
+            try:
+                self.supervisor.shutdown()
+            except Exception:
+                pass
+            self.supervisor = None
         # next session starts clean. Legacy engine teardown is a no-op.
         try:
             from engine import ENGINE_MANAGER
             ENGINE_MANAGER.teardown()
+        except Exception:
+            pass
+        # Windows files yet another drifted "LinkHelm N" profile. Sweep the
+        # ghosts now so the flyout never grows a new number per session.
+        try:
+            sweep_ghost_linkhelm_networks(self.log)
         except Exception:
             pass
         self.log("Connection stopped.")
@@ -2207,7 +2768,6 @@ class TunManager:
     def _read_engine_output(self):
         """Read and log the lwIP engine (hev-socks5-tunnel) stdout/stderr in background threads."""
         def _annotate(msg):
-            # beta1.0.3: attach the corresponding cause instead of letting
             # every failure read as a bare "rejected by the remote host".
             low = msg.lower()
             if "forcibly closed by the remote host" in low or \
@@ -2335,7 +2895,6 @@ class TunManager:
                 if len(resp) >= 2 and resp[0] == 5:
                     if resp[1] == 0:
                         return "ok"
-                    # beta1.0.3: surface the actual REP meaning instead of a
                     # bare hex code — the field log should say WHY the phone
                     # refused, not just "rejected".
                     return (f"refused(REP=0x{resp[1]:02x} "
@@ -2363,7 +2922,6 @@ class TunManager:
         user = urllib.parse.quote(self.socks_user, safe="")
         pwd = urllib.parse.quote(self.socks_pass, safe="")
         if self._use_lane_b:
-            # v1.5.34: failover active — tunnel moved to the standby lane.
             return f"socks5://{user}:{pwd}@{self.phone_ip}:{SECONDARY_LANE_PORT}"
         return f"socks5://{user}:{pwd}@{self.phone_ip}:{self.phone_port}"
 
@@ -2402,7 +2960,6 @@ class TunManager:
         even the old default could still count a normal wake as an outage
         ("检测杀死好连接"); the probe now covers the full wake window.
         """
-        # v1.5.36: probe whichever lane the tunnel is CURRENTLY dialling, at
         # greeting level (the server is genuinely alive — the original
         # the "hollow handshake" was bare TCP). While failed over to :8082, lane A being
         # alive must not mask a standby-lane outage (and vice versa).
@@ -2410,13 +2967,11 @@ class TunManager:
         return self._probe_socks_port(active_port, timeout=timeout)
 
     def _monitor_health(self):
-        # v1.4.2: 10s interval + confirm probe + 3-strike threshold.
         # A Wi-Fi Direct power-save blip lasts a few seconds; the old logic
         # (15s interval, single probe, restart after 2 strikes ≈ 30s) tore down
         # and rebuilt the whole tunnel far too eagerly — that was the reported
         # "occasional disconnects and stutter". Now: probe -> confirm 3s later -> count strike;
         # sharing stops at 2 strikes, tunnel rebuild only at 3.
-        # v1.4.92: rebuild additionally requires a LONG probe (10s) to fail —
         # the final gate. Link wake latency up to ~8s no longer counts as an
         # outage, so a connected tunnel is not rebuilt while it would recover
         # on its own ("do not auto-restart a working connection").
@@ -2443,7 +2998,6 @@ class TunManager:
                 self._connection_healthy = False
                 self.log("Proxy health check failed (1/3); waiting for self-healing...")
             elif fail_count == 2:
-                # beta1.0.51: do NOT stop sharing at two consecutive timeouts.
                 # The field report was exactly this "kill": two probes time out
                 # during a Wi-Fi Direct power-save blip, sharing is torn down,
                 # and the link self-heals moments later ("检测杀死好连接").
@@ -2453,7 +3007,6 @@ class TunManager:
                 self.log("Proxy health check failed (2/3); sharing KEPT while the link may self-heal (no teardown on unconfirmed timeouts)")
             elif fail_count >= 3:
                 self._connection_healthy = False
-                # v1.5.36: log-only egress diagnostic before the long probe —
                 # explains in the field log whether the failure is the tunnel
                 # (proxy dead) or the phone's own egress (e.g. carrier filters
                 # TCP/53) without gating anything on it.
@@ -2505,7 +3058,6 @@ class TunManager:
             if not self._monitoring_active or self._restarting:
                 continue
             if not self._use_lane_b:
-                # v1.5.35: 3s window — under heavy concurrent load (many
                 # pages + game UDP flows) a 2s probe could false-timeout and
                 # trigger a needless switch/rebuild.
                 if self._probe_socks_port(self.phone_port, timeout=3.0):
@@ -2538,7 +3090,6 @@ class TunManager:
                         "keeping current state (overall disconnect handled by the health check)."
                     )
                     continue
-                # v1.5.36: log-only egress diagnostic — shows whether the
                 # primary failure is the proxy or the phone's own uplink.
                 self.log(
                     f"Primary :8080 egress relay diagnostics (logged only):"
@@ -2584,7 +3135,6 @@ class TunManager:
                         self.log("Backup channel :8082 probe timed out; awaiting health-check decision.")
 
     def _restart_engine(self):
-        # v1.4.2: rebuild with up to 3 backoff attempts (3s/6s/10s) instead of
         # giving up after one failure — a transient outage now self-heals and
         # the VPN no longer dies waiting for the user to press Connect again.
         if self._restarting or not self._monitoring_active:
@@ -2607,7 +3157,6 @@ class TunManager:
                     self.log("Tunnel restart succeeded")
                     threading.Thread(target=self._monitor_process, daemon=True).start()
                     threading.Thread(target=self._monitor_health, daemon=True).start()
-                    # v1.4.6: the old keepalive loop returned after triggering
                     # the rebuild — start a fresh one for the new tunnel.
                     threading.Thread(target=self._link_keepalive_loop, daemon=True).start()
                     return
@@ -2622,9 +3171,7 @@ class TunManager:
 
     def _rebuild_tunnel(self):
         # Round-2 fix: do not rebuild the tunnel against a dead phone endpoint.
-        # v1.4.2: precheck with retries; raise → caller retries with backoff.
         if self._use_lane_b:
-            # v1.5.34: failed-over rebuild must precheck the lane it will
             # actually dial, not lane A.
             precheck = check_socks5_with_retry(
                 self.phone_ip, SECONDARY_LANE_PORT, log_fn=self.log,
@@ -2649,7 +3196,6 @@ class TunManager:
                 self.process.kill()
             self.process = None
 
-        # v1.4.91: sweep orphans before relaunching. Repeated crash-restarts
         # can accumulate engine processes that are NOT our current child;
         # a new instance started while one of those holds the TUN adapter is
         # exactly the "reconnect fails (occupied)" symptom.
@@ -2658,12 +3204,10 @@ class TunManager:
         self._clean_routes()
         if not self._monitoring_active:
             return
-        # beta1.0.56: skip _cleanup_stale_tun_adapters() here too — same BSOD
         # risk as the initial start path (pnputil removes a kernel device that
         # may still be referenced). Zombies are already killed by the call above
         # and the adapter is reused by GUID, so never physically remove devices
         # during a live rebuild.
-        # beta1.0.5: re-verify the lwIP engine and bring it up through the
         # EngineManager (single Wintun owner).
         self._check_dependencies()
         from engine import ENGINE_MANAGER
@@ -2683,8 +3227,6 @@ class TunManager:
         for _ in range(15):
             if self.process.poll() is not None:
                 raise RuntimeError("lwIP engine exited while restarting.")
-            # v1.3.2: _run_decoded — same GBK fix as the initial start path.
-            # beta1.0.51: match ANY LinkHelm* entry (a drifted connection name
             # must not read as "adapter missing"), then normalize it below.
             _, out, _ = _run_decoded(
                 ["netsh", "interface", "ipv4", "show", "interfaces"], timeout=15
@@ -2695,13 +3237,11 @@ class TunManager:
         else:
             raise RuntimeError("VPN adapter did not reappear.")
 
-        # beta1.0.51: canonicalize the connection name before config (see the
         # start path) — otherwise a drifted name silently skips IP/DNS setup.
         self._tun_conn_name = self._normalize_adapter_connection_name()
 
         # v1.5.41 (P0): idempotent config — reuse what is already correct.
         self._configure_adapter_if_needed()
-        # beta1.0.51: drop stale negative DNS entries from the outage window.
         try:
             subprocess.run(["ipconfig", "/flushdns"], capture_output=True, timeout=15)
         except Exception:
@@ -2846,13 +3386,12 @@ class App:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("LinkHelm Desktop beta1.0.57 | Windows")
+        self.root.title("LinkHelm Desktop beta1.0.85 | Windows")
         self.root.geometry(f"460x{min(770, max(620, root.winfo_screenheight() - 90))}")
         self.root.minsize(420, 590)
         self.root.configure(fg_color=self.BG)
 
         self.tun_mgr = None
-        # beta1.0.52: heal THIS PC first — a crashed/killed previous run (or
         # any pre-beta1.0.52 build) can leave the automatic default route
         # 0.0.0.0/0 via 10.0.0.1 behind, which black-holes the whole PC the
         # moment the engine is not running ("检测时电脑断网"). The app is
@@ -2860,7 +3399,6 @@ class App:
         # routes when the user connects. Best-effort, never blocks the UI.
         threading.Thread(target=self._startup_route_sweep, daemon=True).start()
         self.ics_mgr = IcsManager(self.log)
-        # beta1.0.57: store accelerator (Mihomo subprocess; no bundled nodes)
         self.accel = store_accel.StoreAccel(CONFIG_DIR, self.log)
 
         self._bridge_lock = threading.RLock()
@@ -2890,7 +3428,6 @@ class App:
             header, text=tr("Android phone   →   Windows client   →   Target devices", "安卓手机   →   Windows 连接   →   目标设备"),
             font=("Segoe UI", 11), text_color=self.MUTED, anchor="w", height=20
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
-        # v1.5.44: in-window Settings entry (the tray menu has one too).
         ctk.CTkButton(
             header, text=tr("⚙ Settings", "⚙ 设置"), width=76, height=26, corner_radius=13,
             font=("Segoe UI", 11), fg_color=self.CARD, hover_color=self.BORDER,
@@ -2942,7 +3479,6 @@ class App:
         self.phone_port.insert(0, "8080")
         self.phone_port.grid(row=1, column=1, sticky="ew", padx=(10, 0))
 
-        # v1.5.47: SOCKS5 credentials — pre-filled with the same fixed initial
         # pair as the APK (never randomized), editable before connecting.
         _creds = load_app_settings()
         ctk.CTkLabel(fields, text=tr("SOCKS5 User", "SOCKS5 账号"), text_color=self.TEXT,
@@ -2983,7 +3519,6 @@ class App:
             self.advanced_frame, height=32, corner_radius=7,
             fg_color=self.INPUT_BG, border_color=self.INPUT_BORDER
         )
-        # v1.3: use 18080 by default to avoid confusion with the phone SOCKS port (8080).
         self.local_port.insert(0, "18080")
         self.local_port.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 9))
 
@@ -3027,76 +3562,6 @@ class App:
         )
         self.btn_stop.grid(row=0, column=1, sticky="ew")
 
-        # beta1.0.57: store accelerator (Steam / Epic) — Mihomo kernel as a
-        # separate helper process. Uses the EXISTING network path (no new
-        # adapter): local mixed port + optional WinINET system proxy. No
-        # nodes are bundled; the user imports their own subscription/config.
-        accel_card = ctk.CTkFrame(
-            self.content, fg_color=self.CARD, corner_radius=13,
-            border_width=1, border_color=self.BORDER
-        )
-        accel_card.pack(fill="x", pady=(0, 12))
-        accel_card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            accel_card, text=tr("02  STORE BOOST", "02  商店加速"), font=("Segoe UI", 9, "bold"),
-            text_color=self.ACCENT, anchor="w", height=15
-        ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 0))
-        ctk.CTkLabel(
-            accel_card, text=tr("Steam / Epic store booster", "Steam / Epic 商店加速"),
-            font=("Segoe UI", 16, "bold"), text_color=self.TEXT, anchor="w", height=24
-        ).grid(row=1, column=0, sticky="w", padx=16, pady=(1, 0))
-        ctk.CTkLabel(
-            accel_card, text=tr(
-                "Unmodified Mihomo kernel, separate process, same network adapter - no new TUN device. "
-                "Store domains only; NO nodes are bundled - import your own subscription or config.",
-                "Mihomo 内核独立子进程运行，沿用现有网卡，不创建新 TUN 设备。仅商店域名走代理；不内置任何节点，请自行导入订阅或配置。"),
-            font=("Segoe UI", 10), text_color=self.MUTED, anchor="w", height=19,
-            wraplength=400, justify="left"
-        ).grid(row=2, column=0, sticky="w", padx=16, pady=(0, 11))
-        self.accel_sub = ctk.CTkEntry(
-            accel_card, height=33, corner_radius=7, fg_color=self.INPUT_BG,
-            border_color=self.INPUT_BORDER, font=("Segoe UI", 11),
-            placeholder_text=tr("Subscription URL or config.yaml path", "订阅链接或 config.yaml 路径")
-        )
-        self.accel_sub.grid(row=3, column=0, sticky="ew", padx=16)
-        _accel_pref = self.accel.load_pref()
-        if _accel_pref.get("subUrl"):
-            self.accel_sub.insert(0, _accel_pref["subUrl"])
-        accel_row = ctk.CTkFrame(accel_card, fg_color="transparent")
-        accel_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(10, 0))
-        accel_row.grid_columnconfigure(0, weight=1)
-        accel_row.grid_columnconfigure(1, weight=1)
-        self.accel_start = ctk.CTkButton(
-            accel_row, text=tr("▷  Start boost", "▷  启动加速"), height=33, corner_radius=7,
-            fg_color=self.ACCENT, hover_color="#005AAB",
-            font=("Segoe UI", 11, "bold"), command=self._accel_start
-        )
-        self.accel_start.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        self.accel_stop = ctk.CTkButton(
-            accel_row, text=tr("Stop", "停止加速"), height=33, corner_radius=7,
-            state="disabled", fg_color=self.INPUT_BG,
-            border_width=1, border_color=self.BORDER,
-            text_color=self.TEXT, hover_color=self.STATUS_BG,
-            font=("Segoe UI", 11), command=self._accel_stop
-        )
-        self.accel_stop.grid(row=0, column=1, sticky="ew")
-        accel_bottom = ctk.CTkFrame(accel_card, fg_color="transparent")
-        accel_bottom.grid(row=5, column=0, sticky="ew", padx=16, pady=(8, 14))
-        accel_bottom.grid_columnconfigure(0, weight=1)
-        accel_bottom.grid_columnconfigure(1, weight=0)
-        self.accel_sysproxy = ctk.CTkCheckBox(
-            accel_bottom, text=tr("Set system proxy", "设置系统代理"),
-            font=("Segoe UI", 10), text_color=self.TEXT,
-        )
-        self.accel_sysproxy.select()
-        self.accel_sysproxy.grid(row=0, column=1, sticky="e")
-        self.accel_status = ctk.StringVar(value=tr(
-            "Idle. Import a subscription, then start.", "未运行。先导入订阅，再启动加速。"))
-        ctk.CTkLabel(
-            accel_bottom, textvariable=self.accel_status,
-            font=("Segoe UI", 10), text_color=self.MUTED, anchor="w"
-        ).grid(row=0, column=0, sticky="w")
-
         self.bridge_card = ctk.CTkFrame(
             self.content, fg_color=self.CARD, corner_radius=13,
             border_width=1, border_color=self.BORDER
@@ -3104,7 +3569,7 @@ class App:
         self.bridge_card.pack(fill="x", pady=(0, 12))
         self.bridge_card.grid_columnconfigure(0, weight=1)
         self.bridge_eyebrow = ctk.CTkLabel(
-            self.bridge_card, text=tr("03  OUTBOUND", "03  出站分发"), font=("Segoe UI", 9, "bold"),
+            self.bridge_card, text=tr("02  OUTBOUND", "02  出站分发"), font=("Segoe UI", 9, "bold"),
             text_color=self.ACCENT, anchor="w", height=15
         )
         self.bridge_eyebrow.grid(row=0, column=0, sticky="w", padx=16, pady=(14, 0))
@@ -3217,7 +3682,6 @@ class App:
         )
         self.bridge_button.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 16))
 
-        # v1.4.3: one-tap UDP connectivity check (live test via the phone SOCKS5 UDP relay, no system changes)
         self.udp_button = ctk.CTkButton(
             self.content, text=tr("Check UDP Connectivity", "检测 UDP 连通性"), height=30,
             fg_color="transparent", border_width=1, border_color=self.BORDER,
@@ -3226,9 +3690,47 @@ class App:
         )
         self.udp_button.pack(fill="x", pady=(0, 12))
 
-        # v1.5.45 (beta1.0.1): file-transfer trial entry — single file <= 1 GB
-        # over the Wi-Fi Direct link only (port 8765), independent of the
+        # v1.5.45 (beta1.0.1): file-transfer entry — single file <= 30 GB
+        # (beta1.0.58, was 1 GB), resumable across a dropped link, over the
+        # Wi-Fi Direct link only (port 8765), independent of the
         # tunnel; files never touch the phone's internet exit.
+        # loopback-only Mihomo micro-kernel (the same engine Clash Verge uses)
+        # and never touches the system proxy, DNS, hosts, adapters or routes —
+        # so it COEXISTS with the user's own Clash Verge. All its controls live
+        # in a dedicated page opened below (like the file-transfer assistant),
+        # which also kills the old "starting the boost freezes the app" bug
+        # (the previous card launched the kernel on the UI thread).
+        accel_card = ctk.CTkFrame(
+            self.content, fg_color=self.CARD, corner_radius=13,
+            border_width=1, border_color=self.BORDER
+        )
+        accel_card.pack(fill="x", pady=(0, 12))
+        accel_header = ctk.CTkFrame(accel_card, fg_color="transparent")
+        accel_header.pack(fill="x", padx=16, pady=9)
+        ctk.CTkLabel(
+            accel_header, text=tr("Store Boost", "商店加速"),
+            font=("Segoe UI", 11, "bold"), text_color=self.TEXT
+        ).pack(side="left")
+        ctk.CTkButton(
+            accel_header, text=tr("Open", "打开"), width=95, height=24,
+            fg_color="transparent", hover_color=self.STATUS_BG,
+            text_color=self.ACCENT, command=self._open_store_accel_dialog
+        ).pack(side="right")
+        ctk.CTkLabel(
+            accel_card,
+            text=tr(
+                "Built-in open-source Clash core (same engine as Clash Verge). "
+                "Runs as a loopback-only micro-kernel — never touches your system "
+                "proxy, so it coexists with Clash Verge. Open the page, paste your "
+                "subscription (or a clash:// one-click link), pick a node; it exposes "
+                "a local proxy on 127.0.0.1 you opt into yourself.",
+                "内置开源 Clash 内核（与 Clash Verge 同款）。仅作为本地回环微内核运行——"
+                "不碰系统代理，因此可与 Clash Verge 共存。点开页面后粘贴订阅（或 clash:// "
+                "一键导入链接）、选节点，它只暴露一个 127.0.0.1 本地代理，由你自行按需使用。"),
+            font=("Segoe UI", 10), text_color=self.MUTED,
+            wraplength=560, justify="left"
+        ).pack(padx=16, pady=(0, 12))
+
         ft_card = ctk.CTkFrame(
             self.content, fg_color=self.CARD, corner_radius=13,
             border_width=1, border_color=self.BORDER
@@ -3237,7 +3739,7 @@ class App:
         ft_header = ctk.CTkFrame(ft_card, fg_color="transparent")
         ft_header.pack(fill="x", padx=16, pady=9)
         ctk.CTkLabel(
-            ft_header, text=tr("File Transfer (trial)", "文件传输（试用版）"),
+            ft_header, text=tr("File Transfer", "文件传输"),
             font=("Segoe UI", 11, "bold"), text_color=self.TEXT
         ).pack(side="left")
         ctk.CTkButton(
@@ -3304,8 +3806,6 @@ class App:
         self._update_bridge_button()
         threading.Thread(target=self._load_hotspot_info, daemon=True).start()
 
-
-
     def _startup_route_sweep(self):
         """beta1.0.55: heal stale tunnel routes without racing a live session.
 
@@ -3315,6 +3815,26 @@ class App:
         the tunnel it was meant to protect — one more way to end up with a
         session that reports "TCP/UDP 不通". Bail out when an engine is up.
         """
+        # 31") otherwise pile up forever in the network flyout, every one of
+        # them showing "无法访问 Internet".
+        try:
+            _cleanup_stale_wlan_profiles(self.log)
+        except Exception:
+            pass
+        # net-connection-profiles of our own lwIP adapter. Rename the live
+        # drift to the fixed "LinkHelm" and delete the disconnected ghosts
+        # from the NetworkList store (registry; needs the app's admin rights).
+        try:
+            sweep_ghost_linkhelm_networks(self.log)
+        except Exception:
+            pass
+        # session — Microsoft's own probe hosts are unreachable without the
+        # tunnel, so the flyout kept saying "无法访问 Internet".
+        # (left by crashed 1.0.55..1.0.71 builds); restored at exit.
+        try:
+            _heal_ncsi_at_startup(self.log)
+        except Exception:
+            pass
         try:
             mgr = self.tun_mgr
             proc = getattr(mgr, "process", None) if mgr is not None else None
@@ -3324,6 +3844,7 @@ class App:
             _sweep_stale_tunnel_routes(self.log)
         except Exception:
             pass  # best effort — never break startup on hygiene
+
     def _load_hotspot_info(self):
         try:
             ssid, password = self.ics_mgr.hotspot_info()
@@ -3373,8 +3894,6 @@ class App:
         except ValueError:
             self.root.after(0, lambda: self._udp_check_done(False, "invalid port"))
             return
-        # v1.4.81: dual-DNS retry (one 5s shot at one DNS was too brittle).
-        # v1.4.93: probe the whole pool in order and REMEMBER the first one
         # that answers, so later checks start there.
         # v1.5.1 BUGFIX: the automatic TUN-adapter DNS reorder is REMOVED.
         # A single successful probe only proves "this resolver answered once
@@ -3467,7 +3986,7 @@ class App:
             "error": "#E45D63",
         }
         details = {
-            "connected": tr("Connected. You can share to other devices in step 3.", "连接已就绪，可以在第 3 步共享给其他设备。"),
+            "connected": tr("Connected. You can share to other devices in step 2.", "连接已就绪，可以在第 2 步共享给其他设备。"),
             "starting": tr("Creating the LinkHelm adapter and configuring routes...", "正在创建 LinkHelm 适配器并配置路由..."),
             "stopping": tr("Closing the tunnel and restoring network settings...", "正在关闭隧道并恢复网络设置..."),
             "disconnected": tr("Enter the phone IP, then tap Connect.", "输入手机 IP 后点击「连接」。"),
@@ -3511,7 +4030,6 @@ class App:
             self._gui_log_pending = getattr(self, "_gui_log_pending", 0) + 1
 
             def _log():
-                # beta1.0.55: this body runs on the Tk main loop, so anything
                 # it raises escapes log()'s own try/except and surfaces as
                 # "Exception in Tkinter callback" — the classic teardown noise
                 # when a worker thread logs one last line after the window is
@@ -3577,7 +4095,6 @@ class App:
         threading.Thread(target=self._do_refresh_ethernet, daemon=True).start()
 
     # ---- v1.5.45 (beta1.0.1): file-transfer trial -------------------------
-    # beta1.0.3: the dialog now shows the ACTUAL local IP (dynamic — it
     # follows the current Wi-Fi Direct lease), takes the peer's IP as input,
     # and requires one-tap mutual IP pairing before any transfer.
     def _open_file_transfer_dialog(self):
@@ -3587,16 +4104,16 @@ class App:
         local_ip = file_transfer.local_ip_toward(phone_ip)
 
         win = ctk.CTkToplevel(self.root)
-        win.title(tr("File Transfer (trial)", "文件传输（试用版）"))
+        win.title(tr("File Transfer", "文件传输"))
         win.geometry("470x470")
         win.transient(self.root)
         win.grab_set()
 
         ctk.CTkLabel(
             win, font=("Segoe UI", 12, "bold"), text_color=self.TEXT,
-            text=tr("Single file up to 1 GB, over the Wi-Fi Direct link only.\n"
+            text=tr("Single file up to 30 GB, over the Wi-Fi Direct link only.\n"
                     "Never touches the phone's internet exit; SHA-256 verified.",
-                    "单文件最大 1 GB，仅走 Wi-Fi Direct 本地通道。\n不经手机外网出口；传输后校验 SHA-256。")
+                    "单文件最大 30 GB，仅走 Wi-Fi Direct 本地通道。\n不经手机外网出口；传输后校验 SHA-256。")
         ).pack(padx=16, pady=(14, 4))
         local_label = ctk.CTkLabel(
             win, font=("Segoe UI", 10), text_color=self.TEXT,
@@ -3610,7 +4127,6 @@ class App:
                     "IP 随 Wi-Fi Direct 组重建而变化，请以当前显示为准。")
         ).pack(padx=16, pady=(0, 6))
 
-        # beta1.0.3: peer IP + one-tap mutual pairing.
         peer_frame = ctk.CTkFrame(win, fg_color="transparent")
         peer_frame.pack(fill="x", padx=16, pady=(2, 0))
         peer_entry = ctk.CTkEntry(peer_frame, width=250, placeholder_text=phone_ip)
@@ -3657,6 +4173,43 @@ class App:
         pair_tip = ctk.CTkLabel(win, font=("Segoe UI", 10), text_color=self.MUTED, text="")
         pair_tip.pack(padx=16, pady=(4, 0))
 
+        # for it the moment it opens (the phone side asks the same way), and
+        # the choice is persisted in settings.json so the next open starts
+        # from it. "Receive" no longer asks: it just listens in that folder.
+        recv_dir = {"path": load_app_settings().get("recvDir") or ""}
+
+        def _refresh_recv_widgets():
+            shown = recv_dir["path"] or tr(
+                "not set (will ask when receiving)", "未设置（点接收时再询问）")
+            recv_dir_label.configure(
+                text=tr(f"Save to: {shown}", f"保存到：{shown}"))
+
+        def _pick_recv_dir():
+            path = filedialog.askdirectory(
+                parent=win,
+                title=tr("Choose the folder for incoming files",
+                         "选择接收文件保存目录"),
+                initialdir=(recv_dir["path"] if os.path.isdir(recv_dir["path"])
+                            else os.path.expanduser("~/Downloads")))
+            if path:
+                recv_dir["path"] = path
+                settings = load_app_settings()
+                settings["recvDir"] = path
+                save_app_settings(settings)
+            _refresh_recv_widgets()
+
+        recv_frame = ctk.CTkFrame(win, fg_color="transparent")
+        recv_frame.pack(fill="x", padx=16, pady=(6, 0))
+        recv_dir_label = ctk.CTkLabel(
+            recv_frame, font=("Segoe UI", 10), text_color=self.TEXT,
+            text=tr("Save to: not set", "保存到：未设置"), anchor="w")
+        recv_dir_label.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            recv_frame, width=76,
+            fg_color=self.STATUS_BG, hover_color=self.CARD, text_color=self.ACCENT,
+            text=tr("Folder...", "目录…"), command=_pick_recv_dir).pack(side="right")
+        _refresh_recv_widgets()
+
         status = ctk.CTkLabel(win, font=("Segoe UI", 10), text_color=self.MUTED,
                               text=tr("Idle", "空闲"))
         status.pack(padx=16, pady=(4, 2))
@@ -3665,7 +4218,19 @@ class App:
         bar.pack(padx=16, pady=(0, 10))
 
         cancel_event = threading.Event()
-        self._ft_server = None
+        # port used to only open after "Receive", so a peer that tried to
+        # PAIR (or send) while the dialog sat idle got ECONNREFUSED — the
+        # phone then showed "cannot connect". PAIR handshakes do not
+        # consume the receive slot, so this is free.
+        arm_dir = os.path.join(os.environ.get("TEMP", "."), "linkhelm_ft")
+        try:
+            os.makedirs(arm_dir, exist_ok=True)
+        except Exception:
+            arm_dir = "."
+        self._ft_server = file_transfer.ReceiverServer(
+            local_ip, user, password,
+            os.path.join(arm_dir, "placeholder"), log_fn=self.log)
+        self._ft_server.start()
 
         def _set_status(text, ok=None):
             color = self.MUTED
@@ -3688,12 +4253,16 @@ class App:
                 _set_status(tr("Pair with the peer first.", "请先与对方配对。"), ok=False)
                 return
             path = filedialog.askopenfilename(
-                parent=win, title=tr("Pick a file to send (<= 1 GB)", "选择要发送的文件（≤ 1 GB）"))
+                parent=win, title=tr("Pick a file to send (<= 30 GB)", "选择要发送的文件（≤ 30 GB）"))
             if not path:
                 return
             cancel_event.clear()
 
             def worker():
+                # beta1.0.8 relay: an actual transfer is in flight — the
+                # coordinator wakes for the duration and backs this sender
+                # off per chunk when the link is under pressure.
+                relay.RELAY.claim(relay.TRANSFER, "ft_sender")
                 try:
                     file_transfer.send_file(
                         ip, user, password, path,
@@ -3702,22 +4271,48 @@ class App:
                     self.root.after(0, lambda: bar.set(1.0))
                 except Exception as exc:
                     _set_status(str(exc), ok=False)
+                finally:
+                    relay.RELAY.release(relay.TRANSFER, "ft_sender")
 
             threading.Thread(target=worker, daemon=True).start()
             _set_status(tr("Sending...", "正在发送…"))
 
         def _do_receive():
-            path = filedialog.asksaveasfilename(
-                parent=win, title=tr("Save the incoming file as", "接收文件保存为"),
-                initialfile="received.bin")
-            if not path:
-                return
+            nonlocal local_ip
+            # opened (or via "Folder..."). Only ask if it is somehow unset —
+            # the old flow asked on every click, which the user explicitly
+            # asked to move to dialog-open time.
+            if not recv_dir["path"]:
+                _pick_recv_dir()
+                if not recv_dir["path"]:
+                    _set_status(tr("Choose a save folder first.",
+                                   "请先选择保存目录。"), ok=False)
+                    return
+            # replace the always-on pairing listener with the real receiver
+            if self._ft_server:
+                self._ft_server.stop()
+            # time — the dialog may have been open across a Wi-Fi Direct
+            # group rebuild, and binding a stale lease made the peer's
+            # connect fail with ECONNREFUSED.
+            peer = peer_entry.get().strip() or phone_ip
+            live_ip = file_transfer.local_ip_toward(peer)
+            if live_ip and live_ip != "0.0.0.0" and live_ip != local_ip:
+                local_ip = live_ip
+                local_label.configure(
+                    text=tr(f"This device address (enter it on the other side): "
+                            f"{local_ip}:{file_transfer.FT_PORT}",
+                            f"本机地址（填到另一台设备）：{local_ip}:{file_transfer.FT_PORT}"))
             self._ft_server = file_transfer.ReceiverServer(
-                local_ip, user, password, path, log_fn=self.log)
+                local_ip, user, password, recv_dir["path"], log_fn=self.log)
             self._ft_server.start()
             bar.set(0)
-            _set_status(tr("Waiting for the phone to send (stops after one file)...",
-                           "等待手机发送（接收一个文件后自动停止）…"))
+            _set_status(tr("Waiting for the peer — files are saved to the chosen folder "
+                           "under the sender's own name and format; a dropped link "
+                           "keeps the partial, re-send the same file to resume "
+                           "(stops after one file)...",
+                           "等待对方发送——文件按发送方的原名和格式保存到所选目录；"
+                           "断线会保留已传部分，重发同一文件即可续传"
+                           "（完成一个文件后停止）…"))
 
         def _cancel():
             cancel_event.set()
@@ -3750,6 +4345,9 @@ class App:
             command=_cancel).pack(side="left", padx=(4, 0))
         win.protocol("WM_DELETE_WINDOW", _close)
         _refresh_pair_widgets()
+        # so receiving is a single tap afterwards (cancelling keeps the
+        # previous choice). The short delay lets the window paint first.
+        win.after(200, _pick_recv_dir)
 
     def _do_refresh_ethernet(self):
         try:
@@ -3813,7 +4411,6 @@ class App:
     def _toggle_bridge(self):
         if self._bridge_busy or self.ics_mgr.needs_cleanup:
             return
-        # v1.5.41: silent UX — precondition hints go to the in-app status
         # line + log instead of modal dialogs (no more popups interrupting the flow).
         if not self.tun_mgr or not self.tun_mgr.is_healthy():
             self.log("Sharing not started: connect first (step 1).")
@@ -3895,7 +4492,6 @@ class App:
 
     def start(self):
         ip = self.phone_ip.get().strip()
-        # v1.5.41: silent UX — input problems are reported in the in-app log
         # and status line instead of modal dialogs (silent start, no popups).
         try:
             p_port = int(self.phone_port.get().strip())
@@ -3905,7 +4501,6 @@ class App:
             self._set_status(tr("Status: Invalid input (ports must be numbers)", "状态：输入有误（端口必须是数字）"), "error")
             return
 
-        # v1.3: the local HTTP->SOCKS bridge port must not collide with the phone proxy.
         if not (0 < p_port < 65536) or not (0 < l_port < 65535 + 1):
             self.log("Invalid input: the port must be between 1 and 65535.")
             self._set_status(tr("Status: Invalid input (ports must be 1-65535)", "状态：输入有误（端口 1-65535）"), "error")
@@ -3915,7 +4510,6 @@ class App:
             self._set_status(tr("Status: Invalid input (port conflict)", "状态：输入有误（端口冲突）"), "error")
             return
 
-        # v1.5.47: SOCKS5 credentials — 8-13 alnum chars, matching the phone.
         s_user = self.phone_user.get().strip()
         s_pass = self.phone_pass.get().strip()
         if not (SOCKS_CREDENTIAL_REGEX.match(s_user)
@@ -4252,32 +4846,457 @@ class App:
             text_color=self.MUTED, anchor="w", wraplength=410, justify="left"
         ).pack(fill="x", pady=(0, 4))
 
-    def _accel_start(self):
-        # beta1.0.57: launch the store accelerator with the USER's own
-        # subscription/config — LinkHelm bundles and fetches no nodes.
-        ok, msg = self.accel.start(self.accel_sub.get(),
-                                   bool(self.accel_sysproxy.get()))
-        if not ok:
-            self.accel_status.set(tr("Start failed: ", "启动失败：") + msg)
-            self.log("[accel] start failed: %s" % msg)
-        else:
-            self.log("[accel] store accelerator started (%s)" % msg)
-        # re-check shortly — an invalid subscription makes mihomo exit fast
-        self.root.after(2500, self._accel_refresh_status)
+    def _open_store_accel_dialog(self):
+        """beta1.0.63: dedicated accelerator page (like the file-transfer
+        assistant). Runs the loopback-only Mihomo micro-kernel; never touches
+        the system proxy, so it coexists with Clash Verge. The user pastes a
+        subscription (or a clash:// one-click link), picks a node, and the
+        kernel exposes a local proxy on 127.0.0.1 they opt into themselves.
+        """
+        win = ctk.CTkToplevel(self.root)
+        win.title(tr("Store Boost (Clash)", "商店加速（Clash）"))
+        win.geometry("520x610")
+        win.transient(self.root)
+        win.grab_set()
 
-    def _accel_stop(self):
-        self.accel.stop()
-        self._accel_refresh_status()
+        pref = self.accel.load_pref()
+        mode_var = ctk.StringVar(value=pref.get("mode", "rule"))
+        # own pasted URL may contain a private token; restoring it into the
+        # input at every launch is exactly the "预填我的token" the user has
+        # forbidden. The preference file keeps the last URL (so start() can
+        # re-use it internally if the user asks), but the UI never shows it
+        # uninvited. DEFAULT_STORE_SUB_URL is "" since beta1.0.64.
+        sub_var = ctk.StringVar(value="")
+        # Some panels (xfltd observed) bind the subscription token to the
+        # IP that first fetched it — fetching through the user's Clash
+        # reproduces the exit route Clash Verge's own import used, which
+        # is why "客户端可以正常导入，LinkHelm 却 403". Prefilled with the
+        # user's Clash Verge mixed port.
+        # the proxy IP right below (panels bind subscription tokens to the
+        # fetching IP). Both prefilled with the user's Clash Verge values;
+        # the subscription URL is NEVER prefilled (token stays private).
+        clash_var = ctk.StringVar(
+            value=pref.get("clashProxy") or "http://127.0.0.1:7897")
+        clash_ip_var = ctk.StringVar(
+            value=pref.get("clashIp") or "127.0.0.1")
+        proxy_addr = ctk.StringVar(value="")
 
-    def _accel_refresh_status(self):
-        running = self.accel.is_running()
-        self.accel_start.configure(state="disabled" if running else "normal")
-        self.accel_stop.configure(state="normal" if running else "disabled")
-        if running:
-            self.accel_status.set(self.accel.status_text())
-        else:
-            self.accel_status.set(tr("Stopped.", "已停止。"))
+        def _set_status(text, ok=None):
+            color = self.MUTED
+            if ok is True:
+                color = "#4ADE80"
+            elif ok is False:
+                color = "#F87171"
+            win.after(0, lambda: status.configure(text=text, text_color=color))
 
+        def _log(msg):
+            win.after(0, lambda: (log_box.configure(state="normal"),
+                                   log_box.insert("end", msg + "\n"),
+                                   log_box.configure(state="disabled"),
+                                   log_box.see("end")))
+
+        _orig_log = self.log
+        def _accel_log(msg):
+            _log(msg)
+            _orig_log(msg)
+        self.accel.log = _accel_log
+
+        def _refresh_hosts():
+            _p, bom, _active, _size = store_accel.inspect_hosts()
+            if bom > 0:
+                hosts_label.configure(
+                    text=tr("hosts 异常：发现 %d 个异常字符（BOM）" % bom,
+                            "hosts anomaly: %d stray characters (BOM)" % bom),
+                    text_color="#F87171")
+                hosts_fix.configure(state="normal")
+            else:
+                hosts_label.configure(text=tr("hosts 文件正常", "hosts file OK"),
+                                      text_color="#4ADE80")
+                hosts_fix.configure(state="disabled")
+
+        def _repair_hosts():
+            ok, msg = store_accel.repair_hosts()
+            _log("[accel] %s" % msg)
+            _refresh_hosts()
+            _set_status(msg, ok=ok)
+
+        # ---- node picker: latency badges + select + auto-pick ----------
+        _latencies = {}      # raw node name -> ms (or None)
+        _shown = {}          # displayed label -> raw node name
+
+        def _decorate(names):
+            out = []
+            for n in names:
+                if n in _latencies:
+                    ms = _latencies[n]
+                    label = ("%s  (%d ms)" % (n, ms) if ms is not None
+                             else "%s  (%s)" % (n, tr("timeout", "超时")))
+                else:
+                    label = n
+                _shown[label] = n
+                out.append(label)
+            return out
+
+        def _refresh_nodes():
+            if not self.accel.is_running():
+                return
+            def _work():
+                nodes = self.accel.list_nodes()
+                cur = self.accel.current_node()
+                def _apply():
+                    _shown.clear()
+                    if nodes:
+                        labels = _decorate(nodes)
+                        node_cb.configure(values=labels)
+                        cur_label = ""
+                        for label, raw in _shown.items():
+                            if raw == cur:
+                                cur_label = label
+                                break
+                        node_cb.set(cur_label or (labels[0] if labels else ""))
+                    else:
+                        node_cb.configure(
+                            values=[tr("(no nodes yet)", "（暂无节点）")])
+                win.after(0, _apply)
+            threading.Thread(target=_work, daemon=True).start()
+
+        _LAT_RE = re.compile(r"\s*\(\d+\s*ms\)$")
+        _TO_RE = re.compile(r"\s*\(" + re.escape(tr("timeout", "超时")) + r"\)$")
+
+        def _on_node_pick(value):
+            node = _shown.get((value or "").strip(), (value or "").strip())
+            node = _LAT_RE.sub("", node).strip()
+            node = _TO_RE.sub("", node).strip()
+            if not node or node.startswith("(") or node.startswith("\uFF08"):
+                return
+            if not self.accel.is_running():
+                return
+            def _work():
+                ok, msg = self.accel.select_node(node)
+                if ok:
+                    self.accel.save_pref(node=node)
+                    win.after(0, lambda: _set_status(
+                        tr("Node: ", "当前节点：") + node, ok=True))
+                else:
+                    win.after(0, lambda: _set_status(
+                        tr("Node switch failed: ", "切换节点失败：") + str(msg),
+                        ok=False))
+            threading.Thread(target=_work, daemon=True).start()
+
+        def _latency_test():
+            if not self.accel.is_running():
+                _set_status(tr("Start the accelerator first.", "请先启动加速。"),
+                            ok=False)
+                return
+            lat_btn.configure(state="disabled")
+            auto_btn.configure(state="disabled")
+            _set_status(tr("Testing latency…", "正在测延迟…"))
+            def _work():
+                res = self.accel.test_delays()
+                def _apply():
+                    _latencies.clear()
+                    _latencies.update(res)
+                    good = {n: m for n, m in res.items() if m is not None}
+                    if good:
+                        best = min(good, key=good.get)
+                        for n, m in sorted(
+                                res.items(),
+                                key=lambda kv: (kv[1] is None, kv[1])):
+                            _log("[delay] %s: %s" % (
+                                n, ("%d ms" % m) if m is not None
+                                else tr("timeout", "超时")))
+                        _set_status(
+                            tr("Fastest: %s (%d ms)", "最快：%s（%d ms）")
+                            % (best, good[best]), ok=True)
+                    else:
+                        _set_status(
+                            tr("No node answered the latency test.",
+                               "没有节点响应延迟测试。"), ok=False)
+                    _refresh_nodes()
+                    lat_btn.configure(state="normal")
+                    auto_btn.configure(state="normal")
+                win.after(0, _apply)
+            threading.Thread(target=_work, daemon=True).start()
+
+        def _auto_pick():
+            if not self.accel.is_running():
+                _set_status(tr("Start the accelerator first.", "请先启动加速。"),
+                            ok=False)
+                return
+            lat_btn.configure(state="disabled")
+            auto_btn.configure(state="disabled")
+            _set_status(tr("Auto-selecting fastest node…",
+                           "正在自动选择最快节点…"))
+            def _work():
+                best, ms, res = self.accel.auto_select()
+                def _apply():
+                    _latencies.clear()
+                    _latencies.update(res)
+                    if best:
+                        _log("[accel] auto-selected %s (%d ms)" % (best, ms))
+                        _set_status(
+                            tr("Auto-selected: %s (%d ms)",
+                               "已自动选择：%s（%d ms）") % (best, ms), ok=True)
+                    else:
+                        _set_status(
+                            tr("Auto-select failed: no node answered.",
+                               "自动选择失败：没有节点响应。"), ok=False)
+                    _refresh_nodes()
+                    lat_btn.configure(state="normal")
+                    auto_btn.configure(state="normal")
+                win.after(0, _apply)
+            threading.Thread(target=_work, daemon=True).start()
+
+        def _do_start():
+            sub = (sub_var.get() or "").strip()
+            if not sub:
+                # must never sit on screen uninvited) — fall back to the
+                # subscription URL saved from a previous start so the
+                # one-click flow still works without pasting every time.
+                sub = (pref.get("subUrl") or "").strip()
+            if not sub:
+                _set_status(tr("Paste a subscription link first.",
+                               "请先粘贴订阅链接。"), ok=False)
+                return
+            mode = mode_var.get()
+            cp = (clash_var.get() or "").strip()
+            cip = (clash_ip_var.get() or "").strip()
+            if not cp and cip:
+                # URL row empty -> derive it from the IP row (default port).
+                if "://" not in cip and ":" not in cip:
+                    cip = cip + ":7897"
+                cp = cip if "://" in cip else "http://" + cip
+            start_btn.configure(state="disabled")
+            _set_status(tr("Starting… (download subscription, launch kernel)",
+                           "正在启动…（下载订阅、启动内核）"))
+            def _worker():
+                ok, msg = self.accel.start(sub, mode=mode, clash_proxy=cp)
+                if ok:
+                    # beta1.0.8 relay: the coordinator wakes only now — the
+                    # store booster actually started. Loopback-only lane;
+                    # the relay refuses any system-proxy/route writes here.
+                    relay.RELAY.claim(relay.STORE, "store_boost")
+                    try:
+                        self.accel.save_pref(clashIp=cip)
+                    except Exception:
+                        pass
+                    proxy_addr.set("127.0.0.1:%d" % self.accel.mixed_port)
+                    win.after(0, lambda: proxy_label.configure(
+                        text=tr("Local proxy: ", "本地代理：") + proxy_addr.get(),
+                        text_color="#4ADE80"))
+                    win.after(0, lambda: _set_status(self.accel.status_text(),
+                                                    ok=True))
+                    win.after(0, lambda: start_btn.configure(state="disabled"))
+                    win.after(0, lambda: stop_btn.configure(state="normal"))
+                    win.after(2500, _refresh_nodes)
+                else:
+                    win.after(0, lambda: _set_status(
+                        tr("Start failed: ", "启动失败：") + msg, ok=False))
+                    win.after(0, lambda: start_btn.configure(state="normal"))
+                win.after(0, lambda: log_box.see("end"))
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def _do_stop():
+            self.accel.stop()
+            # beta1.0.8 relay: both optional features may now be idle —
+            # the coordinator returns to silent standby automatically.
+            relay.RELAY.release(relay.STORE, "store_boost")
+            _set_status(tr("Stopped.", "已停止。"))
+            start_btn.configure(state="normal")
+            stop_btn.configure(state="disabled")
+            proxy_label.configure(
+                text=tr("Local proxy: not started", "本地代理：未启动"),
+                text_color=self.MUTED)
+            proxy_addr.set("")
+
+        def _refresh_status():
+            if self.accel.is_running():
+                proxy_addr.set("127.0.0.1:%d" % self.accel.mixed_port)
+                proxy_label.configure(
+                    text=tr("Local proxy: ", "本地代理：") + proxy_addr.get(),
+                    text_color="#4ADE80")
+                start_btn.configure(state="disabled")
+                stop_btn.configure(state="normal")
+                _set_status(self.accel.status_text(), ok=True)
+                _refresh_nodes()
+            else:
+                start_btn.configure(state="normal")
+                stop_btn.configure(state="disabled")
+
+        def _close():
+            self.accel.log = _orig_log
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _close)
+
+        # ---- header ----
+        ctk.CTkLabel(
+            win, font=("Segoe UI", 12, "bold"), text_color=self.TEXT,
+            text=tr("Built-in open-source Clash core — loopback micro-kernel, "
+                    "coexists with Clash Verge.",
+                    "内置开源 Clash 内核——仅本地回环微内核，与 Clash Verge 共存。")
+        ).pack(padx=16, pady=(14, 4))
+
+        # ---- subscription input ----
+        sub_frame = ctk.CTkFrame(win, fg_color="transparent")
+        sub_frame.pack(fill="x", padx=16, pady=(2, 0))
+        sub_entry = ctk.CTkEntry(
+            sub_frame, height=33, corner_radius=7, fg_color=self.INPUT_BG,
+            border_color=self.INPUT_BORDER, font=("Segoe UI", 11),
+            textvariable=sub_var,
+            placeholder_text=tr(
+                "clash:// link / subscription URL / .yaml path / paste YAML",
+                "clash:// 链接 / 订阅地址 / .yaml 路径 / 直接粘贴配置"))
+        sub_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ctk.CTkButton(
+            sub_frame, text=tr("Paste", "粘贴"), width=64, height=33,
+            corner_radius=7, font=("Segoe UI", 10),
+            fg_color=self.STATUS_BG, hover_color=self.CARD,
+            text_color=self.ACCENT,
+            command=lambda: sub_var.set(win.clipboard_get() or "")).pack(side="right")
+
+        # ---- mode + xfltd guidance ----
+        opt_frame = ctk.CTkFrame(win, fg_color="transparent")
+        opt_frame.pack(fill="x", padx=16, pady=(8, 0))
+        mode_seg = ctk.CTkSegmentedButton(
+            opt_frame,
+            values=[tr("Rule (stores only)", "规则（仅商店）"),
+                    tr("Global (all traffic)", "全局（全部流量）")],
+            height=28, font=("Segoe UI", 10),
+            command=lambda v: mode_var.set(
+                "global" if ("Global" in (v or "") or "\u5168\u5c40" in (v or ""))
+                else "rule"))
+        mode_seg.pack(side="left")
+        mode_seg.set(tr("Rule (stores only)", "规则（仅商店）")
+                     if mode_var.get() != "global"
+                     else tr("Global (all traffic)", "全局（全部流量）"))
+        ctk.CTkLabel(
+            opt_frame, font=("Segoe UI", 9), text_color=self.MUTED,
+            text=tr("From xfltd tutorial: copy the subscription link, or use the "
+                    "panel's 'one-click import to Clash Verge' clash:// link.",
+                    "参考 xfltd 教程：复制订阅地址，或直接使用面板「一键导入 Clash "
+                    "Verge」的 clash:// 链接。")).pack(side="left", padx=(10, 0))
+
+        # ---- node picker ----
+        node_frame = ctk.CTkFrame(win, fg_color="transparent")
+        node_frame.pack(fill="x", padx=16, pady=(8, 0))
+        ctk.CTkLabel(node_frame, text=tr("Node", "节点"),
+                     font=("Segoe UI", 10), text_color=self.MUTED
+                     ).pack(side="left", padx=(0, 8))
+        node_cb = ctk.CTkComboBox(
+            node_frame, height=28, corner_radius=7, font=("Segoe UI", 10),
+            fg_color=self.INPUT_BG, border_color=self.INPUT_BORDER,
+            button_color=self.INPUT_BORDER, button_hover_color=self.BORDER,
+            dropdown_font=("Segoe UI", 10),
+            values=[tr("(start the boost to load nodes)", "（启动加速后加载节点）")],
+            command=_on_node_pick)
+        node_cb.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        auto_btn = ctk.CTkButton(
+            node_frame, text=tr("Auto", "自动选择"), width=70, height=28,
+            corner_radius=7, font=("Segoe UI", 10),
+            fg_color=self.CARD, hover_color=self.BORDER, text_color=self.ACCENT,
+            border_width=1, border_color=self.BORDER,
+            command=_auto_pick)
+        auto_btn.pack(side="right")
+        lat_btn = ctk.CTkButton(
+            node_frame, text=tr("Delay", "延迟测试"), width=70, height=28,
+            corner_radius=7, font=("Segoe UI", 10),
+            fg_color=self.CARD, hover_color=self.BORDER, text_color=self.ACCENT,
+            border_width=1, border_color=self.BORDER,
+            command=_latency_test)
+        lat_btn.pack(side="right", padx=(0, 6))
+        ctk.CTkButton(
+            node_frame, text=tr("Refresh", "刷新"), width=64, height=28,
+            corner_radius=7, font=("Segoe UI", 10),
+            fg_color=self.CARD, hover_color=self.BORDER, text_color=self.ACCENT,
+            border_width=1, border_color=self.BORDER,
+            command=_refresh_nodes).pack(side="right", padx=(0, 6))
+
+        # ---- beta1.0.7: proxy URL row + proxy IP row ----------------------
+        # The subscription is fetched THROUGH the proxy URL when a panel
+        # binds the token to the IP that first fetched it — that is why
+        # Clash Verge's own import succeeds while a direct fetch 403s. Both
+        # rows are editable; the URL row wins when both are filled.
+        clash_frame = ctk.CTkFrame(win, fg_color="transparent")
+        clash_frame.pack(fill="x", padx=16, pady=(8, 0))
+        ctk.CTkLabel(
+            clash_frame, font=("Segoe UI", 10), text_color=self.MUTED,
+            text=tr("Proxy URL", "代理网址")
+        ).pack(side="left", padx=(0, 8))
+        clash_entry = ctk.CTkEntry(
+            clash_frame, height=28, corner_radius=7, fg_color=self.INPUT_BG,
+            border_color=self.INPUT_BORDER, font=("Segoe UI", 10),
+            textvariable=clash_var, placeholder_text="http://127.0.0.1:7897")
+        clash_entry.pack(side="left", fill="x", expand=True)
+
+        clash_ip_frame = ctk.CTkFrame(win, fg_color="transparent")
+        clash_ip_frame.pack(fill="x", padx=16, pady=(6, 0))
+        ctk.CTkLabel(
+            clash_ip_frame, font=("Segoe UI", 10), text_color=self.MUTED,
+            text=tr("Proxy IP", "代理 IP")
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkEntry(
+            clash_ip_frame, height=28, corner_radius=7, fg_color=self.INPUT_BG,
+            border_color=self.INPUT_BORDER, font=("Segoe UI", 10),
+            textvariable=clash_ip_var, placeholder_text="127.0.0.1"
+        ).pack(side="left", fill="x", expand=True)
+
+        # ---- local proxy address + copy ----
+        proxy_frame = ctk.CTkFrame(win, fg_color="transparent")
+        proxy_frame.pack(fill="x", padx=16, pady=(8, 0))
+        proxy_label = ctk.CTkLabel(
+            proxy_frame, font=("Segoe UI", 10), text_color=self.MUTED,
+            text=tr("Local proxy: not started", "本地代理：未启动"))
+        proxy_label.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            proxy_frame, text=tr("Copy", "复制"), width=64, height=26,
+            corner_radius=7, font=("Segoe UI", 10),
+            fg_color=self.STATUS_BG, hover_color=self.CARD,
+            text_color=self.ACCENT,
+            command=lambda: (win.clipboard_clear(),
+                            win.clipboard_append(proxy_addr.get() or ""))
+            ).pack(side="right")
+
+        # ---- hosts integrity (电脑管家 "host 异常" fix) ----
+        hosts_frame = ctk.CTkFrame(win, fg_color="transparent")
+        hosts_frame.pack(fill="x", padx=16, pady=(8, 0))
+        hosts_label = ctk.CTkLabel(
+            hosts_frame, font=("Segoe UI", 10), text_color=self.MUTED, text="")
+        hosts_label.pack(side="left", fill="x", expand=True)
+        hosts_fix = ctk.CTkButton(
+            hosts_frame, text=tr("Repair hosts", "修复 hosts"), width=96, height=26,
+            corner_radius=7, font=("Segoe UI", 10),
+            fg_color=self.CARD, hover_color=self.BORDER, text_color=self.ACCENT,
+            border_width=1, border_color=self.BORDER, command=_repair_hosts)
+        hosts_fix.pack(side="right")
+
+        # ---- start / stop ----
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(10, 0))
+        start_btn = ctk.CTkButton(
+            btn_row, text=tr("\u25b6  Start boost", "\u25b6  启动加速"), height=33,
+            corner_radius=7, fg_color=self.ACCENT, hover_color="#005AAB",
+            font=("Segoe UI", 11, "bold"), command=_do_start)
+        start_btn.pack(side="left", expand=True, fill="x", padx=(0, 6))
+        stop_btn = ctk.CTkButton(
+            btn_row, text=tr("Stop", "停止"), height=33, corner_radius=7,
+            state="disabled", fg_color=self.INPUT_BG, border_width=1,
+            border_color=self.BORDER, text_color=self.TEXT,
+            hover_color=self.STATUS_BG, font=("Segoe UI", 11),
+            command=_do_stop)
+        stop_btn.pack(side="left", expand=True, fill="x")
+
+        status = ctk.CTkLabel(
+            win, font=("Segoe UI", 10), text_color=self.MUTED,
+            text=tr("Idle. Paste a subscription, then start.",
+                    "未运行。粘贴订阅后启动加速。"))
+        status.pack(padx=16, pady=(6, 2))
+
+        log_box = ctk.CTkTextbox(win, font=("Consolas", 9), height=150, wrap="word")
+        log_box.pack(fill="x", padx=16, pady=(4, 12))
+        log_box.configure(state="disabled")
+
+        _refresh_hosts()
+        _refresh_status()
     def _ics_diagnose(self, phone_ip):
         """v1.5.44: READ-ONLY ICS diagnostic (docx §7). Reports:
         SharedAccess service state, per-adapter ICS roles (COM HNetCfg), and
@@ -4345,11 +5364,9 @@ class App:
     def _do_start(self, ip, p_port, l_port, s_user=None, s_pass=None):
         s_user = s_user or DEFAULT_PHONE_USER
         s_pass = s_pass or DEFAULT_PHONE_PASS
-        # v1.5.47: remember the active credentials for the UDP diagnostic probe.
         self._socks_user = s_user
         self._socks_pass = s_pass
         try:
-            # v1.4.91: connect = reset first. A leftover old TunManager (monitor threads and
             # tun2socks child processes from reconnecting/failed states) makes the new
             # connection "occupied, cannot connect" — every connect click fully stops the old
             # tunnel first, then starts from scratch.
@@ -4453,7 +5470,6 @@ def main(startup_hidden=False):
     root = ctk.CTk()
     app = App(root)
 
-    # beta1.0.55: Tk prints a raw traceback to stderr when a callback raises —
     # invisible in a --windowed build — and aborts whatever that callback still
     # had to do (status colour, progress spinner, follow-up scheduling). Route
     # it into the app log so a report is actionable and keep the UI alive.
@@ -4469,18 +5485,8 @@ def main(startup_hidden=False):
 
     root.report_callback_exception = _tk_report_exception
 
-    # v1.4.93: tray residency. Design per the 1.4.92 report:
-    # - the window is only a control surface; hiding it NEVER touches the
-    #   tunnel ("minimizing is not disconnecting");
-    # - the tray thread only ENQUEUES actions; every Tk call happens on the
-    #   GUI main thread via root.after polling (direct tray→Tk calls would
-    #   corrupt Tk state / fake-freeze);
-    # - closing the window (X) ASKS: minimize to tray or full exit — never a
-    #   silent default; the native minimize button keeps its taskbar
-    #   behaviour (do not minimize to tray by default);
-    # - "Exit and clean up network" is the ONLY tray action that tears down routes/ICS.
-    # If pystray/Pillow are unavailable the old behaviour degrades safely:
-    # X = full teardown + exit, exactly like v1.4.92.
+    # Tray: the window is a control surface; the tray thread only enqueues
+    # actions, every Tk call happens on the GUI thread via root.after.
     ui_queue = queue.Queue()
     tray_icon_holder = {"icon": None}
     # v1.5.0 (P0): single teardown entry guard (see _teardown_and_exit).
@@ -4505,7 +5511,6 @@ def main(startup_hidden=False):
         ui_queue.put("QUIT")
 
     def _tray_settings(_icon=None, _item=None):
-        # v1.5.44: tray grew to 4 items — Settings opens the new panel.
         ui_queue.put("SETTINGS")
 
     def _make_tray():
@@ -4536,45 +5541,41 @@ def main(startup_hidden=False):
         root.focus_force()
 
     def _teardown_and_exit():
-        # Former on_closing body — the ONLY exit path that tears down the
-        # network. Kept synchronous: the reap below VERIFIES death (v1.4.91).
-        # v1.5.0 (P0): one-shot guard — a tray QUIT racing a window-close X
-        # must never run the teardown twice (double taskkill / double ICS
-        # rollback). Reset only on the failure path so the user can retry
-        # after fixing the sharing cleanup.
+        # path (taskkill/powershell up to ~7s on the Tk main thread) was the
+        # reported "tray quit -> window not responding" freeze. The window
+        # hides immediately; cleanup completes in the background, then the
+        # process force-exits. One-shot guard unchanged (P0).
         if teardown_state["started"]:
             return
         teardown_state["started"] = True
-        if tray_icon_holder["icon"] is not None:
-            try:
-                tray_icon_holder["icon"].stop()
-            except Exception:
-                pass
-        if app.tun_mgr or app.ics_mgr.needs_cleanup:
-            print("Cleaning up before exit...")
-            if not app._do_stop(is_closing=True):
-                # v1.5.41: silent UX — keep the window open, explain in the
-                # log/status instead of a modal dialog (user can retry).
-                teardown_state["started"] = False
-                app.log("Could not restore Windows sharing settings; stop sharing before closing the app.")
-                root.after(0, lambda: app._set_status(tr("Status: Sharing cleanup failed, stop sharing first", "状态：共享清理失败，请先停止共享"), "error"))
-                return
-        # v1.4.63/91: TRUE exit — the VPN must never outlive the window; the
-        # client itself force-exits after destroy so no half-alive teardown
-        # state lingers.
-        # beta1.0.57: stop the store accelerator and restore the system
-        # proxy before the process dies — never leave WinINET pointing at a
-        # dead 127.0.0.1:7890.
         try:
-            app.accel.shutdown()
+            root.withdraw()  # instant visual feedback; never block the UI
         except Exception:
             pass
-        _kill_engine_procs_all()
-        root.destroy()
-        os._exit(0)
+
+        def _background_teardown():
+            try:
+                if tray_icon_holder["icon"] is not None:
+                    try:
+                        tray_icon_holder["icon"].stop()
+                    except Exception:
+                        pass
+                if app.tun_mgr or app.ics_mgr.needs_cleanup:
+                    if not app._do_stop(is_closing=True):
+                        app.log("Could not restore Windows sharing settings; "
+                                "forcing exit anyway (network state was swept).")
+                try:
+                    app.accel.shutdown()
+                except Exception:
+                    pass
+                _kill_engine_procs_all()
+            finally:
+                root.destroy()
+                os._exit(0)
+
+        threading.Thread(target=_background_teardown, daemon=True).start()
 
     def on_close_request():
-        # v1.5.44: X ALWAYS minimizes to tray — never an implicit exit.
         # The tray menu's "Exit and clean up network" is the ONLY full-exit path, so
         # an idle-window close can never silently tear down the tunnel or
         # surprise the user. Without a tray (pystray unavailable) the old
@@ -4594,7 +5595,6 @@ def main(startup_hidden=False):
                 elif action == "HIDE":
                     root.withdraw()
                 elif action == "SETTINGS":
-                    # v1.5.44: tray "Settings" -> the new settings panel.
                     app.open_settings()
                 elif action == "QUIT":
                     _teardown_and_exit()
@@ -4608,7 +5608,6 @@ def main(startup_hidden=False):
     root.protocol("WM_DELETE_WINDOW", on_close_request)
     _process_ui_queue()
 
-    # v1.5.44: launched via the LoginStartup task → hide to tray immediately
     # (the window stays a control surface, nothing is torn down) and, only if
     # the user enabled "auto-connect" in Settings, run a BOUNDED connect worker:
     # poll the phone's SOCKS5 every 10s for up to ~120s, then start on the
@@ -4630,7 +5629,6 @@ def main(startup_hidden=False):
             settings_p = settings.get("socksPass") or DEFAULT_PHONE_PASS
             deadline = time.time() + 120
             while time.time() < deadline:
-                # v1.5.47: compare against SOCKS5_OK explicitly (the string
                 # return is always truthy — the bare `if` never probed) and
                 # authenticate per the phone's userpass policy.
                 if check_socks5(ip, port, timeout=2.0,
@@ -4651,12 +5649,10 @@ def main(startup_hidden=False):
     root.mainloop()
 
 if __name__ == "__main__":
-    # v1.4.5: single-instance guard. Two live instances fight over Wintun,
     # the /1 routes and ICS until both break ("clash"). A named OS mutex makes
     # any second launch exit cleanly with a clear message instead. Checked
     # BEFORE the UAC relaunch so a duplicate start never prompts for admin.
     #
-    # v1.4.62: the silent-elevation path (schtasks /run) can start the elevated
     # instance while the non-admin launcher is still shutting down — the mutex
     # is still held for a few hundred ms. Retry briefly instead of bouncing
     # the legitimate relaunch (user-visible as "double-click does nothing").
@@ -4689,7 +5685,6 @@ if __name__ == "__main__":
     if IS_WINDOWS:
         try:
             if not ctypes.windll.shell32.IsUserAnAdmin():
-                # v1.4.6: prefer SILENT elevation through the scheduled task
                 # (registered with highest privileges on a previous elevated
                 # run) — no UAC prompt on subsequent launches.
                 if _launch_via_scheduled_task():
