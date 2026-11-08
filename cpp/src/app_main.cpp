@@ -123,6 +123,15 @@ struct App {
     // beta1.0.97: group we select nodes into (always the built-in GLOBAL
     // selector in global mode; mihomo auto-adds every proxy to it).
     std::wstring accel_group = L"GLOBAL";
+
+    // beta1.1.2: reconnect governor + single-shot quit guard.
+    // auto-reconnect used to be a dead setting (the checkbox wrote a file
+    // nobody read), so a link flap just sat there while the user hammered
+    // Connect. Now a failed connect is retried with a hard 10-strike cap.
+    std::atomic<bool> abort_reconnect{false};
+    std::atomic<bool> reconnect_busy{false};
+    std::atomic<int>  connect_fail_streak{0};
+    std::atomic<bool> quitting{false};
 };
 
 App g_app;
@@ -1051,6 +1060,19 @@ static void PaintCards(HWND h) {
         if (c.page != h) continue;
         HRGN rg = CreateRoundRectRgn(c.rc.left, c.rc.top, c.rc.right + 1,
                                      c.rc.bottom + 1, 10, 10);
+        // beta1.1.3: the system erases a plain rectangle before our rounded
+        // fill, leaving four bright "[" / "]" corners outside the radius.
+        // Only repaint those four corner squares -- filling the WHOLE card
+        // rect (first attempt) painted over every child control = blue
+        // screen. Controls start >=14px inside the card, so 10px is safe.
+        const int rad = 10;
+        RECT corners[4] = {
+            {c.rc.left, c.rc.top, c.rc.left + rad, c.rc.top + rad},
+            {c.rc.right - rad, c.rc.top, c.rc.right, c.rc.top + rad},
+            {c.rc.left, c.rc.bottom - rad, c.rc.left + rad, c.rc.bottom},
+            {c.rc.right - rad, c.rc.bottom - rad, c.rc.right, c.rc.bottom},
+        };
+        for (const RECT& q : corners) FillRect(dc, &q, g_brBg);
         HBRUSH br = CreateSolidBrush(kCard);
         FillRgn(dc, rg, br);
         DeleteObject(br);
@@ -1085,6 +1107,26 @@ static bool DrawDarkCtl(DRAWITEMSTRUCT* d) {
         return true;
     }
     if (d->CtlType != ODT_BUTTON) return false;
+    // beta1.1.3: same corner-bracket fix for owner-draw buttons. Windows
+    // erases the button rect (white) first; our rounded fill covered only
+    // the middle, leaving four bright corners on the top tab strip.
+    // ONLY the four corners are repainted (8px radius) -- never the whole
+    // rect, or the button label / page content gets wiped out.
+    {
+        HWND par = GetParent(d->hwndItem);
+        bool onPage = (par == g_app.page_conn || par == g_app.page_share ||
+                       par == g_app.page_accel);
+        HBRUSH bg = CreateSolidBrush(onPage ? kCard : kBg);
+        const int rad = 12;
+        RECT corners[4] = {
+            {r.left, r.top, r.left + rad, r.top + rad},
+            {r.right - rad, r.top, r.right, r.top + rad},
+            {r.left, r.bottom - rad, r.left + rad, r.bottom},
+            {r.right - rad, r.bottom - rad, r.right, r.bottom},
+        };
+        for (const RECT& q : corners) FillRect(dc, &q, bg);
+        DeleteObject(bg);
+    }
     wchar_t txt[80];
     GetWindowTextW(d->hwndItem, txt, 80);
     LONG st = GetWindowLongW(d->hwndItem, GWL_STYLE);
@@ -1328,6 +1370,9 @@ void BuildUi(HWND hwnd) {
         SendMessageW(h, WM_SETFONT, (WPARAM)f, TRUE);
     }
     y += 34;
+    // beta1.1.3 layout: row 1 = Phone IP / Port / Check UDP,
+    // row 2 = User / Password (+ eye). Both rows share the same column
+    // origins so the form reads as a clean grid.
     MakeLabel(pc, TR(L"Phone IP", L"手机IP"), 26, y + 4, 62, 20);
     g_app.phone_ip = CreateWindowW(L"EDIT", L"192.168.49.1",
         WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 96, y, 140, 24, pc, nullptr,
@@ -1336,25 +1381,25 @@ void BuildUi(HWND hwnd) {
     g_app.phone_port = CreateWindowW(L"EDIT", L"8080",
         WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 292, y, 60, 24, pc, nullptr,
         g_app.inst, nullptr);
-    MakeLabel(pc, TR(L"User", L"账号"), 362, y + 4, 40, 20);
-    g_app.phone_user = CreateWindowW(L"EDIT", L"linkhelm01",
-        WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 408, y, 90, 24, pc, nullptr,
+    g_app.udp_btn = CreateWindowW(L"BUTTON", TR(L"Check UDP", L"检测UDP"),
+        WS_VISIBLE | WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+        460, y - 1, 110, 26, pc, (HMENU)(INT_PTR)Ctl::UdpBtn,
         g_app.inst, nullptr);
-    y += 32;
-    MakeLabel(pc, TR(L"Password", L"密码"), 26, y + 4, 62, 20);
+    int row2 = y + 32;
+    MakeLabel(pc, TR(L"User", L"账号"), 26, row2 + 4, 62, 20);
+    g_app.phone_user = CreateWindowW(L"EDIT", L"linkhelm01",
+        WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 96, row2, 140, 24, pc, nullptr,
+        g_app.inst, nullptr);
+    MakeLabel(pc, TR(L"Password", L"密码"), 246, row2 + 4, 62, 20);
     g_app.phone_pass = CreateWindowW(L"EDIT", L"k7h2m9x4qa",
-        WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL | ES_PASSWORD, 96, y, 140, 24,
+        WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL | ES_PASSWORD, 312, row2, 140, 24,
         pc, nullptr, g_app.inst, nullptr);
     g_app.pass_eye = CreateWindowW(L"BUTTON", L"\U0001F441",
         WS_VISIBLE | WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
-        244, y - 3, 46, 28, pc, (HMENU)(INT_PTR)Ctl::PassEye,
+        460, row2 - 3, 46, 28, pc, (HMENU)(INT_PTR)Ctl::PassEye,
         g_app.inst, nullptr);
     SetPropW(g_app.pass_eye, L"lhEye", (HANDLE)1);
-    g_app.udp_btn = CreateWindowW(L"BUTTON", TR(L"Check UDP", L"检测UDP"),
-        WS_VISIBLE | WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
-        480, y - 1, 110, 26, pc, (HMENU)(INT_PTR)Ctl::UdpBtn,
-        g_app.inst, nullptr);
-    y += 36;
+    y = row2 + 36;
     g_app.conn_btn = CreateWindowW(L"BUTTON", TR(L"Connect", L"一键连接"),
         WS_VISIBLE | WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
         26, y, 270, 32, pc, (HMENU)(INT_PTR)Ctl::ConnBtn,
@@ -2003,39 +2048,166 @@ void RefreshEthList() {
 }
 
 // ---- connect/disconnect workers (pure C++ tunnel manager) ----
-void WorkerConnect() {
+
+// beta1.1.2: every access to g_app.tun goes through this lock. A retry loop
+// and a user Disconnect used to race over the same unique_ptr -> crash.
+static std::mutex g_tun_mtx;
+
+static std::wstring AutoConnectFilePath() {
+    wchar_t self[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring p(self);
+    auto sp = p.rfind(L'\\');
+    if (sp != std::wstring::npos) p = p.substr(0, sp);
+    return p + L"\\autoconnect.txt";
+}
+
+// The Settings toggle defaults to ON; only an explicit "off" file disables
+// automatic reconnect. (Before 1.1.2 this file was written but never read.)
+static bool AutoReconnectEnabled() {
+    FILE* f = _wfopen(AutoConnectFilePath().c_str(), L"r");
+    if (!f) return true;
+    wchar_t buf[16]{};
+    fgetws(buf, 16, f);
+    fclose(f);
+    return wcsstr(buf, L"off") == nullptr;
+}
+
+static linkhelm::TunnelConfig ReadConnConfig() {
     linkhelm::TunnelConfig cfg;
     cfg.phone_ip = GetText(g_app.phone_ip);
     cfg.phone_port = _wtoi(GetText(g_app.phone_port).c_str());
     cfg.socks_user = GetText(g_app.phone_user);
     cfg.socks_pass = GetText(g_app.phone_pass);
-    if (cfg.phone_ip.empty() || cfg.phone_port <= 0) {
-        Log(L"Enter the phone IP and port");
-        return;
+    return cfg;
+}
+
+static void StopTunnelSafe() {
+    std::lock_guard<std::mutex> lk(g_tun_mtx);
+    if (g_app.tun) {
+        g_app.tun->Stop();
+        g_app.tun.reset();
+    }
+}
+
+// One connection attempt. Never called on the UI thread.
+static bool TryConnectOnce(const linkhelm::TunnelConfig& cfg,
+                           std::wstring* err) {
+    std::lock_guard<std::mutex> lk(g_tun_mtx);
+    if (g_app.tun) {                 // a previous attempt / dropped link
+        g_app.tun->Stop();
+        g_app.tun.reset();
     }
     g_app.tun = std::make_unique<linkhelm::TunnelManager>(
         [](const std::wstring& m) { Log(m); },
         [](const std::wstring& m) {
             if (g_app.conn_status) UiText(g_app.conn_status, m.c_str());
+            // link loss -> ask the UI thread to start a governed reconnect
+            if (!g_app.abort_reconnect.load() && !g_app.quitting.load() &&
+                AutoReconnectEnabled() && g_app.hwnd && IsWindow(g_app.hwnd) &&
+                (m.find(L"engine exited unexpectedly") != std::wstring::npos ||
+                 m.find(L"link flap") != std::wstring::npos))
+                PostMessageW(g_app.hwnd, WM_APP + 14, 0, 0);
         });
-    std::wstring err;
-    bool ok = g_app.tun->Start(cfg, &err);
-    if (ok) {
-        Log(L"[tun] connected (engine kernel-managed in C++ Job Object)");
-        UiEnable(g_app.conn_btn, FALSE);
-        UiEnable(g_app.disc_btn, TRUE);
-    } else {
-        Log(L"[tun] connect failed: " + err);
-        g_app.tun.reset();
+    return g_app.tun->Start(cfg, err);
+}
+
+// beta1.1.2: auto-reconnect governor. A failed connect (or a link loss)
+// is retried at most 10 consecutive times; the 10th failure performs a
+// full disconnect, resets the UI and stops retrying. Success clears the
+// counter. User Disconnect / app quit sets abort_reconnect and wins.
+static void ConnectWithRetry(linkhelm::TunnelConfig cfg) {
+    if (g_app.reconnect_busy.exchange(true)) return;
+    g_app.abort_reconnect.store(false);
+    if (cfg.phone_ip.empty() || cfg.phone_port <= 0) {
+        Log(TR(L"Enter the phone IP and port", L"请填写手机 IP 和端口"));
+        UiEnable(g_app.conn_btn, TRUE);
+        UiEnable(g_app.disc_btn, FALSE);
+        UiText(g_app.conn_status,
+               TR(L"Status: not connected", L"状态：未连接"));
+        g_app.reconnect_busy.store(false);
+        return;
     }
+    for (int streak = 1;; ++streak) {
+        if (g_app.abort_reconnect.load() || g_app.quitting.load()) {
+            Log(TR(L"[reconnect] stopped (user disconnect / shutdown)",
+                   L"[重连] 已停止（用户断开 / 程序退出）"));
+            break;
+        }
+        std::wstring err;
+        bool ok = TryConnectOnce(cfg, &err);
+        if (ok && (g_app.abort_reconnect.load() || g_app.quitting.load())) {
+            // user hit Disconnect while the attempt was in flight: do not
+            // publish "connected", just tear it straight back down.
+            StopTunnelSafe();
+            Log(TR(L"[reconnect] stopped (user disconnect / shutdown)",
+                   L"[重连] 已停止（用户断开 / 程序退出）"));
+            break;
+        }
+        if (ok) {
+            g_app.connect_fail_streak.store(0);
+            Log(L"[tun] connected (engine kernel-managed in C++ Job Object)");
+            UiText(g_app.conn_status,
+                   TR(L"Status: connected", L"状态：已连接"));
+            UiEnable(g_app.conn_btn, FALSE);
+            UiEnable(g_app.disc_btn, TRUE);
+            break;
+        }
+        g_app.connect_fail_streak.store(streak);
+        Log(L"[tun] connect failed: " + err);
+        StopTunnelSafe();
+        if (streak >= 10) {
+            Log(TR(L"[reconnect] 10 consecutive failures - auto disconnect, no more retries",
+                   L"[重连] 连续失败 10 次，自动断开并停止重试"));
+            UiEnable(g_app.conn_btn, TRUE);
+            UiEnable(g_app.disc_btn, FALSE);
+            UiText(g_app.conn_status,
+                   TR(L"Status: not connected (auto-disconnect after 10 failures)",
+                      L"状态：未连接（连续失败 10 次，已自动断开）"));
+            break;
+        }
+        Log((g_lang_zh
+                 ? L"[重连] 第 " + std::to_wstring(streak) + L"/10 次失败，2 秒后重试…"
+                 : L"[reconnect] attempt " + std::to_wstring(streak) +
+                       L"/10 failed, retrying in 2s..."));
+        // beta1.1.3: 3s -> 2s; interruptible 25ms slices so Disconnect/Quit
+        // is instant. 10 failures still take ~20s, gentle on the hotspot.
+        for (int i = 0; i < 80 && !g_app.abort_reconnect.load() &&
+                 !g_app.quitting.load(); ++i)
+            Sleep(25);
+    }
+    if (g_app.abort_reconnect.load() || g_app.quitting.load())
+        StopTunnelSafe();
+    g_app.reconnect_busy.store(false);
+}
+
+// beta1.1.2: quitting must not run Stop() on the GUI thread (that was the
+// "laggy / slow exit": 5s monitor join + 5 child processes + accel.Stop).
+// Hide the window and drop the tray icon FIRST, then clean up on a worker and
+// only post WM_APP+15 (=> DestroyWindow => PostQuitMessage) when done, so
+// no stale route / adapter is left behind.
+static void RequestQuit() {
+    if (g_app.quitting.exchange(true)) return;
+    g_app.abort_reconnect.store(true);
+    if (g_app.tray) g_app.tray->Remove();
+    if (g_app.hwnd && IsWindow(g_app.hwnd)) ShowWindow(g_app.hwnd, SW_HIDE);
+    Log(TR(L"[quit] cleaning up network...", L"[退出] 正在清理网络…"));
+    std::thread([] {
+        StopTunnelSafe();
+        g_app.accel.Stop();
+        if (g_app.hwnd && IsWindow(g_app.hwnd))
+            PostMessageW(g_app.hwnd, WM_APP + 15, 0, 0);
+    }).detach();
 }
 
 void WorkerDisconnect() {
-    if (g_app.tun) {
-        g_app.tun->Stop();
-        g_app.tun.reset();
-        Log(L"[tun] disconnected, routes cleaned");
-    }
+    g_app.abort_reconnect.store(true);
+    g_app.connect_fail_streak.store(0);
+    // wait for an in-flight retry loop to release the manager (it checks the
+    // abort flag every 25ms), then clean up under the same lock
+    for (int i = 0; i < 1200 && g_app.reconnect_busy.load(); ++i) Sleep(25);
+    StopTunnelSafe();
+    Log(L"[tun] disconnected, routes cleaned");
     UiEnable(g_app.conn_btn, TRUE);
     UiEnable(g_app.disc_btn, FALSE);
 }
@@ -2183,7 +2355,8 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 RegCloseKey(k);
             }
             SetPropW(rs->autoChk, L"lhOn", (HANDLE)(autoOn ? 1 : 0));
-            SetPropW(rs->reconChk, L"lhOn", (HANDLE)1);
+            SetPropW(rs->reconChk, L"lhOn",
+                     (HANDLE)(AutoReconnectEnabled() ? 1 : 0));
             InvalidateRect(rs->autoChk, nullptr, TRUE);
             InvalidateRect(rs->reconChk, nullptr, TRUE);
             return 0;
@@ -2302,17 +2475,13 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     }
                 } else if (id == (int)Ctl::TglAutoconnect) {
                     bool nowOn = !on;
-                    wchar_t selfC[MAX_PATH]{};
-                    GetModuleFileNameW(nullptr, selfC, MAX_PATH);
-                    std::wstring p(selfC);
-                    auto sp = p.rfind(L'\\');
-                    if (sp != std::wstring::npos) p = p.substr(0, sp);
-                    p += L"\\autoconnect.txt";
-                    if (nowOn) {
-                        FILE* fc = _wfopen(p.c_str(), L"w");
-                        if (fc) { fputws(L"on", fc); fclose(fc); }
-                    } else {
-                        DeleteFileW(p.c_str());
+                    // beta1.1.2: "off" is an explicit value now. The old code
+                    // DELETED the file, but AutoReconnectEnabled() treats a
+                    // missing file as ON -> the switch could never turn off.
+                    FILE* fc = _wfopen(AutoConnectFilePath().c_str(), L"w");
+                    if (fc) {
+                        fputws(nowOn ? L"on" : L"off", fc);
+                        fclose(fc);
                     }
                 }
                 return 0;
@@ -2346,7 +2515,7 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     GetModuleFileNameW(nullptr, selfL, MAX_PATH);
                     std::wstring relaunch = L"cmd.exe /c timeout /t 1 /nobreak >nul & \"";
                     relaunch += selfL;
-                    relaunch += L"\"";
+                    relaunch += L"\" --lh-restart";  // beta1.1.2: trusted relaunch
                     STARTUPINFOW siL{};
                     siL.cb = sizeof(siL);
                     PROCESS_INFORMATION piL{};
@@ -2386,17 +2555,11 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 if (id == 23) {
                     bool on = SendMessageW((HWND)l, BM_GETCHECK, 0, 0) ==
                               BST_CHECKED;
-                    wchar_t self2[MAX_PATH]{};
-                    GetModuleFileNameW(nullptr, self2, MAX_PATH);
-                    std::wstring p2(self2);
-                    auto sp2 = p2.rfind(L'\\');
-                    if (sp2 != std::wstring::npos) p2 = p2.substr(0, sp2);
-                    p2 += L"\\autoconnect.txt";
-                    if (on) {
-                        FILE* f2 = _wfopen(p2.c_str(), L"w");
-                        if (f2) { fputws(L"on", f2); fclose(f2); }
-                    } else {
-                        DeleteFileW(p2.c_str());
+                    std::wstring p2 = AutoConnectFilePath();
+                    FILE* f2 = _wfopen(p2.c_str(), L"w");
+                    if (f2) {
+                        fputws(on ? L"on" : L"off", f2);
+                        fclose(f2);
                     }
                     return 0;
                 }
@@ -2430,12 +2593,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 case (int)Ctl::ConnBtn:
                     UiText(g_app.conn_status, TR(L"Status: connecting…", L"状态：连接中…"));
-                    std::thread(WorkerConnect).detach();
+                    // beta1.1.3: Disconnect must stay live for the WHOLE
+                    // governed retry loop, otherwise a failed connecting
+                    // phase leaves the user with no way out until 10 fails.
+                    UiEnable(g_app.disc_btn, TRUE);
+                    {
+                        // read the fields on the UI thread, then hand a copy
+                        // to the governed retry worker (no cross-thread HWND)
+                        auto cfg = ReadConnConfig();
+                        std::thread([cfg] { ConnectWithRetry(cfg); }).detach();
+                    }
                     return 0;
                 case (int)Ctl::DiscBtn:
                     // beta1.0.95: Stop() joins the monitor + runs netsh/route
                     // cleanup (10-20s). On the UI thread that froze the whole
                     // window ("无响应"). Background it; buttons flip instantly.
+                    g_app.abort_reconnect.store(true);
                     UiEnable(g_app.disc_btn, FALSE);
                     UiText(g_app.conn_status, TR(L"Status: disconnecting…", L"状态：断开中…"));
                     std::thread([] {
@@ -2502,43 +2675,73 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 case (int)Ctl::UdpBtn: {
                     std::thread([] {
-                        Log(L"[udp] sending DNS probe via tunnel to 223.5.5.5:53...");
-                        // minimal UDP DNS A query for example.com
+                        // 1.1.1: probe the SAME resolver pool in the SAME
+                        // order as the Android host (UDP_SELF_TEST_DNS_POOL)
+                        // and the TUN statics — 119 primary. The old probe
+                        // hard-coded 223.5.5.5 only, which is the phone's
+                        // SECOND resolver: a flaky 223 made the whole UDP
+                        // data plane look dead even though 119 answered fine.
+                        static const char* kPool[] = {"119.29.29.29",
+                                                      "223.5.5.5",
+                                                      "114.114.114.114"};
                         WSADATA w;
                         WSAStartup(MAKEWORD(2, 2), &w);
-                        SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
-                        sockaddr_in a{};
-                        a.sin_family = AF_INET;
-                        a.sin_port = htons(53);
-                        inet_pton(AF_INET, "223.5.5.5", &a.sin_addr);
-                        // beta1.0.86: bind to the TUN only if it exists;
-                        // a failed bind must NOT kill the probe (it used to
-                        // make the socket unusable -> false "no reply").
-                        sockaddr_in src{};
-                        src.sin_family = AF_INET;
-                        src.sin_port = 0;
-                        inet_pton(AF_INET, "10.0.0.2", &src.sin_addr);
-                        if (bind(s, (sockaddr*)&src, sizeof(src)) != 0) {
-                            // tunnel down: rebind to any interface
+                        int answered = -1;
+                        for (int i = 0; i < 3 && answered < 0; ++i) {
+                            wchar_t wsrv[32]{};
+                            MultiByteToWideChar(CP_UTF8, 0, kPool[i], -1,
+                                                wsrv, 32);
+                            Log(L"[udp] sending DNS probe via tunnel to " +
+                                std::wstring(wsrv) + L":53...");
+                            SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+                            sockaddr_in a{};
+                            a.sin_family = AF_INET;
+                            a.sin_port = htons(53);
+                            inet_pton(AF_INET, kPool[i], &a.sin_addr);
+                            // beta1.0.86: bind to the TUN only if it exists;
+                            // a failed bind must NOT kill the probe (it used
+                            // to make the socket unusable -> false "no
+                            // reply").
+                            sockaddr_in src{};
+                            src.sin_family = AF_INET;
+                            src.sin_port = 0;
+                            inet_pton(AF_INET, "10.0.0.2", &src.sin_addr);
+                            if (bind(s, (sockaddr*)&src, sizeof(src)) != 0) {
+                                // tunnel down: rebind to any interface
+                                closesocket(s);
+                                s = socket(AF_INET, SOCK_DGRAM, 0);
+                                u_long nb2 = 1;
+                                ioctlsocket(s, FIONBIO, &nb2);
+                            }
+                            // minimal UDP DNS A query for example.com
+                            unsigned char q[] = {
+                                0x12,0x34,1,0,0,1,0,0,0,0,0,0,
+                                7,'e','x','a','m','p','l','e',3,'c','o','m',
+                                0,0,1,0,1};
+                            sendto(s, (const char*)q, sizeof(q), 0,
+                                   (sockaddr*)&a, sizeof(a));
+                            char buf[512];
+                            fd_set r;
+                            FD_ZERO(&r);
+                            FD_SET(s, &r);
+                            timeval tv{2, 500000};  // 2.5s per candidate
+                            int n = -1;
+                            if (select(0, &r, nullptr, nullptr, &tv) > 0)
+                                n = recvfrom(s, buf, sizeof(buf), 0,
+                                             nullptr, nullptr);
                             closesocket(s);
-                            s = socket(AF_INET, SOCK_DGRAM, 0);
-                            u_long nb2 = 1;
-                            ioctlsocket(s, FIONBIO, &nb2);
+                            if (n > 0) {
+                                answered = i;
+                                Log(L"[udp] UDP data plane OK — resolver " +
+                                    std::wstring(wsrv) + L" answered");
+                            } else {
+                                Log(L"[udp] " + std::wstring(wsrv) +
+                                    L" no reply, trying next candidate...");
+                            }
                         }
-                        unsigned char q[] = {0x12,0x34,1,0,0,1,0,0,0,0,0,0,
-                                             7,'e','x','a','m','p','l','e',3,'c','o','m',0,0,1,0,1};
-                        sendto(s, (const char*)q, sizeof(q), 0, (sockaddr*)&a, sizeof(a));
-                        char buf[512];
-                        fd_set r;
-                        FD_ZERO(&r);
-                        FD_SET(s, &r);
-                        timeval tv{4, 0};
-                        int n = -1;
-                        if (select(0, &r, nullptr, nullptr, &tv) > 0)
-                            n = recvfrom(s, buf, sizeof(buf), 0, nullptr, nullptr);
-                        closesocket(s);
-                        Log(n > 0 ? L"[udp] UDP data plane OK (DNS reply received)"
-                                  : L"[udp] no reply (tunnel down or UDP blocked)");
+                        if (answered < 0)
+                            Log(L"[udp] no resolver answered (tunnel down or "
+                                L"UDP blocked)");
                     }).detach();
                     return 0;
                 }
@@ -2639,8 +2842,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         26, 240, 420, 36, sw, (HMENU)(INT_PTR)Ctl::TglAutostart,
                         g_app.inst, nullptr);
                     HWND reconChk = CreateWindowW(L"STATIC",
-                        TR(L"Auto-reconnect on link loss",
-                           L"断线自动重连"),
+                        TR(L"Auto-reconnect (10 fails = auto-off)",
+                           L"断线自动重连（失败 10 次自动断开）"),
                         WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_OWNERDRAW,
                         26, 352, 420, 36, sw,
                         (HMENU)(INT_PTR)Ctl::TglAutoconnect,
@@ -2679,7 +2882,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     MessageBoxW(hwnd,
                         g_lang_zh
                             ? L"【产品说明】\n"
-                              L"LinkHelm Desktop 1.1.0（纯 C++ 版）。本软件通过"
+                              L"LinkHelm Desktop 1.1.3（纯 C++ 版）。本软件通过"
                               L"手机热点把网络共享给电脑与下联设备使用，包含隧道连接、"
                               L"网络共享(ICS)、文件传输、商店加速四大功能。\n\n"
                               L"【开源组件】\n"
@@ -2694,7 +2897,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                               L"仅供个人学习与合法用途。使用者应遵守所在地法律法规，"
                               L"不得用于任何违法用途。软件按『现状』提供，不附带任何担保。"
                             : L"[Product]\n"
-                              L"LinkHelm Desktop 1.1.0 (pure C++). Shares the "
+                              L"LinkHelm Desktop 1.1.3 (pure C++). Shares the "
                               L"phone's hotspot Internet with this PC and "
                               L"downstream devices: tunnel connect, network "
                               L"sharing (ICS), file transfer, store boost.\n\n"
@@ -2859,6 +3062,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP + 11: RefreshNodes(); return 0;
         case WM_APP + 12: RefreshNodes(); return 0;
         case WM_APP + 13: DrainLogQueue(); return 0;  // beta1.0.96 log drain
+        case WM_APP + 14: {  // beta1.1.2: link loss -> governed reconnect
+            if (g_app.quitting.load() || g_app.abort_reconnect.load() ||
+                !AutoReconnectEnabled()) return 0;
+            auto cfg = ReadConnConfig();
+            std::thread([cfg] { ConnectWithRetry(cfg); }).detach();
+            return 0;
+        }
+        case WM_APP + 15:  // beta1.1.2: background teardown finished -> exit
+            DestroyWindow(hwnd);
+            return 0;
         case WM_CLOSE:
             // Tray residency: X minimizes, it never exits. Only the tray's
             // "quit & clean up network" ends the process.
@@ -2894,6 +3107,76 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 }  // namespace
 
+// beta1.1.2b: a fully self-owned notice. MessageBoxW lets Windows localise
+// the OK button to "确定" on a zh-CN system even when the app is in English
+// mode, so the popup looked Chinese. Here EVERY string (title, body, button)
+// follows lang.txt -- no system-localised UI is involved.
+static LRESULT CALLBACK NoticeProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+        case WM_COMMAND:
+            if (LOWORD(w) == 1) DestroyWindow(h);
+            return 0;
+        case WM_CLOSE:
+            DestroyWindow(h);
+            return 0;
+        case WM_CTLCOLORSTATIC: {
+            HDC dc = (HDC)w;
+            SetTextColor(dc, kText);
+            SetBkColor(dc, kBg);
+            return (LRESULT)g_brBg;
+        }
+        case WM_DESTROY:
+            PostQuitMessage(0);  // ends our small local message loop
+            return 0;
+        default:
+            return DefWindowProcW(h, m, w, l);
+    }
+}
+
+static void ShowAlreadyRunningNotice(HINSTANCE inst, bool zh) {
+    const wchar_t* kCls = L"LhAlreadyRunningDlg";
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = NoticeProc;
+    wc.hInstance = inst;
+    wc.lpszClassName = kCls;
+    wc.hbrBackground = g_brBg;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassW(&wc);
+    const int w = 440, h = 200;
+    RECT desk{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &desk, 0);
+    int x = desk.left + ((desk.right - desk.left) - w) / 2;
+    int y = desk.top + ((desk.bottom - desk.top) - h) / 2;
+    HWND dlg = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, kCls,
+        zh ? L"LinkHelm — 程序已打开" : L"LinkHelm - Already Running",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        x, y, w, h, nullptr, nullptr, inst, nullptr);
+    if (!dlg) return;
+    HWND txt = CreateWindowW(L"STATIC",
+        zh ? L"LinkHelm 已经打开，只能运行一个实例。\r\n\r\n已为你切换到现有窗口。"
+           : L"LinkHelm is already running.\r\n"
+             L"Only one instance can be open at a time.\r\n\r\n"
+             L"The existing window has been brought to the front.",
+        WS_CHILD | WS_VISIBLE, 22, 24, 392, 100, dlg, nullptr, inst, nullptr);
+    HWND btn = CreateWindowW(L"BUTTON", zh ? L"确定" : L"OK",
+        WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
+        320, 128, 96, 30, dlg, (HMENU)(INT_PTR)1, inst, nullptr);
+    HFONT f = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    SendMessageW(txt, WM_SETFONT, (WPARAM)f, TRUE);
+    SendMessageW(btn, WM_SETFONT, (WPARAM)f, TRUE);
+    SetForegroundWindow(dlg);
+    MSG msg{};
+    while (IsWindow(dlg) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) {
+            DestroyWindow(dlg);
+            continue;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmd_show) {
     WSADATA wsa{};
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -2918,6 +3201,36 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmd_show) {
             fclose(f);
             if (wcsstr(buf, L"zh")) g_lang_zh = true;
         }
+    }
+    // beta1.1.2: single instance. Two copies fought over the wintun adapter,
+    // the /1 routes AND the startup "orphan engine" sweep (which killed the
+    // other copy's engine) -- a direct cause of "TUN adapter did not appear"
+    // and "route 0.0.0.0/1 readback verify failed" in the field.
+    // Checked AFTER lang.txt is read so the notice follows the UI language.
+    const wchar_t* kSingleMutex = L"Local\\LinkHelmDesktopSingleton";
+    bool isRestart = wcsstr(GetCommandLineW(), L"--lh-restart") != nullptr;
+    HANDLE single = CreateMutexW(nullptr, TRUE, kSingleMutex);
+    bool already = single && GetLastError() == ERROR_ALREADY_EXISTS;
+    if (already && isRestart) {
+        // Language switch launches a new copy after a 1s delay; wait (up to
+        // 5s) for the old one to release the mutex instead of false-alarming.
+        for (int i = 0; i < 50 && already; ++i) {
+            if (single) CloseHandle(single);
+            Sleep(100);
+            single = CreateMutexW(nullptr, TRUE, kSingleMutex);
+            already = single && GetLastError() == ERROR_ALREADY_EXISTS;
+        }
+        already = false;  // trusted relaunch: old copy is on its way out
+    }
+    if (already) {
+        HWND prev = FindWindowW(L"LinkHelmDesktopWindow", nullptr);
+        if (prev) {
+            ShowWindow(prev, SW_RESTORE);
+            SetForegroundWindow(prev);
+        }
+        ShowAlreadyRunningNotice(inst, g_lang_zh);
+        if (single) CloseHandle(single);
+        return 0;
     }
     // beta1.0.95 startup hygiene: a hard-killed previous session can leave
     // (a) an orphan hev engine holding the wintun adapter, (b) stale /1
@@ -3009,8 +3322,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmd_show) {
     RegisterClassW(&swc);
 
     HWND hwnd = CreateWindowExW(0, kClass,
-        TR(L"LinkHelm Desktop 1.1.0 (pure C++)",
-           L"LinkHelm 桌面版 1.1.0（纯C++）"),
+        TR(L"LinkHelm Desktop 1.1.3 (pure C++)",
+           L"LinkHelm 桌面版 1.1.3（纯C++）"),
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                                     WS_MINIMIZEBOX,
                                 CW_USEDEFAULT, CW_USEDEFAULT, kWidth, kHeight,
@@ -3057,13 +3370,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmd_show) {
                     SetForegroundWindow(hwnd);
                     break;
                 case linkhelm::TrayAction::QuitAndCleanup:
-                    if (g_app.tun) {
-                        g_app.tun->Stop();
-                        g_app.tun.reset();
-                    }
-                    g_app.accel.Stop();
-                    g_app.tray->Remove();
-                    DestroyWindow(hwnd);
+                    // beta1.1.2: never clean up on the GUI thread. RequestQuit
+                    // hides the window / removes the tray immediately, does
+                    // the teardown on a worker, then posts WM_APP+15 to exit.
+                    RequestQuit();
                     break;
                 default: break;
             }

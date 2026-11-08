@@ -159,8 +159,14 @@ class MyVpnServiceTun2Socks : VpnService() {
                 // v1.4.6: in-country fast resolvers — 8.8.8.8/1.1.1.1 relayed
                 // over the phone's cellular link made every lookup slow and
                 // lossy, amplifying the "sometimes fast, sometimes slow" feel.
-                .addDnsServer("223.5.5.5")
+                // 1.1.1: 119 FIRST — identical order to UDP_SELF_TEST_DNS_POOL
+                // (HostService), the Windows TUN statics and the Windows UDP
+                // probe pool. The old order (223 first) made the phone resolve
+                // via its SECOND resolver while the PC probed its FIRST —
+                // the "DNS inconsistency between the two ends" the 788-note
+                // warned about, resurfacing through the VPN builder.
                 .addDnsServer("119.29.29.29")
+                .addDnsServer("223.5.5.5")
                 .setSession("LinkHelm")
                 .setBlocking(true) // Crucial for gaming stability
 

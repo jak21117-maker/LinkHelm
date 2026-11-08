@@ -57,6 +57,15 @@ private:
     std::wstring phone_port_;
     std::wstring phone_route_gw_;
 
+    // beta1.1.2: Stop() used to run the FULL route/netsh cleanup on EVERY
+    // failure -- even when the SOCKS5 precheck failed and nothing was ever
+    // touched. That (a) spammed "disconnected; routes cleaned." and (b) made
+    // a failed connect cost 4 child processes. `touched_` records whether we
+    // actually started the engine / changed the network; `stopped_` makes
+    // Stop() idempotent so the destructor cannot clean a second time.
+    std::atomic<bool> touched_{false};
+    std::atomic<bool> stopped_{true};
+
     struct Impl;
     Impl* impl_ = nullptr;
 };

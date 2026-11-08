@@ -52,7 +52,7 @@ std::string AnsiToUtf8(const std::string& a) {
 }
 
 int RunCapture(const std::wstring& cmdline, std::string& out,
-               DWORD timeoutMs = 20000) {
+               DWORD timeoutMs = 8000) {
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
     HANDLE rd = nullptr, wr = nullptr;
     if (!CreatePipe(&rd, &wr, &sa, 0)) return -1;
@@ -70,11 +70,42 @@ int RunCapture(const std::wstring& cmdline, std::string& out,
     CloseHandle(wr);
     if (!ok) { CloseHandle(rd); return -1; }
     out.clear();
+    // beta1.1.2: the old code blocked in ReadFile() until the child closed
+    // its pipe. A hung netsh/route (very common while ICS is rebuilding the
+    // network stack) froze the caller forever -- the 20s timeout only ran
+    // AFTER the read loop. Poll PeekNamedPipe instead and hard-kill on
+    // timeout, so teardown can never hang the UI.
     char buf[4096];
-    DWORD n = 0;
-    while (ReadFile(rd, buf, sizeof(buf), &n, nullptr) && n) out.append(buf, n);
+    DWORD start = GetTickCount();
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr)) break;
+        if (avail) {
+            DWORD want = avail > sizeof(buf) ? (DWORD)sizeof(buf) : avail;
+            DWORD n = 0;
+            if (!ReadFile(rd, buf, want, &n, nullptr) || n == 0) break;
+            out.append(buf, n);
+            continue;
+        }
+        if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
+        if (GetTickCount() - start >= timeoutMs) {
+            TerminateProcess(pi.hProcess, 1);
+            break;
+        }
+        Sleep(10);
+    }
+    // drain anything left after the process exited
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr) || !avail)
+            break;
+        DWORD want = avail > sizeof(buf) ? (DWORD)sizeof(buf) : avail;
+        DWORD n = 0;
+        if (!ReadFile(rd, buf, want, &n, nullptr) || !n) break;
+        out.append(buf, n);
+    }
     CloseHandle(rd);
-    WaitForSingleObject(pi.hProcess, timeoutMs);
+    WaitForSingleObject(pi.hProcess, 1500);
     DWORD rc = 0;
     GetExitCodeProcess(pi.hProcess, &rc);
     CloseHandle(pi.hThread);
@@ -133,6 +164,47 @@ bool ListContains(const std::vector<std::string>& v, const char* s) {
     return false;
 }
 
+// beta1.1.2: on a zh-CN Windows the gateway column of an on-link /1 route
+// is rendered "在链路上" instead of "10.0.0.1"; the TUN address then lives
+// in the 4th (Interface) column. The old readback check ONLY looked at the
+// gateway column, so a perfectly good route was reported as
+// "route 0.0.0.0/1 readback verify failed" (screenshot #1). Accept either
+// column as proof that the route is bound to our TUN adapter.
+bool RouteBoundToTun(const std::string& dest, const std::string& mask,
+                     std::string* diag = nullptr) {
+    std::string raw;
+    RunCapture(L"route print -4", raw);
+    std::string txt = AnsiToUtf8(raw);
+    size_t ls = 0;
+    while (ls < txt.size()) {
+        size_t le = txt.find('\n', ls);
+        if (le == std::string::npos) le = txt.size();
+        size_t t = txt.find_first_not_of(" \t", ls);
+        if (t != std::string::npos && t < le) {
+            std::string line = txt.substr(t, le - t);
+            std::vector<std::string> tok;
+            size_t q = 0;
+            while (q < line.size()) {
+                while (q < line.size() && (line[q] == ' ' || line[q] == '\t'))
+                    ++q;
+                size_t s = q;
+                while (q < line.size() && line[q] != ' ' && line[q] != '\t')
+                    ++q;
+                if (s < q) tok.push_back(line.substr(s, q - s));
+            }
+            if (tok.size() >= 4 && tok[0] == dest && tok[1] == mask) {
+                const std::string& gw = tok[2];
+                const std::string& iface = tok[3];
+                if (diag) *diag += "[" + gw + " / " + iface + "] ";
+                if (gw == kTunGateway || iface == kTunGateway ||
+                    iface == kTunLocalIp) return true;
+            }
+        }
+        ls = le + 1;
+    }
+    return false;
+}
+
 std::wstring EngineDir() {
     wchar_t lad[MAX_PATH]{};
     if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0,
@@ -144,10 +216,48 @@ std::wstring EngineDir() {
     return L".";
 }
 
+// beta1.1.2: "TUN adapter did not appear (engine may have exited)" used to
+// be a dead end -- the engine's own stderr was sitting in a file nobody read.
+// Surface its last lines so the real reason (bad config / SOCKS5 refused /
+// wintun busy) is visible in the UI log.
+void DumpEngineLogTail(const std::function<void(const std::wstring&)>& log) {
+    std::wstring p = EngineDir() + L"\\engine_stdout.log";
+    FILE* f = _wfopen(p.c_str(), L"rb");
+    if (!f) return;
+    std::string data;
+    char b[4096];
+    size_t n;
+    while ((n = fread(b, 1, sizeof(b), f)) > 0) data.append(b, n);
+    fclose(f);
+    if (data.size() > 1600) data = data.substr(data.size() - 1600);
+    std::vector<std::string> lines;
+    size_t s = 0;
+    while (s < data.size()) {
+        size_t e = data.find('\n', s);
+        if (e == std::string::npos) e = data.size();
+        std::string ln = data.substr(s, e - s);
+        while (!ln.empty() && (ln.back() == '\r' || ln.back() == '\n'))
+            ln.pop_back();
+        if (!ln.empty()) lines.push_back(ln);
+        s = e + 1;
+    }
+    int from = lines.size() > 8 ? (int)lines.size() - 8 : 0;
+    if (from == (int)lines.size()) log(L"[engine] stdout log is empty");
+    for (int i = from; i < (int)lines.size(); ++i)
+        log(L"[engine] " + Utf16(AnsiToUtf8(lines[i])));
+}
+
 }  // namespace
 
 struct TunnelManager::Impl {
     HANDLE job = nullptr;   // kill-on-close; engine lives inside
+    HANDLE stop_evt = nullptr;  // beta1.1.2: interruptible monitor sleep
+    Impl() {
+        stop_evt = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // manual reset
+    }
+    ~Impl() {
+        if (stop_evt) CloseHandle(stop_evt);
+    }
 };
 
 TunnelManager::TunnelManager(LogFn log, StateFn status)
@@ -167,29 +277,41 @@ bool TunnelManager::PrecheckSocks5(const TunnelConfig& cfg,
     addr.sin_family = AF_INET;
     addr.sin_port = htons((u_short)cfg.phone_port);
     inet_pton(AF_INET, Utf8(cfg.phone_ip).c_str(), &addr.sin_addr);
-    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-    u_long nb = 1;
-    ioctlsocket(s, FIONBIO, &nb);
-    connect(s, (sockaddr*)&addr, sizeof(addr));
-    fd_set w;
-    FD_ZERO(&w);
-    FD_SET(s, &w);
-    timeval tv{5, 0};
-    // beta1.0.86 fix: writability alone is NOT success — a failed connect
-    // also marks the socket writable. Read SO_ERROR for the real verdict.
-    bool ok = false;
-    if (select(0, nullptr, &w, nullptr, &tv) > 0) {
-        int soerr = 0;
-        int len = sizeof(soerr);
-        getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&soerr, &len);
-        ok = (soerr == 0);
+    // beta1.1.2: ICS/hotspot switching rebuilds the phone link for a few
+    // hundred ms; a single 5s attempt reported "phone proxy precheck failed"
+    // for a purely transient flap (screenshots: two failed prechecks right
+    // after "hotspot: ..."). Try 3 short attempts before declaring failure.
+    // beta1.1.3: 1.5s -> 0.8s per attempt and 250 -> 150ms between them;
+    // a healthy LAN connect answers in <50ms, so this only speeds up the
+    // genuinely-down case (WLAN dropped) without losing flap tolerance.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+        u_long nb = 1;
+        ioctlsocket(s, FIONBIO, &nb);
+        connect(s, (sockaddr*)&addr, sizeof(addr));
+        fd_set w;
+        FD_ZERO(&w);
+        FD_SET(s, &w);
+        timeval tv{0, 800000};
+        // beta1.0.86 fix: writability alone is NOT success — a failed connect
+        // also marks the socket writable. Read SO_ERROR for the real verdict.
+        bool ok = false;
+        if (select(0, nullptr, &w, nullptr, &tv) > 0) {
+            int soerr = 0;
+            int len = sizeof(soerr);
+            getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&soerr, &len);
+            ok = (soerr == 0);
+        }
+        closesocket(s);
+        if (ok) return true;
+        if (attempt < 2) Sleep(150);
     }
-    closesocket(s);
-    if (!ok && error) {
+    if (error) {
         *error = L"phone proxy precheck failed (" + cfg.phone_ip + L":" +
-                 std::to_wstring(cfg.phone_port) + L"): check the hotspot link and credentials";
+                 std::to_wstring(cfg.phone_port) +
+                 L"): Wi-Fi / hotspot link may be down (check WLAN), or credentials wrong";
     }
-    return ok;
+    return false;
 }
 
 bool TunnelManager::WriteEngineConfig(const TunnelConfig& cfg,
@@ -268,7 +390,11 @@ bool TunnelManager::LaunchEngine(const std::wstring& cfg_path,
 
 bool TunnelManager::WaitAdapter(int seconds, std::wstring* conn_name) {
     std::string out;
-    for (int i = 0; i < seconds; ++i) {
+    // beta1.1.3: poll every 200ms instead of once per second. wintun usually
+    // publishes the adapter within ~0.3s, but the old 1s sleep plus the
+    // netsh subprocess made every connect wait 1.3-1.8s for no reason.
+    // Total budget is unchanged (seconds * 5 * 200ms).
+    for (int i = 0; i < seconds * 5; ++i) {
         if (engine_ && WaitForSingleObject(engine_, 0) == WAIT_OBJECT_0)
             return false;
         RunCapture(L"netsh interface ipv4 show interfaces", out);
@@ -300,7 +426,7 @@ bool TunnelManager::WaitAdapter(int seconds, std::wstring* conn_name) {
             }
             pos = eol == std::string::npos ? txt.size() : eol;
         }
-        Sleep(1000);
+        Sleep(200);   // beta1.1.3: was 1000 (see loop comment)
     }
     return false;
 }
@@ -335,7 +461,7 @@ bool TunnelManager::ConfigureAdapter(const std::wstring& conn_name) {
             break;  // order verified
         }
         if (log_) log_(L"DNS verify: retrying (" + std::to_wstring(attempt + 1) + L")");
-        Sleep(700);
+        Sleep(250);   // beta1.1.3: was 700; netsh readback settles in <200ms
         Run(L"netsh interface ipv4 set dns name=" + n +
             L" static 119.29.29.29 primary validate=no");
         Run(L"netsh interface ipv4 add dns name=" + n +
@@ -361,11 +487,25 @@ bool TunnelManager::ConfigureAdapter(const std::wstring& conn_name) {
 
 bool TunnelManager::AddRoutes(const std::wstring& conn_name,
                               std::wstring* error) {
-    // stale default via TUN? remove (metric 1 beats WLAN)
+    // beta1.1.2: a leftover 0.0.0.0/0 -> 10.0.0.1 (metric 6) beats the real
+    // default gateway and silently hijacks EVERY subsequent packet -- incl.
+    // the SOCKS5 precheck itself. This was measured on the user's machine.
+    // Delete it and READ BACK that it is really gone before touching /1.
     auto def = RouteGateways("0.0.0.0", "0.0.0.0");
     if (ListContains(def, kTunGateway)) {
-        Run(L"route delete 0.0.0.0 mask 0.0.0.0 10.0.0.1");
+        for (int k = 0; k < 3; ++k) {
+            Run(L"route delete 0.0.0.0 mask 0.0.0.0 10.0.0.1");
+            if (!ListContains(RouteGateways("0.0.0.0", "0.0.0.0"),
+                              kTunGateway)) break;
+            Sleep(120);   // beta1.1.3: was 200
+        }
         if (log_) log_(L"removed stale TUN default route from a previous run");
+        def = RouteGateways("0.0.0.0", "0.0.0.0");
+        if (ListContains(def, kTunGateway) && log_)
+            // persistent (-p) routes and all route edits need elevation;
+            // without it the stale route keeps hijacking traffic forever
+            log_(L"WARNING: stale TUN default route could not be removed - "
+                 L"run LinkHelm as administrator to clear it");
     }
     // return route to phone via original default gw
     if (!def.empty() && !phone_ip_.empty()) {
@@ -401,11 +541,14 @@ bool TunnelManager::AddRoutes(const std::wstring& conn_name,
     }
     for (const char* destC : {"0.0.0.0", "128.0.0.0"}) {
         std::string dest = destC;
-        auto existing = RouteGateways(dest, "128.0.0.0");
-        if (ListContains(existing, kTunGateway)) {
-            Run(L"route delete " + Utf16(dest) + L" mask 128.0.0.0 10.0.0.1");
-            existing = RouteGateways(dest, "128.0.0.0");
+        // A /1 route already bound to our TUN is fine (idempotent reconnect).
+        // Another VPN's /1 must be skipped instead of failing `route add`.
+        if (RouteBoundToTun(dest, "128.0.0.0")) {
+            if (log_) log_(L"route " + Utf16(dest) +
+                           L"/1 already bound to TUN, skipped");
+            continue;
         }
+        auto existing = RouteGateways(dest, "128.0.0.0");
         if (!existing.empty()) {
             if (log_) log_(L"route " + Utf16(dest) + L"/1 exists, skipped");
             continue;
@@ -424,9 +567,22 @@ bool TunnelManager::AddRoutes(const std::wstring& conn_name,
             CleanRoutes();
             return false;
         }
-        // readback verify: gateway line exists
-        auto after = RouteGateways(dest, "128.0.0.0");
-        if (!ListContains(after, kTunGateway)) {
+        // readback verify: the route table needs a few hundred ms to publish
+        // a freshly added /1. Accept "10.0.0.1" in EITHER the gateway or the
+        // interface column (zh-CN renders on-link gateways as "在链路上").
+        // Retry, then report exactly what route print showed.
+        std::string diag;
+        bool bound = RouteBoundToTun(dest, "128.0.0.0", &diag);
+        for (int k = 0; k < 3 && !bound; ++k) {
+            Sleep(150);   // beta1.1.3: was 300; route print itself takes ~200ms
+            diag.clear();
+            bound = RouteBoundToTun(dest, "128.0.0.0", &diag);
+        }
+        if (!bound) {
+            if (log_)
+                log_(L"[tun] route " + Utf16(dest) + L"/1 readback: " +
+                     (diag.empty() ? L"no matching row" : Utf16(diag)) +
+                     L", ifIndex=" + std::to_wstring(tunIdx));
             if (error) *error = L"route " + Utf16(dest) + L"/1 readback verify failed";
             CleanRoutes();
             return false;
@@ -436,12 +592,17 @@ bool TunnelManager::AddRoutes(const std::wstring& conn_name,
 }
 
 void TunnelManager::CleanRoutes() {
-    Run(L"route delete 0.0.0.0 mask 128.0.0.0 10.0.0.1");
-    Run(L"route delete 128.0.0.0 mask 128.0.0.0 10.0.0.1");
-    Run(L"route delete 0.0.0.0 mask 0.0.0.0 10.0.0.1");
+    // beta1.1.2: one cmd.exe for all four deletes instead of 3-4 separate
+    // child processes. Teardown used to spawn ~5 processes on EVERY failed
+    // connect, which is what made quitting (and retrying) feel glacial.
+    std::wstring cmds =
+        L"route delete 0.0.0.0 mask 128.0.0.0 10.0.0.1"
+        L" & route delete 128.0.0.0 mask 128.0.0.0 10.0.0.1"
+        L" & route delete 0.0.0.0 mask 0.0.0.0 10.0.0.1";
     if (!phone_route_gw_.empty() && !phone_ip_.empty())
-        Run(L"route delete " + phone_ip_ + L" mask 255.255.255.255 " +
-            phone_route_gw_);
+        cmds += L" & route delete " + phone_ip_ +
+                L" mask 255.255.255.255 " + phone_route_gw_;
+    Run(cmds);
     phone_route_gw_.clear();
 }
 
@@ -449,7 +610,11 @@ void TunnelManager::MonitorLoop() {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     while (monitoring_.load()) {
-        Sleep(5000);
+        // beta1.1.2: an interruptible wait. The old Sleep(5000) made Stop()
+        // (and therefore app exit) block for up to 5s in monitor_.join().
+        if (impl_->stop_evt &&
+            WaitForSingleObject(impl_->stop_evt, 5000) == WAIT_OBJECT_0)
+            break;
         if (!monitoring_.load()) break;
         if (engine_ && WaitForSingleObject(engine_, 0) == WAIT_OBJECT_0) {
             if (status_) status_(L"Status: engine exited unexpectedly");
@@ -466,10 +631,18 @@ void TunnelManager::MonitorLoop() {
         fd_set w;
         FD_ZERO(&w);
         FD_SET(s, &w);
-        timeval tv{4, 0};
+        timeval tv{2, 0};
         bool ok = select(0, nullptr, &w, nullptr, &tv) > 0;
+        if (ok) {
+            // same SO_ERROR discipline as the precheck: writable != connected
+            int soerr = 0;
+            int len = sizeof(soerr);
+            getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&soerr, &len);
+            ok = (soerr == 0);
+        }
         closesocket(s);
-        if (status_) status_(ok ? L"Status: connected" : L"Status: link flap, monitoring...");
+        if (status_) status_(ok ? L"Status: connected"
+                                : L"Status: link flap, monitoring...");
     }
 }
 
@@ -490,9 +663,15 @@ bool TunnelManager::Start(const TunnelConfig& cfg, std::wstring* error) {
     }
     if (log_) log_(L"starting lwIP engine (Job Object managed)...");
     if (!LaunchEngine(cfgPath, error)) return false;
+    // From here on we have touched the system: the engine owns a wintun
+    // adapter and the route table may be modified. Stop() must clean it up.
+    touched_.store(true);
+    stopped_.store(false);
+    if (impl_->stop_evt) ResetEvent(impl_->stop_evt);
     if (log_) log_(L"waiting for the TUN adapter...");
     if (!WaitAdapter(15, &conn_name_)) {
         if (error) *error = L"TUN adapter did not appear (engine may have exited)";
+        if (log_) DumpEngineLogTail(log_);
         Stop();
         return false;
     }
@@ -510,8 +689,15 @@ bool TunnelManager::Start(const TunnelConfig& cfg, std::wstring* error) {
 }
 
 void TunnelManager::Stop() {
+    // beta1.1.2: idempotent. A failed connect used to run the FULL cleanup
+    // here (Start's failure path), then AGAIN in ~TunnelManager via
+    // tun.reset(). Each pass spawned 4+ child processes and logged
+    // "disconnected; routes cleaned." -- that is the repeated line in the
+    // screenshots and a big part of the "slow / laggy" feel.
+    if (stopped_.exchange(true)) return;
     monitoring_.store(false);
     up_.store(false);
+    if (impl_->stop_evt) SetEvent(impl_->stop_evt);  // wake monitor instantly
     if (monitor_.joinable()) monitor_.join();
     if (engine_) {
         if (impl_->job) TerminateJobObject(impl_->job, 0);
@@ -519,6 +705,7 @@ void TunnelManager::Stop() {
         engine_ = nullptr;
         engine_pid_ = 0;
     }
+    if (!touched_.exchange(false)) return;  // precheck-only failure: nothing to undo
     CleanRoutes();
     Run(L"netsh interface set interface " + Q(kAdapterName) + L" disable");
     if (log_) log_(L"disconnected; routes cleaned.");
